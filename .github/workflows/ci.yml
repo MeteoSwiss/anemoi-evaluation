@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        python-version: "3.12"
+    - uses: actions/cache@v4
+      with:
+        path: ~/.cache/pre-commit
+        key: pre-commit-${{ runner.os }}-py3.12-${{ hashFiles('.pre-commit-config.yaml') }}
+    - run: uvx pre-commit run --all-files --show-diff-on-failure
+
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0 # setuptools-scm needs the tags to compute the version
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        python-version: ${{ matrix.python-version }}
+    # --torch-backend=cpu applies to the whole resolution: torch resolves to a +cpu build and
+    # the nvidia-* / triton wheels are never selected. Without it the runner disk fills, because
+    # anemoi-graphs caps torch below 2.11 and the default index only has CUDA builds there.
+    - run: uv venv --python ${{ matrix.python-version }}
+    - run: uv pip install --torch-backend=cpu -e .[tests]
+    - name: no cuda wheels
+      run: "! uv pip list | grep -iE '^(nvidia-|triton)'"
+    - run: uv run --no-sync pytest tests -q

@@ -1,0 +1,57 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [ "setuptools>=60", "setuptools-scm>=8" ]
+
+[project]
+name = "anemoi-evaluation"
+description = "In-memory forecast evaluation for anemoi models."
+readme = "README.md"
+keywords = [ "ai", "evaluation", "tools" ]
+license = { file = "LICENSE" }
+authors = [
+  { name = "Francesco Zanetta", email = "francesco.zanetta@meteoswiss.ch" },
+]
+requires-python = ">=3.11,<3.14"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = [ "version" ]
+dependencies = [
+  "anemoi-datasets",
+  "anemoi-graphs",
+  "anemoi-inference",
+  "anemoi-transform",
+  "anemoi-utils",
+  "netcdf4",
+  "numpy",
+  "pydantic>=2",
+  "pyyaml",
+  "torch",
+  "xarray",
+]
+optional-dependencies.tests = [ "pytest" ]
+urls.Homepage = "https://github.com/MeteoSwiss/anemoi-evaluation/"
+urls.Issues = "https://github.com/MeteoSwiss/anemoi-evaluation/issues"
+urls.Repository = "https://github.com/MeteoSwiss/anemoi-evaluation/"
+scripts.anemoi-evaluation = "anemoi.evaluation.__main__:main"
+
+[tool.setuptools]
+packages.find.where = [ "src" ]
+
+[tool.setuptools_scm]
+
+[tool.ruff]
+line-length = 120
+lint.extend-select = [ "I" ]
+lint.isort.force-single-line = true
+
+[tool.pytest]
+ini_options.testpaths = [ "tests" ]
