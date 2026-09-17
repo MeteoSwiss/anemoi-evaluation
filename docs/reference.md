@@ -1,6 +1,6 @@
 # Reference
 
-Exact behaviour and interfaces of `anemoi-evaluation` 0.1.0. Task-oriented instructions are in the
+Exact behaviour and interfaces of `anemoi-evaluation` 0.2.0. Task-oriented instructions are in the
 [user guide](user-guide.md); the reasoning behind the design is in
 [design/architecture.md](design/architecture.md) and [design/requirements.md](design/requirements.md).
 
