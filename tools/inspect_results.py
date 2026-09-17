@@ -37,7 +37,7 @@ args = parser.parse_args()
 
 ds = xr.open_dataset(args.results, decode_timedelta=True).load()
 leads = [int(x / np.timedelta64(1, "h")) for x in ds["lead_time"].values]
-positive = ds["lead_time"].values > np.timedelta64(0)
+positive = ds["lead_time"].values > np.timedelta64(0, "h")
 season = "all"  # the derived bin
 print("file:", args.results)
 print("attrs:", {k: v for k, v in ds.attrs.items() if k not in ("config",)})
