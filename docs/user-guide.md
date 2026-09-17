@@ -67,8 +67,8 @@ pytest tests        # CPU only, a few seconds
 The dependencies are anemoi-datasets, anemoi-graphs, anemoi-inference, anemoi-transform,
 anemoi-utils, numpy, torch, xarray, netcdf4, pydantic and pyyaml. To score a checkpoint you also
 need a **GPU** (about 16 GiB for one member of a 1 km stretched-grid model, see
-[benchmarks](benchmarks.md#3-model-step-time-and-gpu-memory)), a **single-dataset
-anemoi-inference checkpoint** and an **anemoi-datasets zarr** for the targets, by default the
+[benchmarks](benchmarks.md#3-model-step-time-and-gpu-memory)), an **anemoi-inference
+checkpoint** and an **anemoi-datasets zarr** for the targets, by default the
 dataset the checkpoint reads its inputs from. The device defaults to the runner's, else `cuda`
 when available, else CPU. The persistence baseline and `merge` need neither a GPU nor a
 checkpoint.

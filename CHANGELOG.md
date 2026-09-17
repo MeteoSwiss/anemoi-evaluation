@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-09-17
+
+Checkpoints trained on multiple datasets, scored as one evaluation per dataset that share the
+model rollout; single-dataset runs are unchanged.
 
 ### Breaking
 
@@ -23,6 +26,10 @@
   still predicts every dataset, the skipped ones simply get no targets, no aggregator and no
   result file. Selecting one dataset gives an ordinary single-dataset run, whose result names the
   dataset it scored.
+
+### Fixes
+
+* `tools/inspect_results.py` compares the zero lead time with a unit, as numpy 2.5 requires.
 
 ## 0.2.0 — 2026-09-17
 

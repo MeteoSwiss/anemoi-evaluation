@@ -1,6 +1,6 @@
 # Reference
 
-Exact behaviour and interfaces of `anemoi-evaluation` 0.2.0. Task-oriented instructions are in the
+Exact behaviour and interfaces of `anemoi-evaluation` 0.3.0. Task-oriented instructions are in the
 [user guide](user-guide.md); the reasoning behind the design is in
 [design/architecture.md](design/architecture.md) and [design/requirements.md](design/requirements.md).
 
@@ -112,8 +112,8 @@ before validation:
   `targets.anemoi_dataset`. `true` means the checkpoint of the `anemoi_inference` forecast, a string is a
   checkpoint path, `false` removes the key and changes nothing. The checkpoint's recorded `open_dataset`
   arguments (with the original paths) replace the key, and the rest of the block is merged on top, so a
-  local `start`/`end` wins. Only single-dataset checkpoints recording a single mapping argument are
-  supported. A `from_checkpoint` anywhere else raises.
+  local `start`/`end` wins. Each dataset must record a single mapping argument; a multi-dataset checkpoint
+  resolves per dataset (see Multi-dataset checkpoints). A `from_checkpoint` anywhere else raises.
 
 `EvaluationConfig` is a serialisation of the `Evaluation` constructor arguments;
 `Evaluation.from_config(config)` builds the object and `Evaluation.to_config()` returns the dict again.
@@ -179,8 +179,8 @@ last call computes past `lead_time` and the extra outputs are computed and disca
 Every other key goes to `anemoi.inference.config.run.RunConfiguration` (`checkpoint`, `device`, `input`,
 `env`, ...). The block is loaded as `{"verbosity": 0, **block, "output": "none"}`: `verbosity: 0` is only
 a default and the block can override it, while `output` is forced. Constraints: `date` must not be set
-(init times come from the evaluation), `output` must be absent or `none`, and the checkpoint must be a
-single-dataset checkpoint.
+(init times come from the evaluation), `output` must be absent or `none`, and the checkpoint's datasets
+must agree on the timing and all be decoded (see Multi-dataset checkpoints).
 
 #### `persistence` (`PersistenceConfig`)
 

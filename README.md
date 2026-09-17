@@ -6,7 +6,7 @@ the fly* by `anemoi-inference` from a checkpoint and scored on the GPU step by s
 targets read from an `anemoi-datasets` zarr. Forecast fields are never written to disk: the only
 output is one small netcdf of aggregated statistics and the metrics derived from them.
 
-**Status:** prototype, alpha (version 0.2.0), not on PyPI. Config keys, the Python API and the
+**Status:** prototype, alpha (version 0.3.0), not on PyPI. Config keys, the Python API and the
 contents of the result file may still change between releases.
 
 ## Features
