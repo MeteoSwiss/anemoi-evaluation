@@ -328,8 +328,7 @@ class EvaluationConfig(_Model):
     @field_validator("metrics")
     @classmethod
     def _check_metrics(cls, value: list) -> list:
-        for spec in value:
-            metrics_module.from_spec(spec)
+        metrics_module.build(value)
         return value
 
 

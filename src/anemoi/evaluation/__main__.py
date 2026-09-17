@@ -121,7 +121,8 @@ def _merge(args: argparse.Namespace) -> None:
     from anemoi.evaluation.output import write
 
     state = merge(args.inputs, partial=args.partial)
-    write(to_xarray(state, [metrics.from_spec(spec) for spec in json.loads(state.attrs["metrics"])]), args.output)
+    specs = json.loads(state.attrs["metrics"])
+    write(to_xarray(state, metrics.build(specs, members=state.members)), args.output)
 
 
 def main(argv: list[str] | None = None) -> None:

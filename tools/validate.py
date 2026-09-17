@@ -9,8 +9,12 @@ One process: the framework `Evaluation` (config members) and the direct loop sha
 (`member_seed(seed, init, member, call)` before every member's model call), so the member draws are identical. For every
 --members value the direct loop times every `next()` (model calls flagged: the first `next()` of each block of
 `frames_per_pass` frames) and records its peak GPU memory; the numpy statistics (rmse, mae, bias, crps, fair_crps, spread,
-spread_skill, member_rmse, member_mae, and acc when the config has a climatology) are compared for the config's member
-count. With --lead-zero the framework's lead-0 rmse/mae/bias must be exactly 0.0 for the variables present in the input
+spread_skill, member_rmse, member_mae, acc when the config has a climatology, and the threshold metrics, the rank
+histogram and the reliability levels the config asks for) are compared for the config's member count; a metric carrying an extra axis, such as
+`rank_histogram`, is compared element by element and reported by its worst element; a threshold metric must be NaN for
+a variable its map omits, and a framework NaN against a finite reference, or the reverse, is a mismatch rather than a
+skipped comparison.
+With --lead-zero the framework's lead-0 rmse/mae/bias must be exactly 0.0 for the variables present in the input
 state and NaN for the others.
 
 Prints `VALIDATE:` lines: the checkpoint facts, the framework run's timing, model calls and peak memory, the direct
@@ -192,6 +196,9 @@ for members in members_list:
 steps = fields_by_members[forecast.members]
 M = forecast.members
 worst = {}
+nan_expected = []  # (metric, lead, variable, region) a threshold metric must be NaN for: its map omits the variable
+nan_mismatches = 0  # one side NaN and the other a number, which a relative difference cannot express
+shape_mismatches = 0  # the framework and the reference disagree on the shape of a metric, which cannot be compared
 for step, date, arrays in steps:
     y = np.asarray(dataset[date_index[date]][columns, 0], dtype=np.float64)[:, gi]
     c = None
@@ -226,13 +233,100 @@ for step, date, arrays in steps:
                 wc = weights[okc]
                 fa, ta = mean[j][okc] - c[j][okc], y[j][okc] - c[j][okc]
                 ref["acc"] = (wc * fa * ta).sum() / np.sqrt((wc * fa * fa).sum() * (wc * ta * ta).sum())
+            for metric in evaluation.metrics:
+                thresholds = getattr(metric, "thresholds", None)
+                if thresholds is None:
+                    continue
+                if variable not in thresholds:
+                    nan_expected.append((metric.name, step, variable, region))
+                    continue
+                threshold = thresholds[variable]
+                o = (y[j][ok] > threshold).astype(np.float64)
+                binary = (mean[j][ok] > threshold).astype(np.float64)
+                p = (m > threshold).astype(np.float64).mean(0)
+                hits = (w * binary * o).sum() / w.sum()
+                misses = (w * (1 - binary) * o).sum() / w.sum()
+                alarms = (w * binary * (1 - o)).sum() / w.sum()
+                negatives = (w * (1 - binary) * (1 - o)).sum() / w.sum()
+                brier = (w * (p - o) ** 2).sum() / w.sum()
+                obar = (w * o).sum() / w.sum()
+                random_hits = (hits + alarms) * (hits + misses)
+                with np.errstate(divide="ignore", invalid="ignore"):  # a degenerate cell is legitimately 0/0
+                    formulas = {
+                        "pod": hits / (hits + misses),
+                        "far": alarms / (hits + alarms),
+                        "csi": hits / (hits + misses + alarms),
+                        "ets": (hits - random_hits) / (hits + misses + alarms - random_hits),
+                        "frequency_bias": (hits + alarms) / (hits + misses),
+                        "hss": 2
+                        * (hits * negatives - misses * alarms)
+                        / ((hits + misses) * (misses + negatives) + (hits + alarms) * (alarms + negatives)),
+                        "pss": hits / (hits + misses) - alarms / (alarms + negatives),
+                        "brier": brier,
+                        "bss": 1 - brier / (obar * (1 - obar)),
+                        "event_frequency": obar,
+                        "brier_uncertainty": obar * (1.0 - obar),
+                    }
+                if metric.kind in formulas:  # the level-resolved metrics are handled below, from their own counts
+                    ref[metric.name] = formulas[metric.kind]
+            rank_metrics = [
+                metric
+                for metric in evaluation.metrics
+                if isinstance(metric, (ae.metrics.RankHistogram, ae.metrics.OutlierFraction))
+            ]
+            if rank_metrics:  # the two counts are the same for every bin and for both metrics
+                below = (m < y[j][ok]).sum(0)
+                ties = (m == y[j][ok]).sum(0)
+                bins = np.stack([((below <= k) & (k <= below + ties)) / (ties + 1.0) for k in range(M + 1)])
+                histogram = (w * bins).sum(1) / w.sum()
+                for metric in rank_metrics:
+                    is_histogram = isinstance(metric, ae.metrics.RankHistogram)
+                    ref[metric.name] = histogram if is_histogram else float(histogram[0] + histogram[-1])
+            level_metrics = [
+                metric
+                for metric in evaluation.metrics
+                if isinstance(metric, ae.metrics.ReliabilityMetric) and variable in metric.thresholds
+            ]
+            for label in sorted({metric.label for metric in level_metrics}):  # the counts serve every level metric
+                threshold = next(metric.thresholds[variable] for metric in level_metrics if metric.label == label)
+                count = (m > threshold).sum(0)  # (n_valid,) integer member exceedance count
+                observed = (y[j][ok] > threshold).astype(np.float64)
+                n = np.array([(w * (count == k)).sum() for k in range(M + 1)])
+                h = np.array([(w * (count == k) * observed).sum() for k in range(M + 1)])
+                total, p_k = n.sum(), np.arange(M + 1) / M  # named _k so as not to shadow the per-node p and o above
+                o_k = np.divide(h, n, out=np.full_like(h, np.nan), where=n > 0)
+                obar_k = h.sum() / total
+                levels = {
+                    "reliability": o_k,
+                    "forecast_frequency": n / total,
+                    "brier_reliability": np.nansum(np.where(n > 0, n * (p_k - o_k) ** 2, 0.0)) / total,
+                    "brier_resolution": np.nansum(np.where(n > 0, n * (o_k - obar_k) ** 2, 0.0)) / total,
+                }
+                for metric in level_metrics:
+                    if metric.label == label:
+                        ref[metric.name] = levels[metric.kind]
             for key, value in ref.items():
                 if key not in framework:
                     continue
-                got = float(
-                    framework[key].sel(lead_time=np.timedelta64(step), bin="all", variable=variable, region=region)
+                # A metric with an extra axis (rank_histogram) leaves an array here, a scalar one a 0-d array; the
+                # comparison is elementwise either way and reports the worst element.
+                got = np.asarray(
+                    framework[key].sel(lead_time=np.timedelta64(step), bin="all", variable=variable, region=region),
+                    dtype=np.float64,
                 )
-                rel = abs(got - value) / max(abs(value), 1e-30)
+                value = np.asarray(value, dtype=np.float64)
+                if got.shape != value.shape:
+                    log(f"MISMATCH {key} lead={step} {variable} {region}: shapes {got.shape} and {value.shape}")
+                    shape_mismatches += 1
+                    continue
+                pattern = np.isnan(got) != np.isnan(value)  # one NaN and one number is a mismatch, not rel = NaN
+                if pattern.any():
+                    log(f"MISMATCH {key} lead={step} {variable} {region}: framework {got!r} numpy {value!r} (NaN)")
+                    nan_mismatches += 1
+                    continue
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    elementwise = np.abs(got - value) / np.maximum(np.abs(value), 1e-30)
+                rel = float(np.max(np.where(np.isnan(got) | (got == value), 0.0, elementwise), initial=0.0))
                 worst[key] = max(worst.get(key, 0.0), rel)
                 if rel > args.rtol:
                     log(
@@ -240,7 +334,25 @@ for step, date, arrays in steps:
                     )
 for key, rel in worst.items():
     log(f"max relative difference {key}: {rel:.2e}")
-ok = all(rel <= args.rtol for rel in worst.values())
+ok = all(rel <= args.rtol for rel in worst.values()) and nan_mismatches == 0 and shape_mismatches == 0
+if nan_mismatches:
+    log(f"{nan_mismatches} comparisons where exactly one of the framework and numpy was NaN")
+if shape_mismatches:
+    log(f"{shape_mismatches} comparisons where the framework and numpy disagreed on the shape")
+missing_nan = 0
+for key, step, variable, region in nan_expected:
+    if key not in framework:
+        continue
+    got = np.asarray(
+        framework[key].sel(lead_time=np.timedelta64(step), bin="all", variable=variable, region=region),
+        dtype=np.float64,
+    )
+    if not np.isnan(got).all():
+        log(f"MISMATCH {key} lead={step} {variable} {region}: framework {got!r}, expected NaN (no threshold)")
+        missing_nan += 1
+if nan_expected:
+    log(f"threshold metrics without a threshold for the variable: {len(nan_expected)} checked, {missing_nan} not NaN")
+ok &= missing_nan == 0
 
 # 4. lead 0: exactly zero for the variables in the input state, NaN for the others
 if args.lead_zero:

@@ -26,8 +26,9 @@ _STATE_SUM = "state_sum_"
 
 
 def to_xarray(state: AggregationState, metrics: list[Metric], attrs: dict | None = None) -> xr.Dataset:
-    """Metrics on (lead_time, bin, variable, region), `bin` being the stored bins plus a derived `all`, the raw
-    state on `state_bin` (stored bins only) and the contributed init times as `init_time`; attrs extend `state.attrs`."""
+    """Metrics on (lead_time, bin, variable, region), plus any extra dimension a metric declares through `output_dim`,
+    `bin` being the stored bins plus a derived `all`, the raw state on `state_bin` (stored bins only) and the
+    contributed init times as `init_time`; attrs extend `state.attrs`."""
     state = state.cpu()
     sums = {name: total.numpy() for name, total in state.sums.items()}
     weights, n_init, bins = state.weights.numpy(), state.n_init.numpy(), list(state.bins)
@@ -35,12 +36,18 @@ def to_xarray(state: AggregationState, metrics: list[Metric], attrs: dict | None
         sums = {name: _with_total(total) for name, total in sums.items()}
         weights, n_init, bins = _with_total(weights), _with_total(n_init), bins + [BIN_ALL]
     means = {name: torch.from_numpy(total) / torch.from_numpy(weights) for name, total in sums.items()}
-    data_vars = {}
+    data_vars, extra_coords = {}, {}
     for metric in metrics:
         missing = set(metric.statistics) - set(means)
         if missing:
             raise ValueError(f"state has no sums for statistics {sorted(missing)} needed by {metric.name}")
-        data_vars[metric.name] = (_DIMS, metric.from_means(means, state.members).numpy())
+        extra = metric.output_dim
+        dims = _DIMS if extra is None else (*_DIMS, extra[0])
+        data_vars[metric.name] = (dims, metric.from_means(means, state.members).numpy())
+        if extra is not None:
+            name, values = extra[0], list(extra[1])
+            if extra_coords.setdefault(name, values) != values:
+                raise ValueError(f"metrics disagree on the {name!r} coordinate: {extra_coords[name]} and {values}")
     data_vars["n_init"] = (_DIMS[:2], n_init)
     data_vars["weight_sum"] = (_DIMS, weights)
     for name, total in state.sums.items():
@@ -55,6 +62,7 @@ def to_xarray(state: AggregationState, metrics: list[Metric], attrs: dict | None
         "region": list(state.regions),
         "init_time": np.array(state.init_times, dtype="datetime64[ns]"),
         **{name: ("variable", list(values)) for name, values in state.variable_coords.items()},
+        **extra_coords,
     }
     attrs = {**state.attrs, **(attrs or {}), "members": state.members, "metrics": json.dumps([m.spec for m in metrics])}
     return xr.Dataset(data_vars, coords, attrs)

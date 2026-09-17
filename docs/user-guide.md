@@ -14,6 +14,9 @@ in the [reference](reference.md); the reasons behind the design are in the
 - [Multi-step-output models and lead 0](#multi-step-output-models-and-lead-0)
 - [Regions, weights and time bins](#regions-weights-and-time-bins)
 - [Anomaly correlation with a climatology](#anomaly-correlation-with-a-climatology)
+- [Categorical scores at thresholds](#categorical-scores-at-thresholds)
+- [Rank histogram](#rank-histogram)
+- [Reliability diagram](#reliability-diagram)
 - [Persistence and the other included sources](#persistence-and-the-other-included-sources)
 - [Sharding and merging](#sharding-and-merging)
 - [Reading the results](#reading-the-results)
@@ -33,7 +36,9 @@ in the [reference](reference.md); the reasons behind the design are in the
   weighted float64 sum. A **metric** is a function of the *means* of those statistics: `rmse` is
   the square root of the mean squared error, `crps` the mean `skill` minus a member-dependent
   multiple of the mean `pairs`. Only the sums are stored, so results add
-  ([reference](reference.md#statistics-and-metrics)).
+  ([reference](reference.md#statistics-and-metrics)). A statistic may be parametrised: a threshold
+  score carries its label in the name of both the metric and the sums, as in `csi_heavy` and
+  `state_sum_hit_heavy`.
 - **Weights** are one float per node and **regions** are boolean node masks, so a result is a
   weighted mean over the nodes of a region; regions may overlap. A **time bin** is the second
   aggregation axis (season, month, date or a single bin); lead time is always its own axis.
@@ -279,14 +284,16 @@ The global RNG is reseeded before every member's model call with a hash of
 members: member 2 of a 4-member run is bit-identical to member 2 of an 8-member run with the same
 seed.
 
-`crps`, `fair_crps`, `spread` and `spread_skill` need at least two members and raise when the
-source has fewer. Three choices worth making deliberately:
+`crps`, `fair_crps`, `spread`, `spread_skill`, `rank_histogram` and `outlier_fraction` need at
+least two members and raise when the source has fewer. Five choices worth making deliberately:
 
 | metric | meaning |
 |---|---|
 | `crps` / `fair_crps` | kernel CRPS at `alpha = 0` / `alpha = 1`; the fair version is the unbiased one for a finite ensemble and is always the smaller |
 | `{crps: {alpha: 0.5}}` | any `alpha` in `[0, 1]`; the result variable is named after it, `crps_0p5` |
 | `member_rmse`, `member_mae` | the error of a randomly drawn member in expectation, never below `rmse` / `mae`, which are computed on the ensemble mean |
+| `rank_histogram`, `outlier_fraction` | whether the ensemble is calibrated rather than how accurate it is, see [Rank histogram](#rank-histogram) |
+| `reliability`, `forecast_frequency` | whether the forecast probabilities of a threshold mean what they say, see [Reliability diagram](#reliability-diagram); unlike the rank histogram they work at one member too |
 
 The full list is in the [reference](reference.md#metrics). A checkpoint with no `noise_injector`
 logs a warning and produces identical members, so `spread` is zero and `crps` equals `mae`.
@@ -392,6 +399,169 @@ climatology: {file: climatology.nc}
 - Per-season or per-init ACC comes from the binning (each bin pooled), not from averaging per-init
   correlations. The two are not the same number.
 - A device copy per (key, variable set) is kept, about 0.12-0.23 GiB for a 232 MiB climatology.
+
+## Categorical scores at thresholds
+
+`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss` and `pss` score a binarised event, `brier`, `bss`
+and `event_frequency` score its probability. Each one takes a **label** and a per-variable **threshold**
+map, and is named after both:
+
+```yaml
+metrics:
+  - rmse
+  - {csi:             {label: heavy, thresholds: {tp: 0.005}}}   # example numbers, not defaults
+  - {pod:             {label: heavy, thresholds: {tp: 0.005}}}
+  - {brier:           {label: heavy, thresholds: {tp: 0.005}}}
+  - {bss:             {label: heavy, thresholds: {tp: 0.005}}}
+  - {event_frequency: {label: heavy, thresholds: {tp: 0.005}}}
+  - {pod:             {label: frost, thresholds: {2t: 273.15}}}
+```
+
+That writes `csi_heavy`, `pod_heavy` and the rest as data variables and
+`state_sum_hit_heavy`, `state_sum_miss_heavy`, `state_sum_false_alarm_heavy`,
+`state_sum_brier_heavy` and `state_sum_event_frequency_heavy` as the raw sums. Metrics that share a
+label share those sums, so the five metrics above cost five sums, not nine. The thresholds must be
+the same for one label: two metrics with the same label and different numbers are refused at config load,
+and at construction from Python, as are two metrics that resolve to the same name.
+
+The event is `value > threshold`, strictly, for the target and for the ensemble mean of the forecast;
+the Brier score uses the fraction of members above the threshold. Only exceedances can be configured, so a
+"below" event such as frost is scored as its complement: `pod_frost` above reads as the detection of
+"not frost", and the frost cells are the mirror image of the stored ones.
+
+Picking a threshold takes three facts. The unit is whatever the training dataset stores, which is the
+`units` entry of the variable's metadata in the zarr (`ds.attrs["variables_metadata"]`), typically metres
+for `tp` and kelvin for `2t`. `tp` is the **per-step** quantity (see the concepts above), so `0.005` is
+5 mm per 6 h on a 6-hourly model and 5 mm per hour on an hourly one, the same number is a different event
+on the two, and nothing accumulates over lead time. And the base rate of a candidate threshold costs no
+GPU: run the `persistence` forecast source over the period with
+`{event_frequency: {label: heavy, thresholds: {tp: 0.005}}}` and read `event_frequency_heavy`, which is the
+observed frequency of the event and nothing to do with the model. There are no default thresholds.
+
+A vector event such as "wind above 10 m/s" is not expressible: thresholding `10u` and `10v` separately is
+not a wind speed, and the package builds no derived variables (see the [requirements](design/requirements.md)),
+so the dataset must carry the scalar variable itself.
+
+Write a small threshold as `0.001` or `1.0e-3`: PyYAML follows YAML 1.1 and reads `1e-3` as the *string*
+`'1e-3'`, which is refused with `threshold for 'tp' must be a finite number`.
+
+A variable that a label's map does not name is **NaN** in that label's metrics and sums, at every lead
+time, bin and region. A column of NaN therefore means "no threshold for this variable", not "zero". A
+threshold naming a variable the run does not evaluate is an error instead, since it is almost always a
+typo. Read `event_frequency_<label>` first: it is the base rate, and it tells you whether the
+threshold was scorable at all. Where nothing was observed and nothing forecast, `pod`, `far`, `csi`,
+`ets` and `frequency_bias` are 0/0 NaN, which is the honest answer, not a bug.
+
+All ten work for a deterministic checkpoint. What compares the two model kinds is `brier` and `bss`, and the
+reliability diagram at one member: they all read the fraction of members above the threshold, and at one
+member the Brier score collapses to `miss + false_alarm` exactly at every element, and so to within float64
+rounding once summed.
+
+The contingency scores do not, and this is the one trap of the family. For an ensemble they binarise the
+**ensemble mean**, so they score it as a point forecast. The mean of a skewed field has less spread than a
+member, so it crosses a rare threshold far less often than a single member of the same calibrated ensemble
+does. A calibrated ensemble therefore reads as badly under-forecasting heavy events, and `pod_heavy` or
+`frequency_bias_heavy` must not be compared between a deterministic checkpoint and its ensemble sibling. What you usually want instead is the contingency table
+at a chosen forecast probability, which the reliability level sums already contain (see
+[Reliability diagram](#reliability-diagram)) and which a later release can derive with no new statistic.
+
+Note that `bss` is a skill score against the base rate of its own cell, so it does not compare across lead
+times, regions or bins; on a rare event with `bins: {time: init_time}` most dates have a base rate of 0 or
+1 and read NaN or minus infinity, so the pooled `all` bin is the one to read.
+
+## Rank histogram
+
+The rank histogram says whether an ensemble is calibrated: how often the target fell below every
+member, between the first and the second, and so on up to above every member. It needs at least two
+members and no configuration at all.
+
+```yaml
+metrics: [rmse, rank_histogram, outlier_fraction]
+```
+
+The file gets `rank_histogram` on `(lead_time, bin, variable, region, rank)`, with a `rank`
+coordinate of the `M + 1` values `0..M`, and `outlier_fraction` as one number per
+`(lead_time, bin, variable, region)`:
+
+```python
+results["rank_histogram"].sel(bin="all", region="global", variable="2t").isel(lead_time=-1).values
+results["outlier_fraction"].sel(bin="all", region="global", variable="2t").values
+```
+
+How to read it. A **flat** histogram, every bin at `1 / (M + 1)`, is a calibrated ensemble. A **U**
+shape, both end bins high, means the target lands outside the ensemble too often: the ensemble is
+under-dispersed. A **dome** means it is over-dispersed. A **slope** is a bias, downwards when the
+forecasts are too high. `outlier_fraction` is the sum of the two end bins and is the one number worth
+quoting: a calibrated `M`-member ensemble gives `2 / (M + 1)` (0.222 at 8 members, 0.038 at 51), more
+means under-dispersed, less over-dispersed.
+
+Ties are spread, not broken. When `ties` members equal the target exactly, each of the `ties + 1` bins
+the target could occupy gets `1 / (ties + 1)`, which is what random tie-breaking would give in
+expectation, with no seed and no noise. This matters for a field that is exactly zero at most nodes: a
+naive rank would put the mass of every exact tie in the first bin and read as a catastrophic high bias,
+and spreading removes that artefact.
+
+It removes the artefact only. A `tp` histogram with a bin-0 spike left over is saying something real,
+usually that the model is never exactly dry where the target is: a dry target below every (slightly
+positive) member is not a tie at all, it is a bias, and no tie rule touches it. Read the rank histogram of
+a bounded variable together with the reliability diagram at the bound, `thresholds: {tp: 0.0}` for
+precipitation occurrence, which answers the dry/wet question directly.
+
+Two more things to know. `M` comes from the run, so no number goes in the config, and a result file
+written at one ensemble size cannot be merged with one written at another. And at lead 0 every member
+equals every other one, so the target is either tied with all of them, which spreads the mass evenly and
+gives a flat histogram (the case when the targets come from the model's input dataset), or outside all of
+them, which puts the whole mass in bin 0 or bin `M`. Either way it says nothing about calibration.
+
+## Reliability diagram
+
+The rank histogram asks whether the ensemble is calibrated as a whole; the reliability diagram asks
+whether the probability it gives one **event** means what it says. Of all the cases where the
+ensemble said 30 %, how often did the event happen? On the diagonal is perfect.
+
+```yaml
+metrics:
+  - {reliability: {label: heavy, thresholds: {tp: 0.005}}}
+  - {forecast_frequency: {label: heavy, thresholds: {tp: 0.005}}}
+  - {brier_reliability: {label: heavy, thresholds: {tp: 0.005}}}
+  - {brier_resolution: {label: heavy, thresholds: {tp: 0.005}}}
+  - {brier_uncertainty: {label: heavy, thresholds: {tp: 0.005}}}
+```
+
+The label and the threshold map are the ones every threshold score uses, and a label names one event:
+every metric carrying `heavy` must give the same map, in this family and in the categorical one.
+
+The file gets `reliability_heavy` and `forecast_frequency_heavy` on
+`(lead_time, bin, variable, region, probability)`, with a `probability` coordinate of the `M + 1`
+values `k / M`, and the three components as one number per `(lead_time, bin, variable, region)`:
+
+```python
+cell = {"bin": "all", "region": "global", "variable": "tp"}
+curve = results["reliability_heavy"].sel(**cell).isel(lead_time=-1)      # observed frequency
+sample = results["forecast_frequency_heavy"].sel(**cell).isel(lead_time=-1)   # how often each was issued
+weight = sample * results["weight_sum"].sel(**cell).isel(lead_time=-1)   # absolute sample weight
+```
+
+How to read it. The diagonal is perfect. A curve **flatter** than the diagonal is over-confident: it
+says 90 % and is right 70 % of the time. A curve **steeper** than the diagonal is under-confident. A
+curve **above** the diagonal everywhere means the event is under-forecast. And a point with almost no
+`forecast_frequency` under it means nothing at all, which is exactly why the second metric is there:
+read the curve and the histogram together or not at all.
+
+The decomposition. `brier_reliability` (`REL`) is the vertical distance from the diagonal, weighted by
+the sample of each level; small is good. `brier_resolution` (`RES`) is how far the levels separate
+events from non-events; large is good. `brier_uncertainty` (`UNC`) is the climatological difficulty of
+the threshold in that cell and has nothing to do with the model. Together they are the Brier score,
+`BS = REL - RES + UNC`, to the float64 rounding of the sums, so they say where a Brier difference
+between two runs comes from.
+
+Four things to know. The bins are the `M + 1` ensemble probability levels, so no number goes in the
+config and a run at another ensemble size is a different set of bins. A level no forecast fell into
+reads NaN in `reliability` and 0 in `forecast_frequency`. At lead 0 every member equals every other
+one, so only the two end levels are populated and the diagram says nothing about calibration. And at
+one member the levels are `{0, 1}`: the diagram has two points and is the contingency table in
+disguise, which is what lets it, `brier` and `bss` put a deterministic checkpoint and its ensemble sibling
+on one axis.
 
 ## Persistence and the other included sources
 
@@ -619,7 +789,15 @@ Dates, grids, variables and merging:
 | `grids differ in size`, `grid coordinates differ by more than 1e-05 degrees` | the targets or the climatology are not on the model grid; with a cutout checkpoint take the targets from the forecast, which also applies `grid_indices` |
 | `a forecast source with a model graph is needed for the node attribute ...` | use `spherical_voronoi`, `uniform` or a `file:` mask instead |
 | `graph nodes 'data' have no attribute '...'` | the training graph does not carry it; the error lists the ones it does |
-| `the metrics need at least 2 members, the forecast source has 1` | `crps`, `fair_crps`, `spread` and `spread_skill` need an ensemble |
+| `the metrics need at least 2 members, the forecast source has 1` | `crps`, `fair_crps`, `spread` and `spread_skill` need an ensemble; the rank histogram reports it itself |
+| `rank_histogram needs at least 2 members, the run has 1` | `rank_histogram` and `outlier_fraction` are ensemble metrics; drop them for a deterministic checkpoint |
+| `rank_histogram is already bound to 4 members, cannot rebind to 8` | the same metric instance was reused for a run with another ensemble size; build a fresh one |
+| `reliability_heavy is already bound to 4 members, cannot rebind to 8` | the same for the reliability family, which is bound to the run's ensemble size in the same way |
+| `reliability_heavy was not bound to the run's ensemble size` | a metric built by hand was used without `metrics.build(..., members=M)` or `bind_members` |
+| `the thresholds of ... name variables the run does not have: [...]` | a threshold names a variable the run does not evaluate; fix the name or add it to `variables` |
+| `... both need a statistic named ... with different parameters` | two statistics of one name disagree on their parameters; give the metrics different labels |
+| `label 'warm' is used with different thresholds by csi_warm ({...}) and reliability_warm ({...}); one label, one threshold map` | a label names one event, so every metric carrying it must give the same threshold map, across every family; give the two events different labels |
+| `duplicate metric names: ... appears 2 times` | the same metric, or the same kind and label, is listed twice |
 | `N of the M shards of the run were given, missing ...` | rerun the shard, or merge with `--partial` |
 | `cannot merge states that share init times`, `duplicate shards of n` | the same result would be counted twice |
 | `cannot merge states with different coordinates or statistics` | the inputs came from different configs |

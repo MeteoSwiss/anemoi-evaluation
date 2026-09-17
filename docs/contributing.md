@@ -74,6 +74,9 @@ that cannot run is a failure, not a skip.
 | `test_aggregation.py` | weighted, masked, binned sums against a naive reference; exact merging; the binnings |
 | `test_end_to_end.py` | metrics against closed forms, lead 0, missing targets, netcdf round trip, `merge` and its shard validation, sharding and the dry run, persistence |
 | `test_ensemble_statistics.py` | CRPS against a naive pairwise sum, ensemble variance, the member-error identity, float32 offsets |
+| `test_categorical_scores.py` | threshold statistics against a numpy reference, the contingency identities, the metric formulas, the identity guard and the end-to-end NaN behaviour |
+| `test_rank_histogram.py` | the rank bins against a numpy reference with planted ties, the sum-to-one identity, the calibrated, under-dispersed and biased shapes, member binding and the extra output axis end to end |
+| `test_reliability.py` | the level statistics against a numpy reference, the decomposition identity against the stored Brier score, the calibrated, over-confident and under-confident diagram shapes, the double binding and both extra axes in one file |
 | `test_climatology.py` | `ArrayClimatology` keys and its netcdf round trip, and ACC end to end |
 | `test_config.py` | config forms and validation errors, the round trip, `base:` merging and cycles, `from_checkpoint` |
 | `test_inference_source.py` | the inference-source pieces that need no checkpoint: chunk defaults, the forcings cache, the chunk report, graph attributes |

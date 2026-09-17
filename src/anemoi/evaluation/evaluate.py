@@ -116,7 +116,7 @@ class Evaluation:
         forecast.grid.check_compatible(targets.grid)
         targets.prefetch_hint(forecast.frames_per_pass)
         self.variables = self._resolve_variables(variables)
-        self.metrics = [metrics_module.from_spec(spec) for spec in metrics]
+        self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)
         if needed > forecast.members:
             raise ValueError(f"the metrics need at least {needed} members, the forecast source has {forecast.members}")

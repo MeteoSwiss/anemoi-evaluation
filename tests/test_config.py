@@ -21,7 +21,13 @@ CONFIG = {
     },
     "lead_time": "24h",
     "init_times": {"start": "2024-01-01", "end": "2024-01-01T12", "frequency": "12h"},
-    "metrics": ["rmse", {"crps": {"alpha": 0.5}}],
+    "metrics": [
+        "rmse",
+        {"crps": {"alpha": 0.5}},
+        {"csi": {"label": "heavy", "thresholds": {"t": 0.5}}},
+        {"reliability": {"label": "heavy", "thresholds": {"t": 0.5}}},
+        "rank_histogram",
+    ],
     "weights": {"uniform": {}},
     "regions": {"global": "all", "box": {"bbox": {"north": 60, "west": -10, "south": 30, "east": 40}}},
     "bins": {"time": "none"},
@@ -51,10 +57,55 @@ def test_validation_errors(fake_sources):
         {**CONFIG, "weights": {"uniform": {}, "file": "w.npy"}},
         {**CONFIG, "lead_time": "-6h"},
         {**CONFIG, "forecast": {}},
+        {**CONFIG, "metrics": [{"crps": {"alpah": 0.5}}]},
+        {**CONFIG, "metrics": [{"csi": {"thresholds": {"t": 0.5}}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "x"}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "x", "thresholds": {"t": 0.5}, "labl": "y"}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "a b", "thresholds": {"t": 0.5}}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "x", "thresholds": {}}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "x", "thresholds": [1, 2]}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "x", "thresholds": {"t": "0.5"}}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "x", "thresholds": {"t": True}}}]},
+        {**CONFIG, "metrics": [{"csi": {"label": "x", "thresholds": {"t": float("nan")}}}]},
+        {**CONFIG, "metrics": [{"rank_histogram": {"members": 8}}]},  # M comes from the run, never from the spec
+        {**CONFIG, "metrics": [{"reliability": {"thresholds": {"t": 0.5}}}]},
+        {**CONFIG, "metrics": [{"reliability": {"label": "x"}}]},
+        {**CONFIG, "metrics": [{"reliability": {"label": "x", "thresholds": {"t": 0.5}, "members": 8}}]},
+        {
+            **CONFIG,
+            "metrics": [  # one label, one threshold map, across the metric families too
+                {"csi": {"label": "x", "thresholds": {"t": 0.5}}},
+                {"reliability": {"label": "x", "thresholds": {"t": 1.5}}},
+            ],
+        },
+        {
+            **CONFIG,
+            "metrics": [
+                {"csi": {"label": "x", "thresholds": {"t": 0.5}}},
+                {"pod": {"label": "x", "thresholds": {"t": 1.5}}},
+            ],
+        },
     ]
     for config in invalid:
         with pytest.raises(ValidationError):
             load_config(config)
+    with pytest.raises(ValidationError, match="rank_histogram"):
+        load_config({**CONFIG, "metrics": [{"rank_histogram": {"members": 8}}]})
+    with pytest.raises(ValidationError, match="one label, one threshold map"):
+        load_config(
+            {
+                **CONFIG,
+                "metrics": [
+                    {"csi": {"label": "x", "thresholds": {"t": 0.5}}},
+                    {"pod": {"label": "x", "thresholds": {"t": 1.5}}},
+                ],
+            }
+        )
+    # the config layer knows no member count, so a metric that needs one validates unbound
+    assert load_config({**CONFIG, "metrics": ["rank_histogram", "outlier_fraction"]}).metrics == [
+        "rank_histogram",
+        "outlier_fraction",
+    ]
     forecast, targets = fake_sources()
     with pytest.raises(ValueError):
         Evaluation.from_config({**CONFIG, "lead_time": "9h"}, forecast=forecast, targets=targets)

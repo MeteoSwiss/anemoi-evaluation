@@ -304,6 +304,14 @@ Per variable and node, with `m` a member, `y` the target, `e` the ensemble mean 
 | `anomaly_product` | `fa * ta` | 1 | `climatology` |
 | `forecast_anomaly_squared` | `fa^2` | 1 | `climatology` |
 | `target_anomaly_squared` | `ta^2` | 1 | `climatology` |
+| `hit_<label>` | `f * o` | 1 | n/a |
+| `miss_<label>` | `(1 - f) * o` | 1 | n/a |
+| `false_alarm_<label>` | `f * (1 - o)` | 1 | n/a |
+| `brier_<label>` | `(p - o)^2` | 1 | n/a |
+| `event_frequency_<label>` | `o` | 1 | n/a |
+| `rank_bin_<k>` | `1{below <= k <= below + ties} / (ties + 1)` | 2 | n/a |
+| `reliability_count_<label>_<k>` | `1{c == k}`, `c` the member exceedance count | 1 | n/a |
+| `reliability_event_<label>_<k>` | `1{c == k} * o` | 1 | n/a |
 
 `ensemble_variance` uses `ddof = 1`. `pairs` is computed from the centred members as
 `sum_k (2k - M - 1) * sorted(m - y)_k` for `k = 1..M`: the weights sum to zero, so centring on the target
@@ -318,6 +326,125 @@ where `c` is non-finite. A statistic that names an `aux` field the aggregator wa
 The aggregator puts the ensemble mean into `aux` once per frame (`ensemble_mean`), and, when a
 climatology is present, the anomalies and the finite mask (`forecast_anomaly`, `target_anomaly`,
 `climatology_finite`), so every statistic of a frame reuses them.
+
+`aux` is a fresh mapping per frame, handed by reference to every statistic of that frame, so a statistic
+may also **stash a per-frame intermediate in it** under a name of its own for the other statistics to
+reuse, as the rank bins do with `rank_below` and `rank_ties`. Such a field must be read through a helper
+that recomputes it when it is absent (`statistics.rank_counts`); and it must not be declared in
+`Statistic.aux`, which names what the aggregator must be given.
+
+The same rule holds for a statistic called from Python: `compute(pred, target, aux)` gets whatever the
+caller passes, or an empty mapping when it passes nothing, and the mapping it gets **belongs to that one
+frame**. It may gain keys, so reusing it for a second frame returns the first frame's stashed values with
+no error. Pass a fresh mapping per frame, as the aggregator does.
+
+#### Thresholds
+
+The five threshold statistics of the categorical family score one binarised event (the reliability levels
+have their own section below). With `t` the threshold of the variable, `y` the
+target, `e` the ensemble mean and `x_m` the members:
+
+- `o = 1{y > t}` is the observed event, `f = 1{e > t}` the binarised deterministic-equivalent forecast and
+  `p = #{m : x_m > t} / M` the ensemble exceedance fraction. At `M = 1`, `p == f`.
+- The comparison is **strict `>`**, so a node exactly at the threshold is a non-event and a `tp` threshold of
+  `0.0` means "any precipitation". Both sides are compared in float64: the threshold is a float64 value from
+  the config, and the field is cast one variable at a time.
+- Thresholds are given per variable, with a label naming the set:
+  `{csi: {label: heavy, thresholds: {tp: 0.005}}}`. Forecast and target are in the same units on the same
+  grid, so one number binarises both.
+- A variable the map does not name is **NaN** in `o`, `f` and `p`, hence NaN in the statistic, in its sum, in
+  its mean and in every metric derived from it, at every lead time, bin and region. A file therefore reads as
+  "not defined for this variable" rather than as a count of zero.
+- A threshold naming a variable the run does not have is an error at `Evaluation` construction
+  (`the thresholds of ... name variables the run does not have`).
+- `correct_negative = (1 - f) * (1 - o)` is not stored: the four cells sum to 1 elementwise, and the shared
+  validity mask drives both the statistic sums and the weight sum, so `cn = 1 - h - m - fa` holds on the
+  weighted means too, up to the float64 rounding of the division.
+- At `M = 1`, `brier = (f - o)^2`, which is 1 exactly on a miss or a false alarm and 0 otherwise, so
+  `brier == miss + false_alarm` elementwise, exactly. The stored sums group those terms differently
+  (`(m + fa) @ W` against `m @ W + fa @ W`), so on the sums and the means the two agree up to the float64
+  rounding of the summation, not bit for bit. That is what puts a deterministic checkpoint and its ensemble
+  sibling on one axis.
+
+#### The rank histogram
+
+The rank histogram records where the target falls among the sorted members. For one element, with `below`
+the number of members strictly under the target and `ties` the number exactly equal to it:
+
+- the rank is `below` when nothing is tied, and the `M + 1` statistics `rank_bin_0 ... rank_bin_M` are the
+  indicators of the rank being `k`;
+- with ties, the rank under uniform random tie-breaking is uniform over `below .. below + ties`, and the
+  stored value is that expectation, `1{below <= k <= below + ties} / (ties + 1)`. The `ties + 1` bins the
+  target could occupy each receive `1 / (ties + 1)` and every other bin receives 0. This is deterministic:
+  no seed is involved, and the rule adds no device dependence of its own: a re-run and a differently
+  sharded run give the same sums, while the members themselves still depend on the GPU model.
+- the `M + 1` values sum to 1 per element, exactly when `ties + 1` is a power of two and to a few ulp
+  otherwise, hence to float64 rounding on the weighted means. Bin `0` means the target sat below every
+  member, bin `M` that it sat above every one.
+
+The comparisons are exact in the frame's own dtype, since widening float32 to float64 is exact and order
+preserving, so nothing is cast before them; only the counts accumulate in float64. Unlike the threshold
+statistics, where the threshold itself is a float64 config value, the rank bins need no widening at all.
+The two counts are the same for all `M + 1` bins of a frame, so they are computed once and shared through
+`aux`: the cost is two comparison passes over the members per variable per frame at any `M`.
+
+A node with a non-finite member or target lands in some finite bin (a NaN member in bin 0, a `-inf` member
+counted as below), which the aggregator's shared validity mask replaces with 0 before the weighted sum, so
+no NaN ever enters a rank sum.
+
+`M` comes from the **run**, not from the spec: `rank_histogram` and `outlier_fraction` carry no
+parameters, and a metric that needs the ensemble size learns it through `bind_members` (see
+[metrics](#metrics)). At lead 0 every member equals every other one, so the target is either tied with all of
+them (the mass spread evenly, a flat histogram, the case when the targets come from the model's input
+dataset) or outside all of them (the whole mass in bin `0` or bin `M`); either way it says nothing about
+calibration.
+
+#### The reliability levels
+
+An `M`-member forecast probability is the exceedance fraction `p = c / M`, where `c` is the integer number
+of members above the threshold, so it takes only the `M + 1` values `k / M`. Those levels **are** the bins
+of the reliability diagram: nothing is configured, there is no binning convention to document, and two runs
+at different `M` cannot put the same physical forecast in different bins.
+
+Two sums are stored per level and label, `reliability_count_<label>_<k>` and
+`reliability_event_<label>_<k>`, whose weighted sums over a cell are the weight `n_k` that landed in level
+`k` and the weight `h_k` of the observed events within it. A third sum, the mean forecast probability of
+the bin, is redundant here: within a level `p` is the constant `k / M`, so it is `(k / M) n_k` exactly.
+
+The test is `c == k` on the **integer count**, never `p == k / M` on the fraction. The count is a float64
+whole number far below `2^53`, so the equality is exact by construction at any ensemble size. All `2 (M + 1)`
+statistics of a label need the same count and the same observed event, so they compute them once per frame
+and share them through `aux` under `exceedance_count_<label>` and `exceedance_event_<label>`
+(`statistics.exceedance_counts`). The label alone is the key because one label carries one threshold map
+across a whole config, which `metrics.build` enforces.
+
+From the level sums, with `W = sum_k n_k`, `obar = (sum_k h_k) / W` and `o_k = h_k / n_k`:
+
+```
+REL = (1 / W) sum_k n_k (p_k - o_k)^2     the reliability component, small is good
+RES = (1 / W) sum_k n_k (o_k - obar)^2    the resolution component, large is good
+UNC = obar (1 - obar)                     the uncertainty, a property of the observations alone
+```
+
+`BS = REL - RES + UNC` is an algebraic identity of those sums, not an approximation: the derivation needs
+only `o` binary and `p` constant within a level, and both hold exactly here. It is an identity in exact
+arithmetic, so on the stored float64 sums it holds to the rounding of the summation, never bit for bit; the
+suite asserts it to `rtol=1e-12`. `REL` and `RES` take `obar` from the level sums themselves, so each metric is
+self-contained; `brier_uncertainty` takes it from `event_frequency_<label>`, one sum it shares with `bss`,
+and the two agree to the same rounding, asserted to `rtol=1e-12`. The same grouping argument applies to `sum_k n_k`, which equals `state_weights`
+to float64 rounding.
+
+A level no forecast ever fell into has `n_k = 0`, so `o_k` is `0/0` NaN and `forecast_frequency` is 0; the
+NaN does not leak into `REL` or `RES`, whose term is replaced by zero where the weight is zero. The test is
+on the weight, which is NaN rather than zero for a variable the threshold map does not name, so that
+variable stays NaN in every metric of the family.
+
+Because `p_k = k / M` is known analytically, **a coarser diagram is a sum of levels** and needs no new
+statistics: for a group `B` of levels, `n_B = sum_{k in B} n_k`, `h_B = sum_{k in B} h_k`, the observed
+frequency is `h_B / n_B` and the mean forecast probability `sum_{k in B} n_k (k / M) / n_B`, all exact from
+the file. The reverse is impossible, which is why the levels are what is stored. Note that a `REL` computed
+on coarse bins is not the `REL` of the levels: it is smaller, because the spread of `p` within a bin is
+absorbed into the bin mean. The stored scalars are the level-exact ones.
 
 ### Metrics
 
@@ -336,6 +463,23 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `member_rmse` | `member_rmse` | `member_squared_error` | `sqrt(mean(member_squared_error))` | 1 |
 | `member_mae` | `member_mae` | `skill` | `mean(skill)` | 1 |
 | `acc` | `acc` | the three anomaly statistics | `mean(ap) / sqrt(mean(fas) * mean(tas))` | 1 |
+| `pod_<label>` | `{pod: {label: L, thresholds: {...}}}` | `hit`, `miss` | `h / (h + m)` | 1 |
+| `far_<label>` | `{far: {...}}` | `hit`, `false_alarm` | `fa / (h + fa)` | 1 |
+| `csi_<label>` | `{csi: {...}}` | `hit`, `miss`, `false_alarm` | `h / (h + m + fa)` | 1 |
+| `ets_<label>` | `{ets: {...}}` | `hit`, `miss`, `false_alarm` | `(h - hr) / (h + m + fa - hr)` | 1 |
+| `frequency_bias_<label>` | `{frequency_bias: {...}}` | `hit`, `miss`, `false_alarm` | `(h + fa) / (h + m)` | 1 |
+| `hss_<label>` | `{hss: {...}}` | `hit`, `miss`, `false_alarm` | `2 (h cn - m fa) / ((h + m)(m + cn) + (h + fa)(fa + cn))` | 1 |
+| `pss_<label>` | `{pss: {...}}` | `hit`, `miss`, `false_alarm` | `h / (h + m) - fa / (fa + cn)` | 1 |
+| `brier_<label>` | `{brier: {...}}` | `brier` | `b` | 1 |
+| `bss_<label>` | `{bss: {...}}` | `brier`, `event_frequency` | `1 - b / (obar (1 - obar))` | 1 |
+| `event_frequency_<label>` | `{event_frequency: {...}}` | `event_frequency` | `obar` | 1 |
+| `rank_histogram` | `rank_histogram` | `rank_bin_0..rank_bin_M` | the `M + 1` means, stacked on a `rank` axis | 2 |
+| `outlier_fraction` | `outlier_fraction` | `rank_bin_0`, `rank_bin_M` | `mean(rank_bin_0) + mean(rank_bin_M)` | 2 |
+| `reliability_<label>` | `{reliability: {label: L, thresholds: {...}}}` | `reliability_count_L_0..M`, `reliability_event_L_0..M` | `o_k = h_k / n_k`, stacked on a `probability` axis | 1 |
+| `forecast_frequency_<label>` | `{forecast_frequency: {...}}` | `reliability_count_L_0..M` | `n_k / sum_j n_j`, on the same axis | 1 |
+| `brier_reliability_<label>` | `{brier_reliability: {...}}` | the `2 (M + 1)` level sums | `REL` | 1 |
+| `brier_resolution_<label>` | `{brier_resolution: {...}}` | the `2 (M + 1)` level sums | `RES` | 1 |
+| `brier_uncertainty_<label>` | `{brier_uncertainty: {...}}` | `event_frequency` | `obar (1 - obar)` | 1 |
 
 `c(alpha, M) = alpha / (M * (M - 1)) + (1 - alpha) / M^2`, with `M` the ensemble size of the run.
 `alpha = 0` is the standard kernel CRPS, `alpha = 1` the fair CRPS; `alpha` must be in `[0, 1]`.
@@ -353,6 +497,49 @@ Ensemble conventions: `bias`, `mae`, `rmse`, `spread_skill` and `acc` score the 
 below `rmse`. A deterministic model is `M = 1`, where `member_squared_error` equals `squared_error` and
 the metrics needing 2 members are rejected at construction (`the metrics need at least N members`).
 
+For an ensemble, the seven contingency scores (`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`)
+and the cells they come from binarise the **ensemble mean** and therefore score it as a point forecast.
+That is not the same event as the deterministic sibling's: the mean of a skewed variable has less spread
+than a member, so at a rare threshold it exceeds far less often and `frequency_bias` and `pod` fall well
+below a single member's. `brier` and `bss`, and the reliability diagram at one member, are what compares
+the two model kinds directly, since they use the exceedance fraction. The contingency table at a chosen probability level is derivable from the
+reliability level sums of the same label (`n_k`, `h_k`), and is a natural follow-up rather than something
+the file lacks.
+
+The ten threshold metrics are functions of the weighted means of the threshold statistics of the same label:
+`h = mean(hit_L)`, `m = mean(miss_L)`, `fa = mean(false_alarm_L)`, `cn = 1 - h - m - fa`, `b = mean(brier_L)`
+and `obar = mean(event_frequency_L)`, each pooled over the nodes and init times of a cell.
+`hr = (h + fa) * (h + m)` is the random-hit rate, which needs no division because the four cells are
+normalised to 1 (see [thresholds](#thresholds)). All ten need only **one member**, so they work for a
+deterministic checkpoint.
+
+Their names are `<kind>_<label>`, for example `csi_heavy`, and the sums they store are
+`state_sum_hit_heavy` and friends. Metrics of the same label share their statistics, so `csi_heavy` and
+`pod_heavy` together store three sums, not five. Two metrics that resolve to the same name are refused
+(`duplicate metric names`), as are two metrics whose statistics share a name with different thresholds
+(`both need a statistic named ... with different parameters`). A label names one event, so every metric
+carrying that label must give the same threshold map; a config in which two of them disagree is refused at
+config load, and at construction from Python, before any data is read (`one label, one threshold map`), and
+that holds across the families, `csi_warm` against `reliability_warm` as much as `csi_warm` against `pod_warm`.
+`brier_<label>` and `event_frequency_<label>`
+are each both a metric and a statistic: the metric is the plain data variable, the sum is written as
+`state_sum_brier_<label>` and `state_sum_event_frequency_<label>`.
+
+`bss` is a skill score against **the base rate of its own cell**, so it is not comparable across cells: a
+different lead time, region or bin is a different reference. Its denominator vanishes where `obar` is 0 or 1,
+giving NaN when `b` is 0 and minus infinity otherwise. `pod`, `far`, `csi`, `ets` and `frequency_bias` are
+0/0 NaN in a cell where nothing was observed and nothing was forecast, which is the honest reading of a
+threshold too rare for the sample; `event_frequency_<label>` in the same file is how a reader sees why.
+`pss` is close to `pod` for rare events, since `fa / (fa + cn)` is tiny when the correct negatives dominate.
+
+`rank_histogram` is not one number per `(lead_time, bin, variable, region)`: it carries an extra `rank`
+axis of `M + 1` values, see the [NetCDF layout](#netcdf-layout). `reliability_<label>` and
+`forecast_frequency_<label>` are the other metrics carrying an extra axis, the `probability` one; the three
+`brier_*` components are ordinary scalars. The five need only one member, unlike the rank histogram: at
+`M = 1` the diagram has the two points of a contingency table. `outlier_fraction`
+is the fraction of targets that fell outside the ensemble range, `2 / (M + 1)` for a calibrated ensemble,
+and stores only the two end bins when it is asked for alone.
+
 Missing targets never enter the sums: with `on_missing_target: skip` the frame is dropped entirely, so
 its `n_init` is not incremented either. With `raise` the `MissingTargetError` propagates.
 
@@ -368,7 +555,7 @@ The state holds float64 sums over the four axes `(lead_time, bin, variable, regi
 | `bins` | list of str | Second axis, the binning's coordinates. |
 | `variables` | list of str | Third axis. |
 | `regions` | list of str | Fourth axis. |
-| `sums` | dict name to float64 tensor `(L, B, V, R)` | One per statistic. |
+| `sums` | dict name to float64 tensor `(L, B, V, R)` | One per statistic, always on these four axes; a metric with an extra output axis is built from several statistics at output time. |
 | `weights` | float64 tensor `(L, B, V, R)` | Weight sum of the valid elements. |
 | `n_init` | int64 tensor `(L, B)` | Frames added. |
 | `members` | int | Ensemble size of the frames. |
@@ -395,12 +582,14 @@ Dimensions and coordinates:
 | `init_time` | `init_time` | `datetime64[ns]` | Init times that contributed. |
 | `param` | `variable` | str | Parameter of each variable, `""` when unknown. |
 | `level` | `variable` | float | Level of each variable, NaN when unknown. |
+| `rank` | `rank` | int64 | `0..M`, present only when a metric declares it (`rank_histogram`). |
+| `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`). |
 
 Data variables:
 
 | Variable | Dimensions | Content |
 |---|---|---|
-| `<metric>` | `(lead_time, bin, variable, region)` | One per configured metric, named by `Metric.name`, derived from the means including the pooled `all` bin. |
+| `<metric>` | `(lead_time, bin, variable, region)` plus any extra dimension the metric declares | One per configured metric, named by `Metric.name`, derived from the means including the pooled `all` bin. `rank_histogram` is on `(lead_time, bin, variable, region, rank)`, `reliability_<label>` and `forecast_frequency_<label>` on `(lead_time, bin, variable, region, probability)`. |
 | `n_init` | `(lead_time, bin)` | Frames, with the `all` bin summed. |
 | `weight_sum` | `(lead_time, bin, variable, region)` | Weight sum of the valid elements, with the `all` bin summed. |
 | `state_sum_<statistic>` | `(lead_time, state_bin, variable, region)` | The raw float64 sums, one per statistic. |
@@ -593,16 +782,32 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 
 #### Metrics, statistics, binning, weights, regions
 
-- `metrics`: the `Metric` base class (`name`, `statistics`, `spec`, `min_members`,
-  `from_means(means, members)`); `Bias`, `MAE`, `RMSE`, `CRPS(alpha=0.0)`, `FairCRPS`, `Spread`,
-  `SpreadSkill`, `MemberRMSE`, `MemberMAE`, `ACC`; `REGISTRY`, the name-to-class mapping a new metric
-  registers in; `from_spec(spec)`, `unique_statistics(metrics)`, `required_aux(metrics)`,
-  `min_members(metrics)`.
-- `statistics`: the `Statistic` base class (`name`, `min_members`, `aux`, `compute(pred, target, aux=None)`)
-  and the ten statistics of the [statistics table](#statistics); `crps_coefficient(alpha, members)`;
-  `ensemble_mean(pred, aux=None)`. `per_variable(pred, target, function)`,
-  `anomalies(mean, target, climatology)` and `climatology_anomalies(pred, target, aux)` are the helpers
-  for writing a custom `Statistic`.
+- `metrics`: the `Metric` base class (`name`, `statistics`, `spec`, `min_members`, `output_dim`,
+  `bind_members(members)`, `from_means(means, members)`); `Bias`, `MAE`, `RMSE`, `CRPS(alpha=0.0)`,
+  `FairCRPS`, `Spread`, `SpreadSkill`, `MemberRMSE`, `MemberMAE`, `ACC`; the threshold metrics
+  `ThresholdMetric(label=None, thresholds=None)` and its subclasses `POD`, `FAR`, `CSI`, `ETS`,
+  `FrequencyBias`, `HSS`, `PSS`, `BrierScore`, `BSS`, `EventFrequency` and `BrierUncertainty`; the
+  `LabelledMetric` mixin they take their label, name and spec from; `EnsembleSizeMetric` and its
+  subclasses `RankHistogram` and `OutlierFraction`, which gain their statistics in `bind_members`;
+  `ReliabilityMetric`, which depends on both the variables and the ensemble size, and its subclasses
+  `ReliabilityDiagram`, `ForecastFrequency`, `BrierReliability` and `BrierResolution`; `REGISTRY`, the
+  name-to-class mapping a new metric registers in; `from_spec(spec)`,
+  `build(specs, variables=None, members=None)` (the constructor the driver and the config use: it refuses
+  duplicate names and conflicting statistics, binds the metrics to the ensemble size and the statistics to
+  the variables), `unique_statistics(metrics)`, `required_aux(metrics)`, `min_members(metrics)`.
+- `statistics`: the `Statistic` base class (`name`, `min_members`, `aux`, `parameters`, `__eq__`,
+  `bind_variables(variables)`, `compute(pred, target, aux=None)`) and the statistics of the
+  [statistics table](#statistics), the threshold ones through
+  `ThresholdStatistic(label=None, thresholds=None)` with the subclasses `Hit`, `Miss`, `FalseAlarm`,
+  `Brier` and `EventFrequency`, the rank bins through `RankBin(k, members)` and the reliability levels
+  through `ReliabilityLevel(label=None, thresholds=None, *, k, members)` with the subclasses
+  `ReliabilityCount` and `ReliabilityEvent`;
+  `crps_coefficient(alpha, members)`; `ensemble_mean(pred, aux=None)`.
+  `per_variable(pred, target, function)`, `anomalies(mean, target, climatology)`,
+  `climatology_anomalies(pred, target, aux)`, `exceedance(field, thresholds)`,
+  `exceedance_count(pred, thresholds)`, `exceedance_fraction(pred, thresholds)`,
+  `exceedance_counts(pred, target, thresholds, label, aux)`, `rank_counts(pred, target, aux)` and
+  `validate_thresholds(label, thresholds)` are the helpers for writing a custom `Statistic`.
 - `binning`: the `Binning` protocol (`kind`, `by`, `coords`, `index(frame)`); `SeasonBinning`,
   `MonthBinning`, `InitTimeBinning(init_times, lead_times=(), by="init_time")` and `NoBinning`, each
   taking `by="init_time"`; `build(kind="season", by="init_time", init_times=(), lead_times=())`;
@@ -778,6 +983,8 @@ Consequences:
 - The arithmetic identity of a run also depends on the GPU model and on the inference chunk counts, which
   is why the result file records `gpu`, `inference_chunks_processor` and `inference_chunks_mapper` along
   with the package versions and the full config.
+- The rank histogram needs no seed: ties are spread deterministically rather than broken at random, so a
+  re-run and a differently sharded run give the same sums.
 - Shared forcings are a pure cache: the cached array is what the provider would have computed for the
   same dates on the same grid, so caching changes no number. A request on a different grid bypasses the
   cache.
@@ -797,7 +1004,26 @@ Constraints the code enforces, with the message or behaviour:
   raises. A `lead_time` that is not a multiple of a multi-step model's `output_horizon` is allowed, warns,
   and discards the outputs beyond it.
 - **Metrics needing members.** Constructing an `Evaluation` whose metrics need more members than the
-  forecast source has raises.
+  forecast source has raises. A metric whose statistics depend on the ensemble size learns it there through
+  `bind_members`, called by `metrics.build` from the evaluation and from the merge CLI (where it comes from
+  the file's `members` attr); it refuses a run with too few members with its own message
+  (`rank_histogram needs at least 2 members, the run has 1`) and refuses to be rebound to a different size
+  (`already bound to 4 members, cannot rebind to 8`).
+- **The lead-0 rank histogram says nothing about calibration**: every member equals every other one there, so
+  the target is either tied with all of them (the mass spread evenly, a flat histogram, the case when the
+  targets come from the model's input dataset) or outside all of them (the whole mass in bin `0` or bin `M`).
+- **The lead-0 reliability diagram is two points by construction**: every member equals every other one, so
+  only the levels 0 and `M` are populated and the interior of the curve is NaN. Like the lead-0 rank
+  histogram, that is a property of the frames, not a calibration statement.
+- **The level sums grow as `2 (M + 1)` per label.** At `M = 8` and three labels that is 54 netcdf variables
+  and a few MB; at `M = 51` it is 312 variables and a result file of about 90 MB. Those figures are computed
+  from the state shape and checked once by hand on the fakes, not in the test suite; the per-frame GPU cost of
+  that many statistics at 1.7M nodes has not been measured. A large ensemble with many labels is worth a thought. Any
+  coarser diagram can be computed from the stored levels afterwards.
+- **A label should not begin with a metric kind.** `{brier: {label: reliability_heavy, ...}}` produces the
+  name `brier_reliability_heavy`, which collides with `{brier_reliability: {label: heavy, ...}}`; the
+  collision is refused loudly (`duplicate metric names`), and the tools split such names longest kind first,
+  but the confusion is avoidable.
 - **`acc` needs a climatology**; `AnomalyProduct` and the other anomaly statistics raise when
   `climatology` is not in `aux`.
 - **A climatology key that a valid time maps to must exist**, otherwise `ArrayClimatology.frame` raises.
@@ -807,6 +1033,19 @@ Constraints the code enforces, with the message or behaviour:
   `MissingTargetError` from `initial_frame` is caught and logged, and only that lead-0 frame is dropped.
   For an inference checkpoint, diagnostic variables are NaN at lead 0 and therefore excluded there by the
   finiteness mask; `spread_skill` at lead 0 is NaN (0/0) for a perfect initial state.
+- **Thresholds.** A threshold naming a variable the run does not have raises at `Evaluation` construction,
+  where the variables are known; a run variable the map omits is not an error but reads as NaN in every
+  threshold statistic and metric. A label must be non-empty and match `[A-Za-z0-9_]+`, a threshold value must
+  be a finite number (NaN and infinity are refused) and an empty `thresholds` mapping is an error; all three
+  are checked at config load. A `Metric` instance passed into two `Evaluation` objects with different
+  variable orders raises rather than re-binding, since the first evaluation would otherwise score the wrong
+  columns.
+- **Duplicate metric names** are refused at construction, including `metrics: [rmse, rmse]`, and so are two
+  metrics whose statistics share a name but not their parameters, and a label used with two different
+  threshold maps (`one label, one threshold map`), which is refused before any binding.
+- **Threshold metrics are legitimately NaN** where their cell is degenerate: `pod`, `far`, `csi`, `ets` and
+  `frequency_bias` where nothing was observed and nothing forecast, `bss` where the base rate is 0 or 1 (NaN
+  or minus infinity, depending on the Brier score).
 - **Regions.** An empty `regions` mapping falls back to `{global: all}` rather than raising; regions may
   overlap and no check is made that they partition the grid. `regions.stack({}, n)`, called directly,
   raises `at least one region is required`.

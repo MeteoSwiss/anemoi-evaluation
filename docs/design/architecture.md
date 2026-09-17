@@ -175,8 +175,9 @@ run on (NFR-21).
 
 A `Statistic` maps `(M, V, N)` predictions and a `(1, V, N)` target to `(V, N)` float64 and
 declares `min_members` and the per-frame `aux` fields it needs. A `Metric` names the statistics it
-consumes (deduplicated across metrics by name), exposes its YAML `spec`, its `min_members`, and
-`from_means(means, members)` mapping `(L, B, V, R)` means to the metric (FR-12). The stored
+consumes (deduplicated across metrics by name), exposes its YAML `spec`, its `min_members`, its optional
+extra output dimension `output_dim`, `bind_members(members)` and `from_means(means, members)` mapping
+`(L, B, V, R)` means to the metric (FR-12). The stored
 primitives, the metrics derived from them and their formulas are listed in
 [`../reference.md`](../reference.md); `members` is recorded in the state, which is what lets a
 CRPS coefficient be applied after the fact.
@@ -189,6 +190,33 @@ target: the weights sum to zero so the centring is free, and the sorted form avo
 
 `REGISTRY` and `from_spec` map a name or a single-key mapping onto a metric instance, which is what
 the config layer and the result file's metric list use.
+
+A statistic may be **parametrised**: the threshold statistics carry a label and a per-variable threshold
+map, and encode them in the name (`hit_heavy`) so that the state, the netcdf and the merge logic keep
+working by name alone. The parameters are also returned from `parameters`, which defines equality, so
+`unique_statistics` refuses a name that means two different statistics instead of silently keeping one of
+them. The per-variable part is resolved once per run by `bind_variables`, called by `metrics.build` from
+`Evaluation.__init__`, where the variable order is already known: the aggregator, the state and the output
+are untouched, `aux` stays a mapping of tensors, and a threshold naming an unknown variable fails before a
+model is loaded.
+
+A metric may instead depend on the **ensemble size**: the rank histogram has one statistic per rank bin,
+so it has none until it knows `M`. It creates them in `bind_members`, called by `metrics.build` from
+`Evaluation.__init__`, where `forecast.members` is already known, and from the merge CLI, where it comes
+from the file's `members` attr. The metric is a valid object before that (empty statistics, `min_members`
+of its own, its bare spec), so the config layer can validate a spec naming it without knowing any run;
+rebinding it to a different size raises, since the statistics, the coordinate and every stored sum would
+change under an evaluation still holding the instance.
+
+A metric may depend on **both**, as the reliability levels do: they need the run's variables for the
+thresholds and its ensemble size for the levels. The `LabelledMetric` mixin carries the label, the name and
+the spec for every labelled family, so a metric that cannot build its statistics yet still validates its
+label and its map at construction (`statistics.validate_thresholds`), and `ReliabilityMetric` inherits the
+`bind_members` machinery unchanged. `metrics.build` fixes the order that makes this work: bind the ensemble
+size, check the names and the one-label-one-threshold-map rule, deduplicate the statistics, then bind the
+variables on the statistics that exist by then. The label rule is checked without any binding, which is why
+it can be enforced at config-validation time, where the statistic identity guard has nothing to compare
+yet.
 
 ### 3.7 Aggregation: `aggregation.py`
 
@@ -205,7 +233,14 @@ validity mask `isfinite(pred).all(0) & isfinite(target[0])`, adds `valid.double(
 weights, and for every statistic adds `where(valid, statistic.compute(...), 0) @ W` to its sums
 (FR-18, FR-19). It computes the ensemble mean once per frame and, with a climatology, the two
 anomaly fields and the finite mask once, passing them to the statistics through `aux`; a statistic
-whose declared `aux` is missing raises rather than silently computing something else.
+whose declared `aux` is missing raises rather than silently computing something else. `aux` is rebuilt for
+each frame and handed to every statistic of that frame by reference, so a statistic may also put an
+intermediate of its own in it for the others to reuse (the rank bins share `rank_below` and `rank_ties`
+that way, the reliability levels of one label the exceedance count and the observed event); the mapping does
+not outlive the frame, which is what makes the sharing safe without a cache key. Within a frame the key must
+still carry everything that changes the value: the level statistics key on the label because one label
+carries one threshold map across a config, and a family without that property would have to key on the
+thresholds too.
 
 ### 3.8 Weights, regions, bins
 
@@ -269,6 +304,12 @@ construction (lead time against the timestep, grids, variables, member requireme
 peak memory, unions the init times, replaces the config with a JSON object `{"merge": [...]}` of
 the inputs' configs, records the files it merged, and drops or rewrites the shard tag.
 `_merged_shard()` implements the shard-set validation of FR-32 and names the offending files.
+
+A metric may declare an **extra output axis** through `output_dim`, returning a name and its coordinate
+values; `to_xarray` then writes that metric on the four standard dimensions plus that one and adds the
+coordinate. It lives only here: the state, `load_state` and `merge` keep the four-axis shape, one sum per
+statistic. That is the cheap side of the trade, because the exactness argument is about the sums and the
+sums do not move.
 
 ### 3.12 CLI: `__main__.py`
 
@@ -386,7 +427,9 @@ unit test with an interleaving fake source checks this.
 | a new target source | subclass `TargetSourceBase`; read-ahead, availability and sub-grids are optional |
 | a new climatology | subclass `ClimatologySourceBase`, returning a read-only `(V, N)` tensor |
 | a new statistic | subclass `Statistic`, declaring its name, minimum members and `aux` |
-| a new metric | subclass `Metric`, declaring the statistics it needs; add it to `REGISTRY` to make it configurable by name |
+| a parametrised statistic | subclass `Statistic`, encode the parameters in `name`, return them from `parameters`, and bind any per-variable state in `bind_variables` |
+| a new metric | subclass `Metric`, declaring the statistics it needs; add it to `REGISTRY` to make it configurable by name; a metric that needs the run's ensemble size subclasses `EnsembleSizeMetric` and creates its statistics in `_build_statistics`, called from `bind_members`; the two bindings compose, a metric needing the variables and the ensemble size mixes in `LabelledMetric` as `ReliabilityMetric` does |
+| a metric with an extra output axis | return `(name, values)` from `output_dim` and an array with that axis last from `from_means`; `to_xarray` writes the dimension and the coordinate |
 | a new binning | implement the `Binning` protocol |
 | a new weight or region spec | add the builder in `weights.py` or `regions.py` and a single-key spec model in `config.py` |
 
@@ -405,7 +448,9 @@ attributes.
 The two bin axes are the one deliberate redundancy. `bin` carries the stored bins plus a derived
 `all` that is the sum over them taken *before* the division, which is what a reader wants;
 `state_bin` carries the stored bins only, which is what a merge must sum (FR-30, FR-31). Writing
-the derived column into the state would double-count on the first merge.
+the derived column into the state would double-count on the first merge. An extra metric axis (the
+`rank` of a rank histogram and the `probability` of a reliability diagram) exists in the derived half of the
+file only.
 
 ## 8. What the package relies on upstream
 

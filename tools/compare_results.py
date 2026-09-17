@@ -7,7 +7,9 @@ CPU only, a second or two. By default coordinates, n_init, weight sums and init 
 file with extra leads (lead 0) or extra statistics can be checked against an older one.
 
 Prints the number of leads and the statistics compared, whether the coordinates, members, init times, `n_init` and
-weights are identical, one line per raw sum and per metric saying `bit-exact` or the maximum relative difference, the
+weights are identical, one line per raw sum and per metric saying `bit-exact` or the maximum relative difference (a
+metric carrying an extra axis, the rank of a rank histogram or the probability of a reliability diagram, is
+compared element by element like any other), the
 timing and counter attrs of both files, and a final `STRUCTURE OK` or `STRUCTURE DIFFERS` (also the exit status, 0 or 1).
 """
 
@@ -38,20 +40,25 @@ print(f"leads compared: {len(leads)} of {len(a.lead_times)} / {len(b.lead_times)
 print("coords/members/init_times/n_init/weights identical:", ok)
 for name in names:
     x, y = a.sums[name][ia], b.sums[name][ib]
-    exact = torch.equal(x, y)
-    rel = float(((x - y).abs() / x.abs().clamp_min(1e-30)).max())
-    print(f"sum {name}: {'bit-exact' if exact else f'max relative difference {rel:.3e}'}")
+    exact = bool(((x == y) | (x.isnan() & y.isnan())).all())  # a threshold sum is NaN for the variables it omits
+    detail = (
+        "bit-exact"
+        if exact
+        else f"max relative difference {float(((x - y).abs() / x.abs().clamp_min(1e-30)).max()):.3e}"
+    )
+    print(f"sum {name}: {detail}")
 da, db = (xr.open_dataset(path, decode_timedelta=True).load() for path in (args.a, args.b))
 lead_values = np.array(leads, dtype="timedelta64[ns]")
 for name in da.data_vars:
     if name.startswith("state_") or name in ("n_init", "weight_sum") or name not in db:
         continue
     x, y = da[name].sel(lead_time=lead_values).values, db[name].sel(lead_time=lead_values).values
-    with np.errstate(invalid="ignore", divide="ignore"):
+    if np.array_equal(x, y, equal_nan=True):
+        print(f"metric {name}: bit-exact")
+        continue
+    with np.errstate(invalid="ignore", divide="ignore"):  # computed only when they differ: an all-NaN metric is legal
         rel = np.nanmax(np.abs(x - y) / np.maximum(np.abs(x), 1e-30))
-    print(
-        f"metric {name}: {'bit-exact' if np.array_equal(x, y, equal_nan=True) else f'max relative difference {rel:.3e}'}"
-    )
+    print(f"metric {name}: max relative difference {rel:.3e}")
 print(
     "attrs a:", {k: v for k, v in a.attrs.items() if k.startswith(("time_", "peak", "shard", "target", "model_calls"))}
 )

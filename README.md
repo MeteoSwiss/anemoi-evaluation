@@ -15,7 +15,10 @@ contents of the result file may still change between releases.
   ensemble variance, kernel-CRPS primitives, anomaly products) are accumulated as float64 sums
   per (lead time, time bin, variable, region); metrics are derived from the means. Included:
   RMSE, MAE, bias, member RMSE and MAE, CRPS for any `alpha` (standard and fair), spread,
-  spread-skill, and ACC against a climatology.
+  spread-skill, ACC against a climatology, the categorical and probabilistic scores at
+  user-given thresholds (POD, FAR, CSI, ETS, frequency bias, HSS, PSS, Brier score and skill
+  score, base rate), the rank histogram of an ensemble with its outlier fraction, and the
+  reliability diagram of a threshold with the Brier decomposition `BS = REL - RES + UNC`.
 * **Ensembles** as lockstep rollouts of the same runner, reseeded per member and per model call.
 * **Multi-step-output models** (several lead times per forward pass) are scored per output time;
   lead 0 can be scored from the initial state.

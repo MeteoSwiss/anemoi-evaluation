@@ -124,8 +124,9 @@ parameter (the CRPS `alpha`) is baked into a file.
 
 **FR-13** The catalogue MUST cover the deterministic scores (bias, MAE, RMSE), the ensemble
 scores (member MAE and RMSE, CRPS for any `alpha` in [0, 1] including the standard and fair
-cases, spread, spread-skill) and the anomaly correlation, each available per lead time, bin,
-variable and region. The exact names and formulas are in [`../reference.md`](../reference.md).
+cases, spread, spread-skill), the anomaly correlation, the categorical and probabilistic scores at
+user-given thresholds, the rank histogram of an ensemble, and the reliability diagram and Brier
+decomposition of a threshold, each available per lead time, bin, variable and region. The exact names and formulas are in [`../reference.md`](../reference.md).
 
 **FR-14** A metric needing more members than the run has MUST fail at construction, not mid-run.
 
@@ -142,6 +143,26 @@ builder for richer climatologies, and none upstream.
 MUST NOT change the shared weights of the frame; the count per variable MUST be recorded.
 *Rationale: only the ACC ratio is then meaningful, and it is weight-invariant; excluding those
 nodes everywhere would make every other metric depend on the climatology.*
+
+**FR-36** A threshold score MUST be configured as a per-variable mapping with a user-given label, MUST
+binarise the forecast and the target with a strict `>` in float64, MUST yield NaN for the variables the
+mapping omits and MUST fail at construction for a variable the run does not have. A statistic name that
+means two different statistics in one run MUST be an error at construction. At one member the Brier
+score MUST equal `miss + false_alarm` exactly elementwise, hence on the weighted means up to float64
+rounding, so that a deterministic and an ensemble run are comparable. *Verified by the unit suite.*
+
+**FR-37** The rank histogram MUST spread tied members deterministically, putting `1 / (ties + 1)` into
+each of the `ties + 1` bins the target could occupy, so that it is the expectation of uniform random
+tie-breaking and needs no seed. The `M + 1` stored values MUST sum to 1 per element to float64 rounding,
+and their weighted means MUST therefore sum to 1 to float64 rounding. A metric whose statistics depend on
+the ensemble size MUST learn it at construction through `bind_members` and MUST refuse to be rebound to a
+different size. *Verified by the unit suite.*
+
+**FR-38** For each threshold label, the system MUST be able to report the observed event frequency and the
+forecast-probability distribution at each of the `M + 1` ensemble probability levels, and the Brier
+decomposition `BS = REL - RES + UNC` as three scalars, from area-weighted sums that merge by addition. The
+decomposition MUST agree with the stored Brier score to float64 rounding of the weighted sums.
+*Verified by the unit suite.*
 
 ### 3.4 Aggregation
 
@@ -333,7 +354,7 @@ model call, since those frames all need their targets at once.
 
 **NFR-21** The unit test suite MUST run on CPU in seconds and MUST NOT need a checkpoint, a GPU
 or a dataset; anything that needs a checkpoint belongs in
-[`tools/`](../../tools/README.md). *Status: 38 tests at v0.1.0.*
+[`tools/`](../../tools/README.md). *Status: 38 tests at v0.1.0, 72 with the categorical, rank histogram and reliability scores.*
 
 **NFR-22** Numerical claims MUST be checked against an independent reference: the aggregator
 against a naive numpy float64 computation, CRPS against the naive pairwise formula, the ensemble
@@ -371,6 +392,16 @@ Deliberate non-goals at v0.1.0. Each is a decision, not an oversight.
   sequential members with a pinned host buffer ([`architecture.md`](architecture.md) section 9).
 * **Multi-dataset checkpoints**, refused at construction, and **comparing several checkpoints in
   one run**: one checkpoint per run, comparison is offline from result files.
+* **Neighbourhood scores** (FSS and its relatives). They are not per-node reductions, and on an
+  unstructured grid a neighbourhood is a spatial query the package has no index for.
+* **Quantile, climatological or otherwise per-node thresholds.** Thresholds are fixed numbers in the
+  model's units, which is the operational question (warning levels are absolute); a per-node threshold
+  field needs a per-node quantile climatology, which the climatology source does not build (FR-16).
+  Only exceedances are configurable, so a below-threshold event is read as the complement of its cells.
+* **Sampling uncertainty.** No confidence intervals and no bootstrap: over the 60 to 80 init times of a
+  campaign a rare-event score has wide and correlated uncertainty, and quantifying it is a separate
+  problem from accumulating the sums. The fractional tie spreading of the rank histogram also makes its
+  bins non-multinomial, so the usual flatness test would be conservative rather than exact.
 
 ## 6. Verification
 
