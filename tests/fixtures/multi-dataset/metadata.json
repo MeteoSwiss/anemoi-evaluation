@@ -1,0 +1,1264 @@
+{
+ "version": "2.0",
+ "seed": 42,
+ "run_id": "d346981c-5e3a-541e-b0cf-b9d7b471ca5b",
+ "uuid": "16c66125-ca91-539f-8f14-9378e728d317",
+ "timestamp": "2026-09-17T00:00:00",
+ "config": {
+  "data": {
+   "format": "zarr",
+   "frequency": "6h",
+   "timestep": "6h",
+   "datasets": {
+    "era5": {
+     "forcing": [
+      "cos_julian_day",
+      "sin_julian_day",
+      "cos_latitude",
+      "sin_latitude",
+      "cos_longitude",
+      "sin_longitude",
+      "insolation",
+      "lsm",
+      "z"
+     ],
+     "diagnostic": [
+      "tp"
+     ],
+     "target": null,
+     "processors": {}
+    },
+    "realch1": {
+     "forcing": [
+      "cos_julian_day",
+      "sin_julian_day",
+      "cos_latitude",
+      "sin_latitude",
+      "cos_longitude",
+      "sin_longitude",
+      "insolation",
+      "lsm"
+     ],
+     "diagnostic": [
+      "tp"
+     ],
+     "target": null,
+     "processors": {}
+    }
+   },
+   "num_features": {
+    "era5": 16,
+    "realch1": 15
+   }
+  },
+  "training": {
+   "multistep_input": 2,
+   "multistep_output": 1,
+   "precision": "16-mixed",
+   "model_task": "anemoi.training.train.tasks.GraphForecaster"
+  },
+  "dataloader": {
+   "batch_size": {
+    "training": 1,
+    "validation": 1
+   },
+   "read_group_size": 1,
+   "num_workers": {
+    "training": 1,
+    "validation": 1
+   },
+   "training": {
+    "datasets": {
+     "era5": {
+      "dataset_config": {
+       "dataset": "aifs-ea-an-oper-0001-mars-n320-1979-2024-6h-v1-for-single-v2.zarr",
+       "select": [
+        "2t",
+        "10u",
+        "10v",
+        "msl",
+        "t_850",
+        "q_850",
+        "tp",
+        "lsm",
+        "z",
+        "cos_julian_day",
+        "sin_julian_day",
+        "cos_latitude",
+        "sin_latitude",
+        "cos_longitude",
+        "sin_longitude",
+        "insolation"
+       ]
+      },
+      "start": "2020",
+      "end": "2020",
+      "trajectory": null
+     },
+     "realch1": {
+      "dataset_config": {
+       "dataset": "mch-realch1-fdb-1km-2005-2025-1h-pl13-v1.0.zarr",
+       "frequency": "6h",
+       "select": [
+        "T_2M",
+        "U_10M",
+        "V_10M",
+        "PMSL",
+        "T_850",
+        "QV_850",
+        "TOT_PREC_6H",
+        "FR_LAND",
+        "cos_julian_day",
+        "sin_julian_day",
+        "cos_latitude",
+        "sin_latitude",
+        "cos_longitude",
+        "sin_longitude",
+        "insolation"
+       ],
+       "rename": {
+        "T_2M": "2t",
+        "U_10M": "10u",
+        "V_10M": "10v",
+        "PMSL": "msl",
+        "T_850": "t_850",
+        "QV_850": "q_850",
+        "TOT_PREC_6H": "tp",
+        "FR_LAND": "lsm"
+       }
+      },
+      "start": "2020",
+      "end": "2020",
+      "trajectory": null
+     }
+    }
+   },
+   "validation": {
+    "datasets": {
+     "era5": {
+      "dataset_config": {
+       "dataset": "aifs-ea-an-oper-0001-mars-n320-1979-2024-6h-v1-for-single-v2.zarr",
+       "select": [
+        "2t",
+        "10u",
+        "10v",
+        "msl",
+        "t_850",
+        "q_850",
+        "tp",
+        "lsm",
+        "z",
+        "cos_julian_day",
+        "sin_julian_day",
+        "cos_latitude",
+        "sin_latitude",
+        "cos_longitude",
+        "sin_longitude",
+        "insolation"
+       ]
+      },
+      "start": "2020",
+      "end": "2020",
+      "trajectory": null
+     },
+     "realch1": {
+      "dataset_config": {
+       "dataset": "mch-realch1-fdb-1km-2005-2025-1h-pl13-v1.0.zarr",
+       "frequency": "6h",
+       "select": [
+        "T_2M",
+        "U_10M",
+        "V_10M",
+        "PMSL",
+        "T_850",
+        "QV_850",
+        "TOT_PREC_6H",
+        "FR_LAND",
+        "cos_julian_day",
+        "sin_julian_day",
+        "cos_latitude",
+        "sin_latitude",
+        "cos_longitude",
+        "sin_longitude",
+        "insolation"
+       ],
+       "rename": {
+        "T_2M": "2t",
+        "U_10M": "10u",
+        "V_10M": "10v",
+        "PMSL": "msl",
+        "T_850": "t_850",
+        "QV_850": "q_850",
+        "TOT_PREC_6H": "tp",
+        "FR_LAND": "lsm"
+       }
+      },
+      "start": "2020",
+      "end": "2020",
+      "trajectory": null
+     }
+    }
+   }
+  },
+  "model": {
+   "noise_injector": null,
+   "encoders": {
+    "0": {
+     "source_datasets": [
+      "era5"
+     ]
+    },
+    "1": {
+     "source_datasets": [
+      "realch1"
+     ]
+    }
+   },
+   "decoders": {
+    "0": {
+     "target_datasets": [
+      "era5"
+     ]
+    },
+    "1": {
+     "target_datasets": [
+      "realch1"
+     ]
+    }
+   }
+  }
+ },
+ "dataset": {
+  "era5": {
+   "version": "0.5.43",
+   "arguments": {
+    "args": [
+     {
+      "dataset": "aifs-ea-an-oper-0001-mars-n320-1979-2024-6h-v1-for-single-v2.zarr",
+      "select": [
+       "2t",
+       "10u",
+       "10v",
+       "msl",
+       "t_850",
+       "q_850",
+       "tp",
+       "lsm",
+       "z",
+       "cos_julian_day",
+       "sin_julian_day",
+       "cos_latitude",
+       "sin_latitude",
+       "cos_longitude",
+       "sin_longitude",
+       "insolation"
+      ],
+      "start": "2020-01-01T00:00:00",
+      "end": "2020-01-05T00:00:00"
+     }
+    ],
+    "kwargs": {}
+   },
+   "frequency": "6h",
+   "variables": [
+    "2t",
+    "10u",
+    "10v",
+    "msl",
+    "t_850",
+    "q_850",
+    "tp",
+    "lsm",
+    "z",
+    "cos_julian_day",
+    "sin_julian_day",
+    "cos_latitude",
+    "sin_latitude",
+    "cos_longitude",
+    "sin_longitude",
+    "insolation"
+   ],
+   "variables_metadata": {
+    "10u": {
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levtype": "sfc",
+      "param": "10u",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    },
+    "10v": {
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levtype": "sfc",
+      "param": "10v",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    },
+    "2t": {
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levtype": "sfc",
+      "param": "2t",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    },
+    "cos_julian_day": {
+     "computed_forcing": true,
+     "constant_in_time": false
+    },
+    "cos_latitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    },
+    "cos_longitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    },
+    "insolation": {
+     "computed_forcing": true,
+     "constant_in_time": false
+    },
+    "lsm": {
+     "constant_in_time": true,
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levtype": "sfc",
+      "param": "lsm",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    },
+    "msl": {
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levtype": "sfc",
+      "param": "msl",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    },
+    "q_850": {
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levelist": 850,
+      "levtype": "pl",
+      "param": "q",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    },
+    "sin_julian_day": {
+     "computed_forcing": true,
+     "constant_in_time": false
+    },
+    "sin_latitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    },
+    "sin_longitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    },
+    "t_850": {
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levelist": 850,
+      "levtype": "pl",
+      "param": "t",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    },
+    "tp": {
+     "mars": {
+      "class": "ea",
+      "date": 19781231,
+      "domain": "g",
+      "expver": "0001",
+      "levtype": "sfc",
+      "param": "tp",
+      "step": 6,
+      "stream": "oper",
+      "time": 1800,
+      "type": "fc"
+     },
+     "period": [
+      "0:00:00",
+      "6h"
+     ],
+     "process": "accumulation"
+    },
+    "z": {
+     "constant_in_time": true,
+     "mars": {
+      "class": "ea",
+      "date": 19790101,
+      "domain": "g",
+      "expver": "0001",
+      "levtype": "sfc",
+      "param": "z",
+      "step": 0,
+      "stream": "oper",
+      "time": 0,
+      "type": "an"
+     }
+    }
+   },
+   "shape": [
+    17,
+    16,
+    1,
+    288
+   ],
+   "dtype": "float32",
+   "start_date": "2020-01-01T00:00:00",
+   "end_date": "2020-01-05T00:00:00",
+   "name": null,
+   "sources": [],
+   "supporting_arrays": [
+    "latitudes",
+    "longitudes"
+   ]
+  },
+  "realch1": {
+   "version": "0.5.43",
+   "arguments": {
+    "args": [
+     {
+      "dataset": "mch-realch1-fdb-1km-2005-2025-1h-pl13-v1.0.zarr",
+      "frequency": "6h",
+      "select": [
+       "T_2M",
+       "U_10M",
+       "V_10M",
+       "PMSL",
+       "T_850",
+       "QV_850",
+       "TOT_PREC_6H",
+       "FR_LAND",
+       "cos_julian_day",
+       "sin_julian_day",
+       "cos_latitude",
+       "sin_latitude",
+       "cos_longitude",
+       "sin_longitude",
+       "insolation"
+      ],
+      "rename": {
+       "T_2M": "2t",
+       "U_10M": "10u",
+       "V_10M": "10v",
+       "PMSL": "msl",
+       "T_850": "t_850",
+       "QV_850": "q_850",
+       "TOT_PREC_6H": "tp",
+       "FR_LAND": "lsm"
+      },
+      "start": "2020-01-01T00:00:00",
+      "end": "2020-01-05T00:00:00"
+     }
+    ],
+    "kwargs": {}
+   },
+   "frequency": "6h",
+   "variables": [
+    "2t",
+    "10u",
+    "10v",
+    "msl",
+    "t_850",
+    "q_850",
+    "tp",
+    "lsm",
+    "cos_julian_day",
+    "sin_julian_day",
+    "cos_latitude",
+    "sin_latitude",
+    "cos_longitude",
+    "sin_longitude",
+    "insolation"
+   ],
+   "variables_metadata": {
+    "lsm": {
+     "constant_in_time": true,
+     "mars": {
+      "date": 20050101,
+      "levtype": "sfc",
+      "param": "FR_LAND",
+      "step": 0,
+      "time": 12
+     }
+    },
+    "msl": {
+     "mars": {
+      "date": 20050101,
+      "levtype": "sfc",
+      "param": "PMSL",
+      "step": 12,
+      "time": 0
+     }
+    },
+    "q_850": {
+     "mars": {
+      "date": 20050101,
+      "levelist": 850,
+      "levtype": "pl",
+      "param": "QV",
+      "step": 12,
+      "time": 0
+     }
+    },
+    "tp": {
+     "mars": {
+      "date": 20050101,
+      "levtype": "sfc",
+      "param": "TOT_PREC_6H",
+      "step": 12,
+      "time": 0
+     },
+     "period": [
+      "6h",
+      "12h"
+     ],
+     "process": "accumulation"
+    },
+    "2t": {
+     "mars": {
+      "date": 20050101,
+      "levtype": "sfc",
+      "param": "T_2M",
+      "step": 12,
+      "time": 0
+     }
+    },
+    "t_850": {
+     "mars": {
+      "date": 20050101,
+      "levelist": 850,
+      "levtype": "pl",
+      "param": "T",
+      "step": 12,
+      "time": 0
+     }
+    },
+    "10u": {
+     "mars": {
+      "date": 20050101,
+      "levtype": "sfc",
+      "param": "U_10M",
+      "step": 12,
+      "time": 0
+     }
+    },
+    "10v": {
+     "mars": {
+      "date": 20050101,
+      "levtype": "sfc",
+      "param": "V_10M",
+      "step": 12,
+      "time": 0
+     }
+    },
+    "cos_julian_day": {
+     "computed_forcing": true,
+     "constant_in_time": false
+    },
+    "cos_latitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    },
+    "cos_longitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    },
+    "insolation": {
+     "computed_forcing": true,
+     "constant_in_time": false
+    },
+    "sin_julian_day": {
+     "computed_forcing": true,
+     "constant_in_time": false
+    },
+    "sin_latitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    },
+    "sin_longitude": {
+     "computed_forcing": true,
+     "constant_in_time": true
+    }
+   },
+   "shape": [
+    17,
+    15,
+    1,
+    176
+   ],
+   "dtype": "float32",
+   "start_date": "2020-01-01T00:00:00",
+   "end_date": "2020-01-05T00:00:00",
+   "name": null,
+   "sources": [],
+   "supporting_arrays": [
+    "latitudes",
+    "longitudes"
+   ]
+  }
+ },
+ "data_indices": {
+  "era5": {
+   "data": {
+    "input": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [
+      6
+     ],
+     "forcing": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+     ],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "tp": 6,
+      "lsm": 7,
+      "z": 8,
+      "cos_julian_day": 9,
+      "sin_julian_day": 10,
+      "cos_latitude": 11,
+      "sin_latitude": 12,
+      "cos_longitude": 13,
+      "sin_longitude": 14,
+      "insolation": 15
+     }
+    },
+    "output": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [
+      6
+     ],
+     "forcing": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+     ],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "tp": 6,
+      "lsm": 7,
+      "z": 8,
+      "cos_julian_day": 9,
+      "sin_julian_day": 10,
+      "cos_latitude": 11,
+      "sin_latitude": 12,
+      "cos_longitude": 13,
+      "sin_longitude": 14,
+      "insolation": 15
+     }
+    }
+   },
+   "model": {
+    "input": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [],
+     "forcing": [
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+     ],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "lsm": 6,
+      "z": 7,
+      "cos_julian_day": 8,
+      "sin_julian_day": 9,
+      "cos_latitude": 10,
+      "sin_latitude": 11,
+      "cos_longitude": 12,
+      "sin_longitude": 13,
+      "insolation": 14
+     }
+    },
+    "output": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [
+      6
+     ],
+     "forcing": [],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "tp": 6
+     }
+    }
+   }
+  },
+  "realch1": {
+   "data": {
+    "input": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [
+      6
+     ],
+     "forcing": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+     ],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "tp": 6,
+      "lsm": 7,
+      "cos_julian_day": 8,
+      "sin_julian_day": 9,
+      "cos_latitude": 10,
+      "sin_latitude": 11,
+      "cos_longitude": 12,
+      "sin_longitude": 13,
+      "insolation": 14
+     }
+    },
+    "output": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [
+      6
+     ],
+     "forcing": [
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+     ],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "tp": 6,
+      "lsm": 7,
+      "cos_julian_day": 8,
+      "sin_julian_day": 9,
+      "cos_latitude": 10,
+      "sin_latitude": 11,
+      "cos_longitude": 12,
+      "sin_longitude": 13,
+      "insolation": 14
+     }
+    }
+   },
+   "model": {
+    "input": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [],
+     "forcing": [
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+     ],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "lsm": 6,
+      "cos_julian_day": 7,
+      "sin_julian_day": 8,
+      "cos_latitude": 9,
+      "sin_latitude": 10,
+      "cos_longitude": 11,
+      "sin_longitude": 12,
+      "insolation": 13
+     }
+    },
+    "output": {
+     "prognostic": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+     ],
+     "diagnostic": [
+      6
+     ],
+     "forcing": [],
+     "target": [],
+     "full": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+     ],
+     "name_to_index": {
+      "2t": 0,
+      "10u": 1,
+      "10v": 2,
+      "msl": 3,
+      "t_850": 4,
+      "q_850": 5,
+      "tp": 6
+     }
+    }
+   }
+  }
+ },
+ "metadata_inference": {
+  "seed": 42,
+  "run_id": "d346981c-5e3a-541e-b0cf-b9d7b471ca5b",
+  "dataset_names": [
+   "era5",
+   "realch1"
+  ],
+  "task": "anemoi.training.train.tasks.GraphForecaster",
+  "era5": {
+   "timesteps": {
+    "relative_date_indices_training": [
+     0,
+     1,
+     2
+    ],
+    "timestep": "6h",
+    "input_relative_date_indices": [
+     0,
+     1
+    ],
+    "output_relative_date_indices": [
+     2
+    ],
+    "input_offsets": [
+     "-6h",
+     "0h"
+    ],
+    "output_offsets": [
+     "6h"
+    ],
+    "rollout_shift": "6h",
+    "advance_map": {
+     "inin": [
+      [
+       1,
+       0
+      ]
+     ],
+     "outin": [
+      [
+       0,
+       1
+      ]
+     ]
+    }
+   },
+   "data_indices": {
+    "input": {
+     "2t": 0,
+     "10u": 1,
+     "10v": 2,
+     "msl": 3,
+     "t_850": 4,
+     "q_850": 5,
+     "lsm": 6,
+     "z": 7,
+     "cos_julian_day": 8,
+     "sin_julian_day": 9,
+     "cos_latitude": 10,
+     "sin_latitude": 11,
+     "cos_longitude": 12,
+     "sin_longitude": 13,
+     "insolation": 14
+    },
+    "output": {
+     "2t": 0,
+     "10u": 1,
+     "10v": 2,
+     "msl": 3,
+     "t_850": 4,
+     "q_850": 5,
+     "tp": 6
+    }
+   },
+   "variable_types": {
+    "forcing": [
+     "lsm",
+     "z",
+     "cos_julian_day",
+     "sin_julian_day",
+     "cos_latitude",
+     "sin_latitude",
+     "cos_longitude",
+     "sin_longitude",
+     "insolation"
+    ],
+    "target": [],
+    "prognostic": [
+     "2t",
+     "10u",
+     "10v",
+     "msl",
+     "t_850",
+     "q_850"
+    ],
+    "diagnostic": [
+     "tp"
+    ]
+   },
+   "shapes": {
+    "variables": 42,
+    "input_timesteps": 2,
+    "ensemble": 1,
+    "grid": null
+   }
+  },
+  "realch1": {
+   "timesteps": {
+    "relative_date_indices_training": [
+     0,
+     1,
+     2
+    ],
+    "timestep": "6h",
+    "input_relative_date_indices": [
+     0,
+     1
+    ],
+    "output_relative_date_indices": [
+     2
+    ],
+    "input_offsets": [
+     "-6h",
+     "0h"
+    ],
+    "output_offsets": [
+     "6h"
+    ],
+    "rollout_shift": "6h",
+    "advance_map": {
+     "inin": [
+      [
+       1,
+       0
+      ]
+     ],
+     "outin": [
+      [
+       0,
+       1
+      ]
+     ]
+    }
+   },
+   "data_indices": {
+    "input": {
+     "2t": 0,
+     "10u": 1,
+     "10v": 2,
+     "msl": 3,
+     "t_850": 4,
+     "q_850": 5,
+     "lsm": 6,
+     "cos_julian_day": 7,
+     "sin_julian_day": 8,
+     "cos_latitude": 9,
+     "sin_latitude": 10,
+     "cos_longitude": 11,
+     "sin_longitude": 12,
+     "insolation": 13
+    },
+    "output": {
+     "2t": 0,
+     "10u": 1,
+     "10v": 2,
+     "msl": 3,
+     "t_850": 4,
+     "q_850": 5,
+     "tp": 6
+    }
+   },
+   "variable_types": {
+    "forcing": [
+     "lsm",
+     "cos_julian_day",
+     "sin_julian_day",
+     "cos_latitude",
+     "sin_latitude",
+     "cos_longitude",
+     "sin_longitude",
+     "insolation"
+    ],
+    "target": [],
+    "prognostic": [
+     "2t",
+     "10u",
+     "10v",
+     "msl",
+     "t_850",
+     "q_850"
+    ],
+    "diagnostic": [
+     "tp"
+    ]
+   },
+   "shapes": {
+    "variables": 40,
+    "input_timesteps": 2,
+    "ensemble": 1,
+    "grid": null
+   }
+  }
+ },
+ "provenance_training": {
+  "time": "2026-09-17T00:00:00",
+  "python": "3.12"
+ }
+}

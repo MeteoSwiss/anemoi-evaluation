@@ -55,3 +55,4 @@ lint.isort.force-single-line = true
 
 [tool.pytest]
 ini_options.testpaths = [ "tests" ]
+ini_options.pythonpath = [ "tests" ]

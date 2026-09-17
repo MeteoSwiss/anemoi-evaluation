@@ -261,6 +261,7 @@ class GridSpec(_Spec):
 
 WeightsConfig = GraphAttributeSpec | SphericalVoronoiSpec | UniformSpec | FileSpec
 RegionConfig = Literal["all"] | BboxSpec | GraphAttributeSpec | GridSpec | FileSpec
+RegionsConfig = dict[str, RegionConfig]
 
 
 def build_weights(spec: dict, grid: Grid, forecast: Any = None) -> np.ndarray:
@@ -273,6 +274,66 @@ def build_region(spec: str | dict, grid: Grid, forecast: Any = None, targets: An
     if spec == "all":
         return regions.all(grid)
     return TypeAdapter(RegionConfig).validate_python(spec).build(grid, forecast, targets).astype(bool)
+
+
+class PerDataset(_Model):
+    """A block given once per dataset, `datasets: {name: block}`, as anemoi-inference's own per-dataset config
+    entries are; a block that is not in this form is shared by every dataset."""
+
+    def value(self, dataset: str) -> Any:
+        """The block of `dataset`."""
+        return self.datasets[dataset]
+
+    def names(self) -> list[str]:
+        """The dataset names the block names."""
+        return list(self.datasets)
+
+
+class DatasetsTargets(PerDataset):
+    datasets: dict[str, TargetsConfig] = Field(min_length=1)
+
+
+class DatasetsVariables(PerDataset):
+    datasets: dict[str, list[str]] = Field(min_length=1)
+
+
+class DatasetsWeights(PerDataset):
+    datasets: dict[str, WeightsConfig] = Field(min_length=1)
+
+
+class DatasetsRegions(PerDataset):
+    datasets: dict[str, RegionsConfig] = Field(min_length=1)
+
+
+def per_dataset(block: Any, names: list[str], what: str) -> dict[str, Any]:
+    """`block` for each of `names`: one block shared by every dataset, or the `datasets:` mapping, which must name
+    every dataset the run scores and no other (anemoi-inference's all-or-nothing rule).
+
+    `names` are the datasets the run scores, which the top-level `datasets:` key may have narrowed: a block for a
+    dataset that is only predicted is refused like any other unknown name."""
+    if not isinstance(block, PerDataset):
+        return dict.fromkeys(names, block)
+    given = block.names()
+    unknown = [name for name in given if name not in names]
+    if unknown:
+        raise ValueError(f"{what}.datasets names unknown datasets {unknown}, the run scores {names}")
+    missing = [name for name in names if name not in given]
+    if missing:
+        raise ValueError(f"{what}.datasets is missing the datasets {missing}: give a block for every one or none")
+    return {name: block.value(name) for name in names}
+
+
+def config_dataset_names(config: Any) -> list[str]:
+    """The dataset names the `datasets:` blocks of a config agree on, empty when none is in that form."""
+    blocks = [getattr(config, key, None) for key in ("targets", "variables", "weights", "regions", "climatology")]
+    found = [block.names() for block in blocks if isinstance(block, PerDataset)]
+    if not found:
+        return []
+    first = found[0]
+    for names in found[1:]:
+        if set(names) != set(first):
+            raise ValueError(f"the datasets: blocks name different datasets, {first} and {names}")
+    return list(first)
 
 
 class BinsConfig(_Model):
@@ -294,6 +355,10 @@ class ClimatologyConfig(_Model):
     file: str
 
 
+class DatasetsClimatology(PerDataset):
+    datasets: dict[str, ClimatologyConfig] = Field(min_length=1)
+
+
 class OutputConfig(_Model):
     path: str
 
@@ -302,19 +367,27 @@ class EvaluationConfig(_Model):
     """Everything `anemoi-evaluation run` needs; see `Evaluation.from_config`."""
 
     forecast: ForecastConfig
-    targets: TargetsConfig | None = None
+    targets: DatasetsTargets | TargetsConfig | None = None
+    datasets: list[str] | None = None
     lead_time: datetime.timedelta
     init_times: InitTimesConfig
-    variables: list[str] | None = None
+    variables: DatasetsVariables | list[str] | None = None
     metrics: list[str | dict[str, dict[str, Any] | None]] = ["rmse", "mae", "bias"]
-    weights: WeightsConfig | None = None
-    regions: dict[str, RegionConfig] = {"global": "all"}
+    weights: DatasetsWeights | WeightsConfig | None = None
+    regions: DatasetsRegions | RegionsConfig = {"global": "all"}
     bins: BinsConfig = BinsConfig()
-    climatology: ClimatologyConfig | None = None
+    climatology: DatasetsClimatology | ClimatologyConfig | None = None
     output: OutputConfig | None = None
     on_missing_target: Literal["skip", "raise"] = "skip"
     include_lead_zero: bool = False
     log_level: str = "INFO"
+
+    @field_validator("datasets")
+    @classmethod
+    def _check_datasets(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and not value:
+            raise ValueError("datasets: must name at least one dataset of the checkpoint, or be left out")
+        return value
 
     @field_validator("lead_time", mode="before")
     @classmethod
@@ -368,23 +441,26 @@ def resolve_base(config: dict, directory: Path, source: str, seen: tuple[Path, .
     return _merge(resolve_base(_load_yaml(path), path.parent, str(path), (*seen, path)), config)
 
 
-def checkpoint_dataset_arguments(checkpoint: str) -> tuple[tuple, dict]:
-    """The `open_dataset` arguments a checkpoint records, with the dataset paths it was trained on."""
+def checkpoint_dataset_arguments(checkpoint: str) -> dict[str, tuple[tuple, dict]]:
+    """The `open_dataset` arguments a checkpoint records for each of its datasets, with the dataset paths it was
+    trained on; a single-dataset checkpoint gives a one-entry mapping."""
     from anemoi.inference.checkpoint import Checkpoint
 
     metadata = Checkpoint(str(checkpoint)).multi_dataset_metadata
-    if len(metadata) != 1:
-        raise ValueError(f"only single-dataset checkpoints are supported, got {sorted(metadata)}")
-    args, kwargs = next(iter(metadata.values())).open_dataset_args_kwargs(use_original_paths=True)
-    return tuple(args), dict(kwargs)
+    arguments = {}
+    for name, dataset in metadata.items():
+        args, kwargs = dataset.open_dataset_args_kwargs(use_original_paths=True)
+        arguments[name] = (tuple(args), dict(kwargs))
+    return arguments
 
 
-def _dataset_from_checkpoint(block: dict, checkpoint: str | None, where: str) -> dict:
-    """`block` with its `from_checkpoint` replaced by the checkpoint's recorded arguments, the rest of `block` on top."""
+def _dataset_from_checkpoint(block: dict, checkpoint: str | None, where: str) -> dict[str, dict] | None:
+    """The `block` of each of the checkpoint's datasets: `from_checkpoint` replaced by that dataset's recorded
+    arguments, the rest of `block` on top. None when `from_checkpoint` is false (the block stands as it is)."""
     block = dict(block)
     source = block.pop(FROM_CHECKPOINT)
     if source is False:
-        return block
+        return None
     if source is True:
         if checkpoint is None:
             raise ValueError(
@@ -394,23 +470,26 @@ def _dataset_from_checkpoint(block: dict, checkpoint: str | None, where: str) ->
         source = checkpoint
     if not isinstance(source, str):
         raise ValueError(f"{where}.from_checkpoint must be true, false or a checkpoint path, got {source!r}")
-    args, kwargs = checkpoint_dataset_arguments(source)
-    if len(args) != 1 or not isinstance(args[0], dict):
-        raise ValueError(
-            f"checkpoint {source} records the open_dataset arguments {args}, only a single mapping can be reused; "
-            "spell the dataset out instead"
+    resolved = {}
+    for name, (args, kwargs) in checkpoint_dataset_arguments(source).items():
+        if len(args) != 1 or not isinstance(args[0], dict):
+            raise ValueError(
+                f"checkpoint {source} records the open_dataset arguments {args} for {name!r}, only a single mapping "
+                "can be reused; spell the dataset out instead"
+            )
+        dataset = {**args[0], **kwargs, **block}
+        select = dataset.get("select")
+        LOG.info(
+            "%s: dataset %r recorded in %s, %s variables, start %s, end %s",
+            where,
+            name,
+            source,
+            len(select) if isinstance(select, (list, tuple, dict)) else "all",
+            dataset.get("start"),
+            dataset.get("end"),
         )
-    dataset = {**args[0], **kwargs, **block}
-    select = dataset.get("select")
-    LOG.info(
-        "%s: dataset recorded in %s, %s variables, start %s, end %s",
-        where,
-        source,
-        len(select) if isinstance(select, (list, tuple, dict)) else "all",
-        dataset.get("start"),
-        dataset.get("end"),
-    )
-    return dataset
+        resolved[name] = dataset
+    return resolved
 
 
 def _check_resolved(config: Any, where: str = "") -> None:
@@ -439,14 +518,37 @@ def resolve_from_checkpoint(config: dict) -> dict:
         dataset = block.get("dataset") if isinstance(block.get("dataset"), dict) else {}
         if FROM_CHECKPOINT in dataset:
             where = "forecast.anemoi_inference.input.dataset"
-            dataset = _dataset_from_checkpoint(dataset, checkpoint, where)
-            inference = {**inference, "input": {**block, "dataset": dataset}}
+            resolved = _dataset_from_checkpoint(dataset, checkpoint, where)
+            if resolved is None:
+                block = {**block, "dataset": {key: value for key, value in dataset.items() if key != FROM_CHECKPOINT}}
+            elif len(resolved) == 1:
+                block = {**block, "dataset": next(iter(resolved.values()))}
+            else:
+                # anemoi-inference keys per-dataset run-config entries by the dataset name itself
+                rest = {key: value for key, value in block.items() if key != "dataset"}
+                block = {name: {**rest, "dataset": value} for name, value in resolved.items()}
+            inference = {**inference, "input": block}
             config["forecast"] = {**forecast, "anemoi_inference": inference}
     targets = config.get("targets") if isinstance(config.get("targets"), dict) else {}
     dataset = targets.get("anemoi_dataset") if isinstance(targets.get("anemoi_dataset"), dict) else {}
     if FROM_CHECKPOINT in dataset:
-        dataset = _dataset_from_checkpoint(dataset, checkpoint, "targets.anemoi_dataset")
-        config["targets"] = {**targets, "anemoi_dataset": dataset}
+        where = "targets.anemoi_dataset"
+        resolved = _dataset_from_checkpoint(dataset, checkpoint, where)
+        if resolved is not None:
+            # the targets of a run that scores a subset are the selected datasets' only; an unknown name
+            # in `datasets:` is left to the build, which names the checkpoint's datasets in its message
+            selected = config.get("datasets")
+            if isinstance(selected, list) and any(name in resolved for name in selected):
+                resolved = {name: block for name, block in resolved.items() if name in selected}
+        if resolved is None:
+            config["targets"] = {
+                **targets,
+                "anemoi_dataset": {key: value for key, value in dataset.items() if key != FROM_CHECKPOINT},
+            }
+        elif len(resolved) == 1:
+            config["targets"] = {**targets, "anemoi_dataset": next(iter(resolved.values()))}
+        else:
+            config["targets"] = {"datasets": {name: {"anemoi_dataset": value} for name, value in resolved.items()}}
     _check_resolved(config)
     return config
 

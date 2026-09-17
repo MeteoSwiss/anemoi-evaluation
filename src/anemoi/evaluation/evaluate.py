@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import itertools
 import json
@@ -33,10 +34,13 @@ from anemoi.evaluation.config import EvaluationConfig
 from anemoi.evaluation.config import InitTimesRange
 from anemoi.evaluation.config import build_region
 from anemoi.evaluation.config import build_weights
+from anemoi.evaluation.config import config_dataset_names
 from anemoi.evaluation.config import load_config
+from anemoi.evaluation.config import per_dataset
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.metrics import Metric
 from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
+from anemoi.evaluation.sources.anemoi_inference import DatasetForecast
 from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
 from anemoi.evaluation.sources.base import ClimatologySource
 from anemoi.evaluation.sources.base import ForecastSource
@@ -48,6 +52,7 @@ from anemoi.evaluation.sources.persistence import PersistenceForecastSource
 
 LOG = logging.getLogger(__name__)
 PHASES = ("model", "target", "statistics", "total")
+DEFAULT_DATASET = "data"
 PACKAGES = ("anemoi-evaluation", "anemoi-inference", "anemoi-models", "anemoi-graphs", "anemoi-datasets", "torch")
 # benchmarks.md sections 7 and 9: about 90 s of cold-node startup plus about 15 s of first-call overheads.
 STARTUP_SECONDS = 105.0
@@ -74,6 +79,11 @@ class PhaseTimer:
         self.totals[phase] = self.totals.get(phase, 0.0) + now - self._last
         self._last = now
 
+    def skip(self) -> None:
+        """Discard the time since the previous mark: it belongs to another timer (the shared rollout, or another
+        dataset of the same rollout)."""
+        self._last = self._now()
+
     def _now(self) -> float:
         if self.device is not None and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -85,6 +95,9 @@ class Evaluation:
 
     Construction validates the arguments and checks the init times against the sources; weights and regions given
     as specs are resolved on first use (`weights`, `regions`, `aggregator`), so a model graph is only loaded by `run()`.
+
+    `dataset` names the dataset of a multi-dataset checkpoint this evaluation scores; it is written to the result as
+    the `dataset` attr and is None for a checkpoint that has only one dataset, whose results are unchanged.
     """
 
     def __init__(
@@ -102,7 +115,9 @@ class Evaluation:
         on_missing_target: str = "skip",
         include_lead_zero: bool = False,
         climatology: ClimatologySource | None = None,
+        dataset: str | None = None,
     ) -> None:
+        self.dataset = dataset
         self.forecast = forecast
         self.targets = targets
         self.init_times = [as_datetime(date) for date in init_times]
@@ -287,7 +302,13 @@ class Evaluation:
                 "frame": self.forecast.members * row,
                 "aggregator_weights": n * r * 8,
                 "statistics_temporaries": 3 * v * n * 8,
-                **{key: forecast[key] for key in ("checkpoint_bytes", "per_member_state_bytes") if key in forecast},
+                # `predicted_only_state_bytes` is the state of the datasets the run does not score: the runner
+                # holds one for every dataset of the checkpoint, scored or not
+                **{
+                    key: forecast[key]
+                    for key in ("checkpoint_bytes", "per_member_state_bytes", "predicted_only_state_bytes")
+                    if key in forecast
+                },
                 **(
                     {"climatology": plan_climatology_bytes}
                     if (plan_climatology_bytes := self._climatology_bytes())
@@ -316,19 +337,8 @@ class Evaluation:
     def run(self, init_times: list[datetime.datetime] | None = None) -> AggregationState:
         """Evaluate `init_times` (default: all) and return the state, with result attrs and timing totals."""
         init_times = list(self.init_times if init_times is None else init_times)
-        if self.climatology is not None:
-            self.climatology_nonfinite = self.climatology.nonfinite_nodes(self.variables)
-            if any(self.climatology_nonfinite.values()):
-                LOG.warning(
-                    "climatology has non-finite nodes, excluded from the anomaly statistics only: %s",
-                    {name: count for name, count in self.climatology_nonfinite.items() if count},
-                )
-        state = self.aggregator.new_state(
-            self.lead_times, self.variables, list(self.regions), self.forecast.members, self.variable_coords()
-        )
-        self.timing = {}
+        state = self.begin()
         calls_per_init, _ = self.model_calls_per_init()
-        self.model_calls = 0
         cuda = self.device.type == "cuda"
         if cuda:
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -336,18 +346,80 @@ class Evaluation:
             for init_time in init_times:
                 start = time.perf_counter()
                 timer = PhaseTimer(self.device)
-                for frame, target in self._pairs_one(init_time, timer):
-                    self.aggregator.add(state, frame, target, self._aux(frame))
-                timer.totals["total"] = time.perf_counter() - start
-                for phase, seconds in timer.totals.items():
-                    self.timing[phase] = self.timing.get(phase, 0.0) + seconds
-                self.model_calls += calls_per_init
-                LOG.info(
-                    "%s: %s (%d model calls)",
-                    init_time.isoformat(),
-                    ", ".join(f"{p} {timer.totals.get(p, 0.0):.2f}s" for p in PHASES),
-                    calls_per_init,
+                for frame in self.frames(init_time):
+                    self.add_frame(state, frame, timer)
+                timer.mark("model")
+                self.charge(timer, start, init_time, calls_per_init)
+        self.finish(state, init_times, cuda)
+        return state
+
+    def begin(self) -> AggregationState:
+        """A fresh aggregation state, with the timing counters reset; the first half of `run`, for a driver that
+        feeds the frames itself (see `MultiEvaluation`)."""
+        if self.climatology is not None:
+            self.climatology_nonfinite = self.climatology.nonfinite_nodes(self.variables)
+            if any(self.climatology_nonfinite.values()):
+                LOG.warning(
+                    "climatology has non-finite nodes, excluded from the anomaly statistics only: %s",
+                    {name: count for name, count in self.climatology_nonfinite.items() if count},
                 )
+        self.timing = {}
+        self.model_calls = 0
+        return self.aggregator.new_state(
+            self.lead_times, self.variables, list(self.regions), self.forecast.members, self.variable_coords()
+        )
+
+    def frames(self, init_time: datetime.datetime) -> Iterator[Frame]:
+        """The forecast frames of one init time, the lead-0 one first when it is scored; announces the valid times
+        to the target source first."""
+        self.targets.prefetch([init_time + lead for lead in self.lead_times], self.variables)
+        frames = self.forecast.frames(init_time, self.lead_time, self.variables, self.device)
+        if self.include_lead_zero:
+            frames = itertools.chain(self._initial_frames(init_time), frames)
+        return frames
+
+    def add_frame(self, state: AggregationState, frame: Frame, timer: PhaseTimer, charge_model: bool = True) -> None:
+        """Score one frame into `state`; a frame whose target is missing is skipped or raises.
+
+        `charge_model` False leaves the time before the target read uncharged: it is another timer's, which is how
+        `MultiEvaluation` keeps one dataset's target reads out of another's `model` (see `_run_shared`)."""
+        target = self._target(frame, timer, charge_model)
+        if target is None:
+            return
+        self.aggregator.add(state, frame, target, self._aux(frame))
+        timer.mark("statistics")
+
+    def charge(
+        self,
+        timer: PhaseTimer,
+        start: float,
+        init_time: datetime.datetime,
+        calls_per_init: int,
+        shared: dict[str, float] | None = None,
+    ) -> None:
+        """Add one init time's phase times to the totals and log them.
+
+        `shared` are the phases of a rollout this evaluation shares with others: they are added to the timer as
+        they are (not divided), and `total` is then this dataset's own phases plus them rather than the wall clock
+        of the whole init time, which would be the same number in every dataset's result file."""
+        if shared is None:
+            timer.totals["total"] = time.perf_counter() - start
+        else:
+            for phase, seconds in shared.items():
+                timer.totals[phase] = timer.totals.get(phase, 0.0) + seconds
+            timer.totals["total"] = sum(timer.totals.values())
+        for phase, seconds in timer.totals.items():
+            self.timing[phase] = self.timing.get(phase, 0.0) + seconds
+        self.model_calls += calls_per_init
+        LOG.info(
+            "%s: %s (%d model calls)",
+            init_time.isoformat(),
+            ", ".join(f"{p} {timer.totals.get(p, 0.0):.2f}s" for p in PHASES),
+            calls_per_init,
+        )
+
+    def finish(self, state: AggregationState, init_times: list[datetime.datetime], cuda: bool = False) -> None:
+        """Log the totals and put the result attrs on `state`; the second half of `run`."""
         self.peak_memory_bytes = torch.cuda.max_memory_allocated(self.device) if cuda else None
         LOG.info(
             "%d init times: %s%s",
@@ -367,7 +439,6 @@ class Evaluation:
                 stats.get("cache_hits", 0),
             )
         state.attrs.update(self.attrs(init_times, self.timing))
-        return state
 
     def pairs(self, init_times: list[datetime.datetime] | None = None) -> Iterator[tuple[Frame, torch.Tensor]]:
         """Yield `(frame, target)` pairs for a custom loop, without aggregation; the loop runs in inference mode."""
@@ -381,22 +452,25 @@ class Evaluation:
         except MissingTargetError as error:
             LOG.warning("%s: no lead-0 frame for init %s", error, init_time)
 
-    def _pairs_one(self, init_time: datetime.datetime, timer: PhaseTimer) -> Iterator[tuple[Frame, torch.Tensor]]:
-        self.targets.prefetch([init_time + lead for lead in self.lead_times], self.variables)
-        frames = self.forecast.frames(init_time, self.lead_time, self.variables, self.device)
-        if self.include_lead_zero:
-            frames = itertools.chain(self._initial_frames(init_time), frames)
-        for frame in frames:
-            timer.mark("model")
-            try:
-                target = self.targets.frame(frame.valid_time, self.variables, self.device)
-            except MissingTargetError as error:
-                if self.on_missing_target == "raise":
-                    raise
-                LOG.warning("%s: skipping init %s lead %s", error, init_time, frequency_to_string(frame.lead_time))
-                timer.mark("target")
-                continue
+    def _target(self, frame: Frame, timer: PhaseTimer, charge_model: bool = True) -> torch.Tensor | None:
+        """The target of `frame`, None when it is missing and missing targets are skipped."""
+        timer.mark("model") if charge_model else timer.skip()
+        try:
+            target = self.targets.frame(frame.valid_time, self.variables, self.device)
+        except MissingTargetError as error:
+            if self.on_missing_target == "raise":
+                raise
+            LOG.warning("%s: skipping init %s lead %s", error, frame.init_time, frequency_to_string(frame.lead_time))
             timer.mark("target")
+            return None
+        timer.mark("target")
+        return target
+
+    def _pairs_one(self, init_time: datetime.datetime, timer: PhaseTimer) -> Iterator[tuple[Frame, torch.Tensor]]:
+        for frame in self.frames(init_time):
+            target = self._target(frame, timer)
+            if target is None:
+                continue
             yield frame, target
             timer.mark("statistics")
         timer.mark("model")
@@ -413,6 +487,8 @@ class Evaluation:
         wait for targets, `time_target_read_s` the seconds the target source's worker spent reading) and read counters."""
         timing = self.timing if timing is None else timing
         attrs = dict(self.forecast.provenance())
+        if self.dataset is not None:
+            attrs["dataset"] = self.dataset
         attrs["init_times"] = ", ".join(compress_dates(list(self.init_times if init_times is None else init_times)))
         attrs["lead_time"] = frequency_to_string(self.lead_time)
         try:
@@ -444,43 +520,14 @@ class Evaluation:
         cls,
         config: str | Path | dict | EvaluationConfig,
         forecast: ForecastSource | None = None,
-        targets: TargetSource | None = None,
-        climatology: ClimatologySource | None = None,
-    ) -> Evaluation:
-        """Build from a YAML path, a dict or a config; the source arguments override the configured sources."""
-        config = load_config(config)
-        if climatology is None and config.climatology is not None:
-            climatology = ArrayClimatology.from_netcdf(config.climatology.file)
-        if forecast is None and config.forecast.persistence is not None:
-            if targets is None:
-                if config.targets is None:
-                    raise ValueError("persistence forecasts need an explicit targets block")
-                targets = _targets_from_config(config, None)
-            spec = config.forecast.persistence
-            forecast = PersistenceForecastSource(targets, spec.timestep, spec.members)
-        if forecast is None:
-            forecast = InferenceForecastSource(**config.forecast.anemoi_inference.model_dump())
-        if targets is None:
-            targets = _targets_from_config(config, forecast)
-        regions = {
-            name: region if isinstance(region, str) else region.spec() for name, region in config.regions.items()
-        }
-        evaluation = cls(
-            forecast,
-            targets,
-            config.init_times.resolve(),
-            config.lead_time,
-            config.metrics,
-            config.variables,
-            config.weights.spec() if config.weights is not None else None,
-            regions,
-            config.bins.model_dump(),
-            on_missing_target=config.on_missing_target,
-            include_lead_zero=config.include_lead_zero,
-            climatology=climatology,
-        )
-        evaluation._config = config
-        return evaluation
+        targets: TargetSource | dict[str, TargetSource] | None = None,
+        climatology: ClimatologySource | dict[str, ClimatologySource] | None = None,
+    ) -> Evaluation | MultiEvaluation:
+        """Build from a YAML path, a dict or a config; the source arguments override the configured sources.
+
+        A checkpoint trained on multiple datasets gives a `MultiEvaluation`: one evaluation per dataset, sharing one
+        runner and one rollout. `targets` and `climatology` may then be given per dataset as `{name: source}`."""
+        return build(config, forecast, targets, climatology)
 
     def to_config(self) -> dict:
         """YAML-ready dict; raises when sources, weights or regions were given as objects without a spec."""
@@ -507,9 +554,325 @@ class Evaluation:
         return config.model_dump(mode="json", exclude_none=True)
 
 
-def _targets_from_config(config: EvaluationConfig, forecast: ForecastSource | None) -> TargetSource:
+class MultiEvaluation:
+    """A multi-dataset run: one `Evaluation` per decoded dataset, sharing one runner and one rollout.
+
+    Every dataset has its own targets, variables, weights, regions, climatology, aggregator and result; the datasets
+    only share the model call, the init times and the lead times. `run()` returns one aggregation state per dataset.
+    """
+
+    def __init__(self, evaluations: dict[str, Evaluation], forecast: InferenceForecastSource | None = None) -> None:
+        if not evaluations:
+            raise ValueError("a multi-dataset evaluation needs at least one dataset")
+        self.evaluations = dict(evaluations)
+        self.forecast = forecast
+        first = next(iter(self.evaluations.values()))
+        self.init_times = first.init_times
+        self.lead_time = first.lead_time
+        self.lead_times = first.lead_times
+        self.include_lead_zero = first.include_lead_zero
+        self.device = first.device
+        for name, evaluation in self.evaluations.items():
+            if evaluation.init_times != self.init_times or evaluation.lead_times != self.lead_times:
+                raise ValueError(f"dataset {name!r} does not share the init times and lead times of the others")
+        self.timing: dict[str, float] = {}
+        self.model_calls = 0
+        self.peak_memory_bytes: int | None = None
+        self._config: EvaluationConfig | None = None
+
+    @property
+    def dataset_names(self) -> list[str]:
+        """The datasets scored, in the checkpoint's order."""
+        return list(self.evaluations)
+
+    @property
+    def metrics(self) -> dict[str, list[Metric]]:
+        """The metrics of each dataset, for `AggregationState.to_xarray`."""
+        return {name: evaluation.metrics for name, evaluation in self.evaluations.items()}
+
+    @property
+    def variables(self) -> dict[str, list[str]]:
+        """The variables scored in each dataset."""
+        return {name: evaluation.variables for name, evaluation in self.evaluations.items()}
+
+    def shard(self, index: int, count: int) -> list[datetime.datetime]:
+        """Init times of shard `index` of `count`, the same for every dataset."""
+        return next(iter(self.evaluations.values())).shard(index, count)
+
+    def plan(
+        self, init_times: list[datetime.datetime] | None = None, step_time: float | None = None, shards: int = 1
+    ) -> dict:
+        """One plan per dataset under `datasets`, plus the shared init times and device.
+
+        The datasets share the model call, so every dataset's `time` estimate is the whole run's, not a share
+        of it. `predicted_only` names the checkpoint's datasets the run does not score: the model still predicts
+        them, they simply have no targets, no aggregator and no result."""
+        init_times = list(self.init_times if init_times is None else init_times)
+        predicted_only = [name for name in getattr(self.forecast, "dataset_names", ()) if name not in self.evaluations]
+        return {
+            "datasets": {
+                name: evaluation.plan(init_times, step_time, shards) for name, evaluation in self.evaluations.items()
+            },
+            "scored": self.dataset_names,
+            **({"predicted_only": predicted_only} if predicted_only else {}),
+            "device": str(self.device),
+            "init_times": {"count": len(init_times), "dates": ", ".join(compress_dates(init_times))},
+        }
+
+    def run(self, init_times: list[datetime.datetime] | None = None) -> dict[str, AggregationState]:
+        """Evaluate `init_times` (default: all) and return one aggregation state per dataset."""
+        init_times = list(self.init_times if init_times is None else init_times)
+        if self.forecast is None:  # no shared rollout (a persistence baseline per dataset)
+            states = {name: evaluation.run(init_times) for name, evaluation in self.evaluations.items()}
+            self.timing = {}
+            self._sum_timing()
+        else:
+            states = self._run_shared(init_times)  # sets self.timing, whose model phase is shared
+            self._sum_timing(shared=("model", "total"))
+        for name, state in states.items():
+            state.attrs["dataset"] = name
+        self.model_calls = next(iter(self.evaluations.values())).model_calls
+        return states
+
+    def _sum_timing(self, shared: tuple[str, ...] = ()) -> None:
+        """The run's timing: the per-dataset phases summed, the shared ones (already in `self.timing`) left alone."""
+        for evaluation in self.evaluations.values():
+            for phase, seconds in evaluation.timing.items():
+                if phase in shared:
+                    continue
+                self.timing[phase] = self.timing.get(phase, 0.0) + seconds
+
+    def _run_shared(self, init_times: list[datetime.datetime]) -> dict[str, AggregationState]:
+        """One rollout per init time, its per-dataset frames scored by the dataset's own evaluation.
+
+        The rollout is timed once, by `shared`, and charged whole to every dataset's `model`; each dataset's own
+        timer sees only its target reads and its statistics, so no dataset is charged for another's work. The
+        run's `model` is the rollout's, counted once."""
+        names = self.dataset_names
+        states = {name: evaluation.begin() for name, evaluation in self.evaluations.items()}
+        calls_per_init, _ = next(iter(self.evaluations.values())).model_calls_per_init()
+        cuda = self.device.type == "cuda"
+        if cuda:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self.timing = {}
+        wall = time.perf_counter()
+        with torch.inference_mode():
+            for init_time in init_times:
+                start = time.perf_counter()
+                shared = PhaseTimer(self.device)
+                timers = {name: PhaseTimer(self.device) for name in names}
+                for name in names:
+                    evaluation = self.evaluations[name]
+                    evaluation.targets.prefetch(
+                        [init_time + lead for lead in evaluation.lead_times], evaluation.variables
+                    )
+                    if evaluation.include_lead_zero:
+                        for frame in evaluation._initial_frames(init_time):
+                            evaluation.add_frame(states[name], frame, timers[name], charge_model=False)
+                shared.skip()  # the prefetch calls and the lead-0 frames are not the rollout
+                stream = self.forecast.multi_frames(
+                    init_time, self.lead_time, {name: self.evaluations[name].variables for name in names}, self.device
+                )
+                with contextlib.closing(stream):
+                    for frames in stream:
+                        shared.mark("model")
+                        for name in names:
+                            self.evaluations[name].add_frame(states[name], frames[name], timers[name], False)
+                        shared.skip()
+                shared.mark("model")
+                for name in names:
+                    self.evaluations[name].charge(timers[name], start, init_time, calls_per_init, shared.totals)
+                for phase, seconds in shared.totals.items():
+                    self.timing[phase] = self.timing.get(phase, 0.0) + seconds
+        for name in names:
+            self.evaluations[name].finish(states[name], init_times, cuda)
+        self.timing["total"] = time.perf_counter() - wall
+        self.peak_memory_bytes = torch.cuda.max_memory_allocated(self.device) if cuda else None
+        return states
+
+    def pairs(self, init_times: list[datetime.datetime] | None = None) -> Iterator[tuple[str, Frame, torch.Tensor]]:
+        """Yield `(dataset, frame, target)` triples for a custom loop, without aggregation."""
+        if self.forecast is None:
+            for name, evaluation in self.evaluations.items():
+                for frame, target in evaluation.pairs(init_times):
+                    yield name, frame, target
+            return
+        names = self.dataset_names
+        with torch.inference_mode():
+            for init_time in self.init_times if init_times is None else init_times:
+                timer = PhaseTimer()
+                for name in names:
+                    evaluation = self.evaluations[name]
+                    if evaluation.include_lead_zero:
+                        for frame in evaluation._initial_frames(init_time):
+                            target = evaluation._target(frame, timer)
+                            if target is not None:
+                                yield name, frame, target
+                stream = self.forecast.multi_frames(
+                    init_time, self.lead_time, {name: self.evaluations[name].variables for name in names}, self.device
+                )
+                with contextlib.closing(stream):  # a caller that breaks out closes the runner generators
+                    for frames in stream:
+                        for name in names:
+                            target = self.evaluations[name]._target(frames[name], timer)
+                            if target is not None:
+                                yield name, frames[name], target
+
+    def attrs(self, init_times: list[datetime.datetime] | None = None) -> dict[str, dict]:
+        """The result attrs of each dataset."""
+        return {name: evaluation.attrs(init_times) for name, evaluation in self.evaluations.items()}
+
+    def to_config(self) -> dict:
+        """The YAML-ready config of the run."""
+        if self._config is not None:
+            return self._config.model_dump(mode="json", exclude_none=True)
+        raise ValueError("a multi-dataset evaluation built by hand cannot be written to a config")
+
+    def close(self) -> None:
+        """Release every dataset's sources and the shared runner."""
+        for evaluation in self.evaluations.values():
+            evaluation.close()
+        if self.forecast is not None:
+            self.forecast.close()
+
+
+def _forecast_views(
+    config: EvaluationConfig,
+    forecast: ForecastSource | None,
+    names: list[str],
+    targets: dict[str, TargetSource],
+) -> tuple[dict[str, ForecastSource], InferenceForecastSource | None]:
+    """One forecast source per dataset and, when they share a runner, that runner's source."""
+    if isinstance(forecast, InferenceForecastSource) and forecast.multi_dataset:
+        return {name: forecast.datasets[name] for name in names}, forecast
+    if forecast is not None:
+        if len(names) > 1 and not isinstance(forecast, PersistenceForecastSource):
+            LOG.warning(
+                "%s is not a multi-dataset source: its rollout is run once per dataset (%s), %d times in all",
+                type(forecast).__name__,
+                ", ".join(names),
+                len(names),
+            )
+        return dict.fromkeys(names, forecast), None
+    spec = config.forecast.persistence
+    return {name: PersistenceForecastSource(targets[name], spec.timestep, spec.members) for name in names}, None
+
+
+def _dataset_names(config: EvaluationConfig, forecast: ForecastSource | None, targets: object) -> list[str]:
+    """The datasets a run could score: the checkpoint's when there is one, else the names the `datasets:` blocks or
+    the given target sources agree on, else the one unnamed dataset."""
+    if isinstance(forecast, InferenceForecastSource):
+        names = list(forecast.dataset_names)
+    elif isinstance(targets, dict):
+        names = list(targets)
+    else:
+        names = config_dataset_names(config)
+    return names or [DEFAULT_DATASET]
+
+
+def _selected_datasets(config: EvaluationConfig, available: list[str]) -> list[str]:
+    """The datasets the run scores: every one of `available` unless the top-level `datasets:` key names a subset.
+
+    The model still predicts every dataset — anemoi-inference runs every decoder and needs an input state for each
+    one — so the skipped datasets only lose their targets, their weights, regions and climatology, their aggregator
+    and their result file."""
+    chosen = config.datasets
+    if chosen is None:
+        return list(available)
+    unknown = [name for name in chosen if name not in available]
+    if unknown:
+        raise ValueError(f"datasets: names the unknown datasets {unknown}, the checkpoint has {available}")
+    return [name for name in available if name in chosen]  # the checkpoint's order, duplicates dropped
+
+
+def build(
+    config: str | Path | dict | EvaluationConfig,
+    forecast: ForecastSource | None = None,
+    targets: TargetSource | dict[str, TargetSource] | None = None,
+    climatology: ClimatologySource | dict[str, ClimatologySource] | None = None,
+) -> Evaluation | MultiEvaluation:
+    """An `Evaluation`, or a `MultiEvaluation` when the run scores multiple datasets; see `Evaluation.from_config`."""
+    config = load_config(config)
+    if forecast is None and config.forecast.anemoi_inference is not None:
+        forecast = InferenceForecastSource(**config.forecast.anemoi_inference.model_dump())
+    available = _dataset_names(config, forecast, targets)
+    names = _selected_datasets(config, available)
+    skipped = [name for name in available if name not in names]
+    if isinstance(forecast, InferenceForecastSource):
+        forecast.scored_datasets = names
+    blocks = {
+        key: per_dataset(getattr(config, key), names, key)
+        for key in ("targets", "variables", "weights", "regions", "climatology")
+    }
+    given_targets = targets if isinstance(targets, dict) else {names[0]: targets} if targets is not None else {}
+    unknown = [name for name in given_targets if name not in names]
+    if unknown:
+        raise ValueError(f"targets were given for the unknown datasets {unknown}, the run scores {names}")
+    if given_targets and set(given_targets) != set(names):  # the all-or-nothing rule of the `datasets:` blocks
+        raise ValueError(f"targets must be given for every dataset or for none, got {sorted(given_targets)} of {names}")
+    sources = {
+        name: given_targets.get(name)
+        or _targets_from_config(
+            blocks["targets"][name],
+            forecast.datasets[name]
+            if isinstance(forecast, InferenceForecastSource) and forecast.multi_dataset
+            else forecast,
+        )
+        for name in names
+    }
+    views, shared = _forecast_views(config, forecast, names, sources)
+    given_climatology = (
+        climatology if isinstance(climatology, dict) else {names[0]: climatology} if climatology is not None else {}
+    )
+    climatologies = {
+        name: given_climatology.get(name)
+        or (ArrayClimatology.from_netcdf(blocks["climatology"][name].file) if blocks["climatology"][name] else None)
+        for name in names
+    }
+    evaluations = {}
+    for name in names:
+        regions = {
+            region: spec if isinstance(spec, str) else spec.spec() for region, spec in blocks["regions"][name].items()
+        }
+        weights = blocks["weights"][name]
+        try:
+            evaluations[name] = Evaluation(
+                views[name],
+                sources[name],
+                config.init_times.resolve(),
+                config.lead_time,
+                config.metrics,
+                blocks["variables"][name],
+                weights.spec() if weights is not None else None,
+                regions,
+                config.bins.model_dump(),
+                on_missing_target=config.on_missing_target,
+                include_lead_zero=config.include_lead_zero,
+                climatology=climatologies[name],
+                dataset=name if len(available) > 1 else None,
+            )
+        except ValueError as error:  # a shared block that fits one dataset's grid but not another's
+            if len(available) == 1:
+                raise
+            raise ValueError(f"dataset {name!r}: {error}") from error
+        evaluations[name]._config = config
+    if skipped and isinstance(forecast, InferenceForecastSource):
+        # the runner reads every dataset's inputs whether or not the dataset is scored (FR-7)
+        for name in skipped:
+            forecast.check_init_times(config.init_times.resolve(), config.lead_time, dataset=name)
+    if len(names) == 1:
+        view = views[names[0]]
+        if isinstance(view, DatasetForecast):  # one dataset of a multi-dataset checkpoint: it owns the runner
+            view.solo = True
+        return evaluations[names[0]]
+    evaluation = MultiEvaluation(evaluations, shared)
+    evaluation._config = config
+    return evaluation
+
+
+def _targets_from_config(block: object, forecast: ForecastSource | None) -> TargetSource:
     """The configured target source; without an `anemoi_dataset` mapping, the forecast source's own dataset."""
-    options = config.targets.anemoi_dataset if config.targets is not None else AnemoiDatasetConfig()
+    options = block.anemoi_dataset if block is not None else AnemoiDatasetConfig()
     settings = {"prefetch": options.prefetch, "cache_bytes": options.cache_bytes}
     kwargs = options.open_dataset_kwargs()
     if kwargs:

@@ -106,11 +106,29 @@ on the first forecast, which is what keeps a dry run model-free (FR-28).
 
 Construction enforces the invariants: `output` must be `"none"` (forecasts stay in memory, FR-1,
 and the process stays clear of anemoi-inference's never-cleared registry of output paths), `date`
-must not be set, the checkpoint must be single-dataset, and `verbosity` defaults to 0. From the
-checkpoint it takes the timestep, the two multi-step counts (hence `output_horizon` and
-`frames_per_pass`), the output variables and their typed forms, the coordinates reduced by the
-checkpoint's `grid_indices`, and the uuid and run id for provenance (NFR-5). With `quiet`, the
-anemoi-inference loggers and the per-step timer are raised to WARNING while the source runs.
+must not be set, the datasets must share the timing, the model must decode every dataset, and
+`verbosity` defaults to 0. From the checkpoint it takes the timestep, the two multi-step counts
+(hence `output_horizon` and `frames_per_pass`), and the uuid and run id for provenance (NFR-5).
+With `quiet`, the anemoi-inference loggers and the per-step timer are raised to WARNING while the
+source runs.
+
+**Per-dataset views.** The output variables and their typed forms, and the coordinates reduced by
+the checkpoint's `grid_indices`, are per dataset and live on a `DatasetForecast` view, one per
+dataset in `datasets` (FR-39). A view is an ordinary single-dataset forecast source — it is what
+the per-dataset `Evaluation` sees — except that it yields no frames of its own: the rollout is
+shared, so `multi_frames()` on the parent yields one frame per dataset per step and the driver
+hands each view's frame to its evaluation. Anything a view does not define itself (members,
+device, lead times, provenance, the run configuration) is the parent's. A single-dataset
+checkpoint keeps the flat API: `grid`, `variables` and `frames()` on the source itself, and the
+source is what the `Evaluation` sees, unchanged.
+
+**Refusals.** `_check_shared_timing()` compares the timestep, the multi-step counts and the
+offsets across `multi_dataset_metadata` and refuses a checkpoint whose datasets disagree, because
+anemoi-inference silently forwards the first dataset's timing as the checkpoint's.
+`_check_every_dataset_is_decoded()` reads `config.model.encoders/decoders` from the stored training
+config and refuses a downscaler: anemoi-inference's `Runner.forecast` indexes the model output by
+every dataset of `metadata_inference` and raises `KeyError` on an input-only one, so such a
+checkpoint cannot be run at all. A checkpoint that does not carry the routing is let through.
 
 **Lockstep members.** For one init time the source builds the initial state once, then advances
 `members` `run()` generators one step at a time, reseeding the global RNG with
@@ -127,7 +145,10 @@ requested variable present in that state and NaN for the others (FR-5).
 **The forcings cache.** `ForcingsCache` is a host LRU of forcings arrays keyed by provider and
 dates, and `SharedForcings` wraps each of the tensor handler's forcings providers so their arrays
 come through it (NFR-11). It checks the grid: the first coordinates seen define it, and a request
-on another grid bypasses the cache. Counters go to the result attributes.
+on another grid bypasses the cache. There is therefore one cache per dataset, each with
+`forcings_cache_bytes` of its own; a single cache would serve the first grid and bypass every other
+one for ever, silently, since the results would stay correct. Each dataset's result file reports
+its own cache's counters; the source's `stats` sums them over the caches.
 
 **Chunk handling.** `inference_env()` implements NFR-12 for the one case that matters: it adds
 `ANEMOI_INFERENCE_NUM_CHUNKS_PROCESSOR=1` to the run configuration's `env` block when
@@ -140,7 +161,9 @@ explicit value alone. `inference_chunks()` reports the counts a loaded model act
 of every model call but the last, since the runner loads no forcings after its last call.
 `graph_node_attribute()` reads a per-node attribute off the loaded model's training graph, and
 `dataset_args_kwargs()` returns the `open_dataset` arguments of the runner's own prognostics input
-(FR-9).
+(FR-9). All three take the dataset: the dates are checked per dataset, the targets default to that
+dataset's own input, and a multi-dataset graph names the node set after the dataset rather than
+`data`, which `graph_node_attribute()` falls back to when `data` is absent.
 
 ### 3.4 Targets: `sources/anemoi_dataset.py`
 
@@ -267,8 +290,22 @@ the runner's datasets. `weights`, `regions` and `aggregator` are cached properti
 spec that needs the checkpoint graph loads the model only when `run()` does.
 
 `run()` loops over init times, accumulating into one state inside a single
-`torch.inference_mode()`; `pairs()` yields `(frame, target)` for a custom loop in the same mode;
+`torch.inference_mode()`, through `begin()`, `frames()`, `add_frame()`, `charge()` and `finish()`,
+which `MultiEvaluation` reuses to drive N evaluations off one rollout; `pairs()` yields
+`(frame, target)` for a custom loop in the same mode;
 `shard(i, n)` returns `init_times[i::n]` and `run(init_times=...)` accepts any subset (FR-33).
+`MultiEvaluation` holds one `Evaluation` per dataset plus the shared source (FR-39). Its `run()`
+pulls the shared `multi_frames()` stream once per init time and gives each dataset's frame to that
+dataset's evaluation, so the model is called once and every dataset has its own targets, weights,
+regions, climatology, aggregator and state; without a shared source (a per-dataset persistence
+baseline) it simply runs the evaluations one after the other. `Evaluation.from_config` returns a
+`MultiEvaluation` when the run scores more than one dataset, and `metrics`, `variables` and
+`attrs()` are then mappings keyed by dataset. The config's `datasets:` key narrows the set of
+datasets that are scored: the build makes views, targets, aggregators and results for the selected
+ones only, checks the init times of the others itself (the runner reads their inputs all the same)
+and, when one dataset is left, hands its view the rollout and the ownership of the runner, so the
+run is an ordinary single-dataset one.
+
 `plan()` produces the dry run (FR-28) without loading a model, combining the sources' `describe()`
 output with the grid size, the variable info and a target-availability check per valid time.
 `time_estimate()` turns a measured step time into shard and run costs, wall being model time plus
@@ -285,13 +322,18 @@ A pydantic model of the `Evaluation` arguments. Every model forbids unknown keys
 pass-through blocks (`anemoi_inference` and `anemoi_dataset`), whose extra keys go to the runner
 configuration and to `open_dataset` respectively. Weight and region specs are single-key models
 with a `build(grid, forecast, targets)` method, so the YAML vocabulary and the builders of 3.8 stay
-in step.
+in step. `targets`, `variables`, `weights`, `regions` and `climatology` additionally accept a
+`datasets: {name: block}` mapping (`PerDataset`), which `per_dataset()` resolves against the
+checkpoint's dataset names: all or none, and no name the checkpoint does not have, which is
+anemoi-inference's own rule for its per-dataset run-config entries.
 
 Two resolutions happen on the raw mapping before validation, in this order: `resolve_base()`
 merges a config on top of the `base:` chain it names (mappings merge key by key, anything else
 replaces, cycles are refused), and `resolve_from_checkpoint()` replaces a dataset block's
 `from_checkpoint` with the arguments the checkpoint records, the block's own keys on top (FR-25,
-FR-26). What the rest of the package sees is the resolved configuration. Validation happens twice:
+FR-26); with multiple datasets it fans out, the runner's `input` block keyed by dataset name as
+anemoi-inference wants it and the `targets` block in the `datasets:` form. What the rest of the
+package sees is the resolved configuration. Validation happens twice:
 at config time (types, unknown keys, single-key specs, durations, metric names) and at
 construction (lead time against the timestep, grids, variables, member requirements, dates)
 (NFR-23).
@@ -317,7 +359,10 @@ Two subcommands over the API. `resolve_shard()` reads `--shard i/n` or derives i
 environment so that job steps and job arrays compose; it uses `SLURM_STEP_NUM_TASKS` rather than
 `SLURM_NTASKS` deliberately, because a batch script also sees `SLURM_NTASKS` with `SLURM_PROCID` 0
 and would then silently evaluate one shard of n under the full output name.
-`format_output_path()` enforces the `{shard}` placeholder for more than one shard (FR-33). The
+`format_output_path()` enforces the `{shard}` placeholder for more than one shard (FR-33) and the
+`{dataset}` placeholder for a run that scores multiple datasets, which it refuses on a run that
+scores one. A shard of such a run writes one file per dataset; merging is then per dataset, and `merge()`
+refuses inputs whose `dataset` attributes differ (FR-30). The
 module imports torch and the package lazily inside the command functions, so `--help` is cheap.
 
 ## 4. Data flow of a run

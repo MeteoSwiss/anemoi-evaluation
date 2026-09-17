@@ -132,7 +132,7 @@ def test_graph_node_attribute_reads_both_graph_data_forms():
     graph = HeteroData()
     graph["data"].area_weight = torch.tensor([[0.25], [0.75]])
     source = InferenceForecastSource.__new__(InferenceForecastSource)
-    source.dataset_name = "ds"
+    source.dataset_names = ["ds"]
 
     source.runner = SimpleNamespace(model=SimpleNamespace(graph_data=graph))
     np.testing.assert_array_equal(source.graph_node_attribute("area_weight"), [0.25, 0.75])

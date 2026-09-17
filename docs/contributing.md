@@ -66,8 +66,10 @@ The suite runs on the CPU in a few seconds. It is built on the in-memory fakes i
 `src/anemoi/evaluation/sources/fake.py` (`FakeForecastSource`, `ArrayTargets`, wired up by the
 `fake_sources` fixture in `tests/conftest.py`) and on hand-written stand-ins for an anemoi
 dataset and an anemoi-inference runner, so no test needs a GPU, a checkpoint or a real zarr.
-There are no pytest markers and no skips: everything in `tests/` runs everywhere, and a test
-that cannot run is a failure, not a skip.
+Apart from `parametrize` there are no markers, and there are no skips: everything in `tests/` runs everywhere, and a test that cannot
+run is a failure, not a skip. Shared helpers that are too big for `conftest.py` live in a private
+module under `tests/` (`_multi_dataset.py`), which `pythonpath = ["tests"]` in `pyproject.toml`
+makes importable.
 
 | file | covers |
 |---|---|
@@ -81,6 +83,7 @@ that cannot run is a failure, not a skip.
 | `test_config.py` | config forms and validation errors, the round trip, `base:` merging and cycles, `from_checkpoint` |
 | `test_inference_source.py` | the inference-source pieces that need no checkpoint: chunk defaults, the forcings cache, the chunk report, graph attributes |
 | `test_real_sources.py` | `DatasetTargets` reads and member seeding against a stand-in anemoi dataset |
+| `test_multi_dataset.py` | the two-dataset fixture runner (`tests/_multi_dataset.py`, `tests/fixtures/multi-dataset/`), the per-dataset views, the refusals, the per-dataset config forms, and the end-to-end equality of a two-dataset run with the two single-dataset runs of the same fake |
 
 The GPU and real-data paths are therefore not covered by `pytest`. They are covered by the
 tools below, which are run by hand against a real checkpoint.

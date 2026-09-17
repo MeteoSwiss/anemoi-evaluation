@@ -12,6 +12,10 @@ Every path they touch is an argument; each script's module docstring says what i
 | `inspect_results.py` | Checks the mechanics of a results file (weights, exclusions, metric inequalities, lead 0, the threshold labels and their contingency identities, the rank histogram and its sum-to-one identity, the reliability diagram and the Brier decomposition identity) and prints its headline numbers. | no |
 | `compare_results.py` | Compares two results files element by element, reporting each raw sum and metric as bit-exact or by its maximum relative difference. | no |
 
+`validate.py`, `make_climatology.py` and `ab_prefetch.py` take a single-dataset checkpoint only:
+they read `forecast.dataset_name`, the `forecast.anemoi_inference.input.dataset` block and a plain
+`regions` block, all of which are per dataset on a multi-dataset checkpoint.
+
 The two GPU scripts load a real checkpoint and run it, so they belong on a compute node with a
 GPU (on balfrin, `scripts/submit.sh` of the aggregation repository); the other three run
 anywhere in a few seconds. `validate.py` and `ab_prefetch.py` set `ANEMOI_INFERENCE_NUM_CHUNKS`

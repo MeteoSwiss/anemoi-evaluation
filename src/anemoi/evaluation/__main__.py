@@ -36,11 +36,21 @@ def resolve_shard(shard: str | None, env: Mapping[str, str] | None = None) -> tu
     return index, count
 
 
-def format_output_path(path: str, index: int, count: int) -> str:
-    """`path` with ``{shard}`` and ``{shards}`` filled in; the ``{shard}`` placeholder is required for several shards."""
+def format_output_path(path: str, index: int, count: int, dataset: str | None = None) -> str:
+    """`path` with ``{shard}``, ``{shards}`` and ``{dataset}`` filled in.
+
+    ``{shard}`` is required for several shards. A multi-dataset run writes one file per dataset and therefore needs
+    ``{dataset}``; a run over a single dataset must not use it, because the dataset name is then an internal label
+    of the checkpoint rather than something the user chose."""
     if count > 1 and "{shard}" not in path:
         raise ValueError(f"output.path needs a {{shard}} placeholder to write {count} shards, got {path!r}")
-    return path.format(shard=index, shards=count)
+    if dataset is None:
+        if "{dataset}" in path:
+            raise ValueError(f"output.path has a {{dataset}} placeholder but the run scores one dataset, got {path!r}")
+        return path.format(shard=index, shards=count)
+    if "{dataset}" not in path:
+        raise ValueError(f"output.path needs a {{dataset}} placeholder to write one file per dataset, got {path!r}")
+    return path.format(shard=index, shards=count, dataset=dataset)
 
 
 def _humanise(value: object, key: str = "", in_bytes: bool = False) -> object:
@@ -86,9 +96,15 @@ def _run(args: argparse.Namespace) -> None:
     index, count = resolve_shard(args.shard)
     if config.output is None and not args.dry_run:
         raise SystemExit("the config needs output.path to run from the command line")
-    path = format_output_path(config.output.path, index, count) if config.output is not None else None
     logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     evaluation = Evaluation.from_config(config)
+    datasets = getattr(evaluation, "dataset_names", None)  # None for a single-dataset run
+    paths = (
+        {name: format_output_path(config.output.path, index, count, name) for name in datasets or [None]}
+        if config.output is not None
+        else {}
+    )
+    path = ", ".join(paths.values()) if paths else None
     init_times = evaluation.shard(index, count)
     LOG.info("shard %d/%d: %d init times %s", index, count, len(init_times), ", ".join(compress_dates(init_times)))
     if not init_times:
@@ -97,7 +113,11 @@ def _run(args: argparse.Namespace) -> None:
         plan = evaluation.plan(init_times, step_time=args.step_time, shards=count)
         plan["shard"] = {"index": index, "count": count, "output": path}
         print(yaml.safe_dump(_humanise(plan), sort_keys=False, width=120))
-        LOG.info("dry run: %s; model loaded: %s", _headline(plan, count), plan["forecast"].get("model_loaded", "n/a"))
+        # the datasets of a multi-dataset run share the model call, so any one of them carries the run's cost
+        summary = next(iter(plan["datasets"].values())) if "datasets" in plan else plan
+        LOG.info(
+            "dry run: %s; model loaded: %s", _headline(summary, count), summary["forecast"].get("model_loaded", "n/a")
+        )
         evaluation.close()
         return
     device = evaluation.device
@@ -106,12 +126,15 @@ def _run(args: argparse.Namespace) -> None:
     else:
         LOG.info("device %s", device)
     try:
-        state = evaluation.run(init_times)
+        result = evaluation.run(init_times)
     finally:
         evaluation.close()
-    state.attrs["shard"] = f"{index}/{count}"
-    write(state.to_xarray(evaluation.metrics), path)
-    LOG.info("wrote %s", path)
+    states = result if datasets else {None: result}
+    metrics = evaluation.metrics if datasets else {None: evaluation.metrics}
+    for name, state in states.items():
+        state.attrs["shard"] = f"{index}/{count}"
+        write(state.to_xarray(metrics[name]), paths[name])
+        LOG.info("wrote %s", paths[name])
 
 
 def _merge(args: argparse.Namespace) -> None:

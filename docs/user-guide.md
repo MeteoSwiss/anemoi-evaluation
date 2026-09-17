@@ -42,6 +42,9 @@ in the [reference](reference.md); the reasons behind the design are in the
 - **Weights** are one float per node and **regions** are boolean node masks, so a result is a
   weighted mean over the nodes of a region; regions may overlap. A **time bin** is the second
   aggregation axis (season, month, date or a single bin); lead time is always its own axis.
+- A checkpoint may be trained on several **datasets**, each with its own grid and variables. Such
+  a run is one evaluation per dataset sharing one rollout, and it writes one result file per
+  dataset (see [Multi-dataset checkpoints](#multi-dataset-checkpoints)).
 - A **source** produces forecasts, targets or a climatology. Sources are small protocols, so a
   run mixes an anemoi-inference checkpoint, a persistence baseline or your own code.
 - Nodes where any member or the target is non-finite are excluded from every statistic *and* from
@@ -562,6 +565,105 @@ one, so only the two end levels are populated and the diagram says nothing about
 one member the levels are `{0, 1}`: the diagram has two points and is the contingency table in
 disguise, which is what lets it, `brier` and `bss` put a deterministic checkpoint and its ensemble sibling
 on one axis.
+
+## Multi-dataset checkpoints
+
+A checkpoint trained on multiple datasets (one encoder and one decoder per dataset) is scored as
+one evaluation per dataset. They share the runner and the rollout — the model is called once —
+and nothing else: each dataset has its own grid, variables, targets, weights, regions,
+climatology and result file. Nothing changes for a stretched-grid checkpoint, whose one dataset
+is a `cutout`.
+
+Every per-dataset block takes either its usual single form, applied to every dataset, or a
+`datasets:` mapping keyed by the checkpoint's dataset names — the convention anemoi-inference
+[uses for its own per-dataset entries][multi-dataset]:
+
+[multi-dataset]: https://anemoi-inference.readthedocs.io/en/latest/inference/configs/multi-dataset.html
+
+```yaml
+forecast:
+  anemoi_inference:
+    checkpoint: /path/to/inference-last.ckpt
+    input:
+      dataset: {from_checkpoint: true, start: 2024, end: 2024}   # resolves per dataset
+    device: cuda
+
+lead_time: 120h
+init_times: {start: 2024-01-02T00, end: 2024-01-05T12, frequency: 12h}
+metrics: [rmse, mae, bias]
+
+weights: {graph_attribute: area_weight}      # one block: every dataset
+variables:
+  datasets:
+    era5: [2t, 10u, t_850, z_500]
+    cerra: [2t, 10u]
+regions:
+  datasets:
+    era5: {global: all}
+    cerra: {alps: {bbox: {north: 48.0, west: 5.5, south: 45.5, east: 11.0}}}
+
+output:
+  path: results/run-{dataset}-{shard}.nc     # {dataset} is required, and only allowed, here
+```
+
+The mapping is all or nothing: it must name every dataset of the checkpoint and no other.
+`targets`, `variables`, `weights`, `regions` and `climatology` accept it; `metrics`, `bins`,
+`lead_time` and the init times are shared by every dataset.
+
+`from_checkpoint: true` resolves per dataset, so each dataset's input and each dataset's targets
+come from that dataset's own zarr, over the evaluation period (FR-9).
+
+Each dataset writes its own file, with the layout of any other result plus a `dataset` attribute.
+Sharding works as usual and a shard writes one file per dataset; merging is then per dataset:
+
+```bash
+anemoi-evaluation run config.yaml --shard 0/4      # writes run-era5-0.nc and run-cerra-0.nc
+anemoi-evaluation merge results/run-era5-*.nc  -o results/run-era5.nc
+anemoi-evaluation merge results/run-cerra-*.nc -o results/run-cerra.nc
+```
+
+`merge` refuses a mixture of datasets, so a glob that catches both is an error rather than a
+silent sum of two grids.
+
+From Python, `Evaluation.from_config` returns a `MultiEvaluation`: `run()` gives one state per
+dataset and `metrics` is a mapping keyed by dataset.
+
+```python
+evaluation = ae.Evaluation.from_config("config.yaml")
+for name, state in evaluation.run().items():
+    state.to_xarray(evaluation.metrics[name]).to_netcdf(f"results-{name}.nc")
+```
+
+Two checkpoints are refused at construction: one whose datasets disagree on the timestep or the
+input and output steps, and a downscaling checkpoint whose model does not decode every dataset —
+anemoi-inference cannot run one either.
+
+### Scoring some of the datasets
+
+The top-level `datasets:` key names the datasets to score; without it, every dataset of the
+checkpoint is scored.
+
+```yaml
+datasets: [cerra]                            # score the LAM only, over the same rollout
+output:
+  path: results/run-cerra-{shard}.nc         # one dataset: no {dataset} placeholder
+```
+
+The model still predicts every dataset — anemoi-inference runs every decoder and needs an input
+state for each one — so the input datasets, the forcings, the rollout and the init-time checks are
+what they would be otherwise, and the run costs the same. What the skipped datasets lose is
+everything downstream of the model: no targets are read, no weights, regions or climatology are
+built, nothing is aggregated and no result file is written for them. The `datasets:` mappings of
+`targets`, `variables`, `weights`, `regions` and `climatology` must then name exactly the selected
+datasets — naming a dataset the run does not score is an error, as is an unknown name or an empty
+list. `from_checkpoint: true` resolves the targets of the selected datasets only.
+
+Selecting exactly one dataset makes the run an ordinary single-dataset one: `output.path` takes no
+`{dataset}` placeholder (and refuses one, as for a single-dataset checkpoint),
+`Evaluation.from_config` returns a plain `Evaluation` whose `run()` gives one state, and the result
+file has the usual single-dataset layout. It does carry the `dataset` attribute, which names the
+dataset of the checkpoint that was scored; results of a checkpoint that has only one dataset carry
+no such attribute.
 
 ## Persistence and the other included sources
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+* `config.checkpoint_dataset_arguments` returns one `open_dataset` argument set per dataset.
+* `Evaluation.from_config` returns a `MultiEvaluation` for a checkpoint trained on multiple datasets.
+* `output.path` must not contain `{dataset}` on a single-dataset run.
+
+### Features
+
+* Checkpoints trained on multiple datasets are scored: one evaluation per dataset, sharing one
+  runner and one rollout, each with its own targets, variables, weights, regions, climatology and
+  result file. Single-dataset runs are unchanged.
+* `targets`, `variables`, `weights`, `regions` and `climatology` accept a `datasets:` mapping
+  keyed by the checkpoint's dataset names, and `from_checkpoint:` resolves per dataset.
+* `output.path` takes a `{dataset}` placeholder, required by a multi-dataset run; `merge` refuses
+  results of different datasets.
+* Checkpoints whose datasets disagree on the timing, and downscaling checkpoints whose model does
+  not decode every dataset, are refused with a message naming the problem.
+* A top-level `datasets:` key scores a subset of a multi-dataset checkpoint's datasets; the model
+  still predicts every dataset, the skipped ones simply get no targets, no aggregator and no
+  result file. Selecting one dataset gives an ordinary single-dataset run, whose result names the
+  dataset it scored.
+
 ## 0.2.0 — 2026-09-17
 
 Categorical, calibration and reliability scores, all stored as additive per-element sums, so

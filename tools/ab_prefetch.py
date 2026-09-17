@@ -3,7 +3,8 @@
     python tools/ab_prefetch.py <config.yaml> --variants p0 p2 p2c2 p0
 
 Needs a GPU: it loads the checkpoint of the config's `forecast.anemoi_inference` block and runs the whole config once
-per variant. Repeat a variant (`p0 ... p0`) to bracket the measurement against drift.
+per variant. Repeat a variant (`p0 ... p0`) to bracket the measurement against drift. Single-dataset checkpoints only:
+it reads a plain `regions` block.
 
 A variant is `p<prefetch>[c<GiB>][t]`, e.g. `p6c2` = read six rows ahead with a 2 GiB decoded-row cache, `t` =
 `numcodecs.blosc.use_threads = True` for that variant only. One `InferenceForecastSource` serves every variant; the

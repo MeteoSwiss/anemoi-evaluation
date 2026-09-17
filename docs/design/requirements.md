@@ -96,16 +96,34 @@ at every lead) as a baseline and as a model-free end-to-end check.
 from, or listed as missing in, the datasets the runner reads.
 *Rationale: a failure 40 minutes into a job array is expensive, and this check needs no model.*
 
+**FR-39** A checkpoint trained on multiple datasets MUST be scored as N per-dataset evaluations
+sharing one runner and one rollout: every dataset gets its own targets, variables, weights,
+regions, climatology, aggregator and result file, and the datasets share only the model call, the
+init times and the lead times. A single-dataset run MUST be unaffected, bit for bit. Every
+per-dataset configuration block MUST accept either one value applied to every dataset or a
+`datasets: {name: block}` mapping naming every dataset of the checkpoint and no other. A
+checkpoint whose datasets disagree on the timing, or whose model does not decode every dataset,
+MUST be refused with a message naming the problem. A run MUST be able to score a subset of the
+checkpoint's datasets, named by a top-level `datasets:` key (default: all of them); the model still
+predicts every dataset, so inputs, forcings, the rollout and the init-time checks of FR-7 are
+unchanged for the skipped ones, which get no targets, no weights, regions or climatology, no
+aggregator and no result file. A run that selects exactly one dataset MUST behave like a
+single-dataset run, its result file naming the dataset it scored.
+*Rationale: anemoi-inference yields one independent, complete state per dataset from one rollout,
+so the only thing the datasets have to share is the model call; anything else shared would mix two
+grids and two variable namespaces in one result.*
+
 ### 3.2 Targets
 
-**FR-8** Targets MUST be read from an anemoi dataset at the frame's valid time, on the forecast
-source's grid, in the model's units, with no regridding and no unit conversion; a source on a
-different grid (beyond 1e-5 degrees per node) MUST be refused at construction.
+**FR-8** Targets MUST be read from an anemoi dataset at the frame's valid time, on the grid of the
+dataset being scored, in the model's units, with no regridding and no unit conversion; a source on
+a different grid (beyond 1e-5 degrees per node) MUST be refused at construction.
 *Rationale: the comparison is then the one the model was trained against, with no interpolation
 error the package cannot account for.*
 
-**FR-9** The default target dataset MUST cover the evaluation period rather than the period the
-model was trained on, without the user having to spell the dataset out.
+**FR-9** The default target dataset of a scored dataset MUST be that dataset's own prognostics
+input, and MUST cover the evaluation period rather than the period the model was trained on,
+without the user having to spell the dataset out.
 *Rationale: the arguments recorded in a checkpoint carry the training period's `start` and `end`,
 which would silently exclude the dates being evaluated.*
 
@@ -181,7 +199,8 @@ uses exactly the weights training used. The spec vocabulary is in
 
 **FR-21** Regions MUST be configurable as arbitrary per-node masks, including geographic boxes,
 graph attributes and the sub-grids of a cutout dataset, and MAY overlap. At least one region MUST
-be configured, the default being one global region.
+be configured, the default being one global region. Regions are per scored dataset: a mask is
+built over that dataset's grid, and a graph attribute is read from that dataset's node set.
 
 **FR-22** Time binning MUST offer at least seasonal, monthly, per-date and no binning, keyed on
 either the init time or the valid time of a frame. Lead time MUST always be an axis and never a
@@ -222,9 +241,12 @@ evaluation: it MUST change no result and MUST NOT be a configuration key.
 
 ### 3.6 Output, sharding and merging
 
-**FR-30** A run MUST write one netcdf holding the metrics, the raw aggregation state, the
-coordinates, and provenance attributes identifying the checkpoint, the configuration, the package
-versions, the counters and the timings. The raw state MUST be readable back from that file.
+**FR-30** A run MUST write one netcdf per scored dataset, holding that dataset's metrics, raw
+aggregation state, coordinates, and provenance attributes identifying the checkpoint, the
+configuration, the package versions, the counters and the timings. The raw state MUST be readable
+back from that file. The file layout MUST NOT depend on the number of datasets: a multi-dataset
+run's files differ from a single-dataset run's only by a `dataset` attribute, and merging MUST
+refuse inputs of different datasets.
 
 **FR-31** Result files and in-memory states MUST merge by summation, since everything the state
 holds is a sum, into a state that satisfies NFR-4.
@@ -312,7 +334,9 @@ value MUST be left alone.
 peak memory and bit-identical fields (benchmarks 10).*
 
 **NFR-13** GPU memory MUST be linear in the ensemble size with a documented per-member cost, so a
-user can size a job.
+user can size a job. With multiple datasets the per-member cost is the sum over their grids: the
+rollout holds one state per dataset and builds every dataset's frame before yielding, and the host
+holds one target prefetch buffer and one forcings cache per dataset.
 *Evidence: 1.45 to 1.55 GiB per member for a 6-hourly 2-in/1-out model at 1.69M nodes, about
 6 GiB for an hourly 7-in/6-out one, linear to M = 24 (benchmarks 3 and 10).*
 
@@ -390,8 +414,10 @@ Deliberate non-goals at v0.2.0. Each is a decision, not an oversight.
   only gain is per-step Python overhead, which is nil at 1.7M nodes, and it is incompatible with a
   sharded model. Should the ensemble memory of NFR-13 ever bind, the fix is the opposite one,
   sequential members with a pinned host buffer ([`architecture.md`](architecture.md) section 9).
-* **Multi-dataset checkpoints**, refused at construction, and **comparing several checkpoints in
-  one run**: one checkpoint per run, comparison is offline from result files.
+* **Downscaling checkpoints** (`input_datasets != target_datasets`): anemoi-inference cannot run
+  them at all, so they are refused where the training config makes the routing readable (FR-39).
+* **Comparing several checkpoints in one run**: one checkpoint per run, comparison is offline from
+  result files.
 * **Neighbourhood scores** (FSS and its relatives). They are not per-node reductions, and on an
   unstructured grid a neighbourhood is a spatial query the package has no index for.
 * **Quantile, climatological or otherwise per-node thresholds.** Thresholds are fixed numbers in the

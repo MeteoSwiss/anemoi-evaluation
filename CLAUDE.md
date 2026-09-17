@@ -34,6 +34,8 @@ See @README.md for the project overview and repository layout.
 * `setuptools-scm` versioning: a clone without tags reports `0+unknown`.
 * `ANEMOI_INFERENCE_NUM_CHUNKS` without `ANEMOI_INFERENCE_NUM_CHUNKS_PROCESSOR`: the inference source adds the
   latter as 1; the GPU tools default the former to 8.
-* `output.path` needs a `{shard}` placeholder whenever more than one shard is written.
+* `output.path` needs a `{shard}` placeholder whenever more than one shard is written, and a
+  `{dataset}` placeholder for a run that scores multiple datasets (which it refuses on a run that scores one,
+  including a subset of one selected with `datasets:`).
 * Slurm sharding uses `SLURM_STEP_NUM_TASKS`, not `SLURM_NTASKS`, which would silently make a batch script 1 of n.
 * `base:` and `from_checkpoint:` resolve on the raw mapping before pydantic validation; the rest sees the result.

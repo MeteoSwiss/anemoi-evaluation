@@ -4,6 +4,7 @@
                                      [--key hour_of_day] [--prefetch 4] -o <climatology.nc>
 
 No GPU needed, but one zarr row per date: a month of six-hourly dates takes a few minutes off Lustre.
+Single-dataset checkpoints only: it reads the config's `forecast.anemoi_inference.input.dataset` block.
 
 Reads every dataset date in [start, end] once through `DatasetTargets` (worker prefetch) — the dataset of the config's
 `forecast.anemoi_inference.input.dataset` block, for the config's `variables` — accumulates float64 sums per key and

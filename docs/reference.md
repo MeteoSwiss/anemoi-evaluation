@@ -47,7 +47,8 @@ Order of operations in `run`:
    counts and `_s` durations rendered as `1 GiB (1073741824)` and `1 minute 30 seconds (90.0)`, and the
    `shard` block (`index`, `count`, `output`) appended. Otherwise the run executes, the sources are
    closed in a `finally`, `state.attrs["shard"]` is set to `"i/n"` (also for an unsharded run, where it
-   is `"0/1"`), and the dataset is written to the formatted path, creating parent directories.
+   is `"0/1"`), and the dataset is written to the formatted path, creating parent directories. A
+   multi-dataset run writes one file per dataset, `{dataset}` filled in with the dataset's name.
 
 ### `merge`
 
@@ -123,16 +124,17 @@ before validation:
 |---|---|---|---|
 | `base` | path | absent | Not a model field: it is consumed and removed before validation. See [Loading](#loading). |
 | `forecast` | `ForecastConfig` | required | Forecast source; exactly one of `anemoi_inference`, `persistence`. |
-| `targets` | `TargetsConfig` or null | null | Target source. Null (or a block with no `open_dataset` keys) means the forecast source's own dataset. |
+| `targets` | `TargetsConfig`, `{datasets: {name: TargetsConfig}}` or null | null | Target source. Null (or a block with no `open_dataset` keys) means the forecast source's own dataset. See [Multi-dataset checkpoints](#multi-dataset-checkpoints). |
+| `datasets` | list of str or null | null | The datasets of a multi-dataset checkpoint to score; null means every one of them. An unknown name, an empty list, or a per-dataset `datasets:` mapping that names a dataset the run does not score raises at build time. See [Multi-dataset checkpoints](#multi-dataset-checkpoints). |
 | `lead_time` | duration | required | Longest lead time to score. Must be positive; strings such as `24h`, `1d`, `6h` are accepted. Must be a multiple of the forecast timestep. Serialised back as a frequency string. |
 | `init_times` | `InitTimesRange` or `InitTimesList` | required | See below. |
-| `variables` | list of str or null | null | Variables to score. Null means the variables shared by the two sources, in the forecast source's order (`[name for name in forecast.variables if name in targets.variables]`). A requested name that either source cannot deliver raises; an empty result raises `no variables to evaluate`. |
+| `variables` | list of str, `{datasets: {name: list of str}}` or null | null | Variables to score. Null means the variables shared by the two sources, in the forecast source's order (`[name for name in forecast.variables if name in targets.variables]`). A requested name that either source cannot deliver raises; an empty result raises `no variables to evaluate`. |
 | `metrics` | list of str or `{name: kwargs}` | `["rmse", "mae", "bias"]` | See [metrics](#metrics). Validated at config load. |
-| `weights` | `WeightsConfig` or null | null | Node weights. Null means `{graph_attribute: area_weight}` when the forecast source has a model graph, else `{uniform: {}}`. |
-| `regions` | map name to `RegionConfig` | `{"global": "all"}` | Named node masks; they may overlap. An empty mapping falls back to the default. |
+| `weights` | `WeightsConfig`, `{datasets: {name: WeightsConfig}}` or null | null | Node weights. Null means `{graph_attribute: area_weight}` when the forecast source has a model graph, else `{uniform: {}}`. |
+| `regions` | map name to `RegionConfig`, or `{datasets: {name: map}}` | `{"global": "all"}` | Named node masks; they may overlap. An empty mapping falls back to the default. |
 | `bins` | `BinsConfig` | `{time: season, by: init_time}` | Time binning. |
-| `climatology` | `ClimatologyConfig` or null | null | Required by `acc`. |
-| `output` | `{path: str}` or null | null | Result file path; required by `anemoi-evaluation run`. |
+| `climatology` | `ClimatologyConfig`, `{datasets: {name: ClimatologyConfig}}` or null | null | Required by `acc`. |
+| `output` | `{path: str}` or null | null | Result file path; required by `anemoi-evaluation run`. `{shard}` and `{shards}` are filled in; `{dataset}` is required by, and only allowed for, a run that scores multiple datasets. |
 | `on_missing_target` | `"skip"` or `"raise"` | `"skip"` | What to do when the target for a valid time is absent. `skip` logs a warning and drops that frame. |
 | `include_lead_zero` | bool | `false` | Prepend a lead-0 frame from the initial state. Raises at construction when the forecast source has `supports_lead_zero = False`. A `MissingTargetError` from `initial_frame` for one init time is caught and logged as `no lead-0 frame for init <date>`; that init time is scored without its lead-0 frame. |
 | `log_level` | str | `"INFO"` | Level passed to `logging.basicConfig` by the CLI. |
@@ -203,6 +205,52 @@ init times up front.
 Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no `targets:` block at
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
+
+### Multi-dataset checkpoints
+
+A checkpoint trained on multiple datasets is scored as one evaluation per dataset, sharing one runner and
+one rollout. `targets`, `variables`, `weights`, `regions` and `climatology` then take either their usual
+single form, applied to every dataset, or a `datasets:` mapping keyed by the checkpoint's dataset names:
+
+```yaml
+weights: {uniform: {}}                      # one block, every dataset
+regions:
+  datasets:
+    era5: {global: all}
+    cerra: {alps: {bbox: {north: 48, west: 5, south: 45, east: 11}}}
+```
+
+The mapping must name every dataset the run scores and no other, which is anemoi-inference's rule for
+its own per-dataset config entries; an incomplete or unknown set raises at build time. `from_checkpoint:`
+resolves per dataset: the runner's `input` block becomes one entry per dataset name (anemoi-inference's
+form) and the `targets` block becomes the `datasets:` form.
+
+The top-level `datasets:` key scores a subset; the default is every dataset of the checkpoint. The model
+still predicts every dataset (the runner runs every decoder and needs an input state for each one), so the
+inputs, the forcings, the rollout and the init-time checks of FR-7 are unchanged for the skipped ones: they
+only lose their targets, weights, regions, climatology, aggregator and result file. The per-dataset
+`datasets:` mappings must then name exactly the selected datasets. When exactly one dataset is selected the
+run is an ordinary single-dataset one: `Evaluation.from_config` returns an `Evaluation`, `output.path` must
+not contain `{dataset}`, and the result has the single-dataset layout plus the `dataset` attr, which names
+the dataset scored. `describe()` and `plan()` of such a run report `datasets_scored` and
+`datasets_predicted_only`, and the plan's `predicted_only_state_bytes` is the forecast state the runner
+holds for the datasets that are not scored.
+
+`Evaluation.from_config` then returns a `MultiEvaluation`, whose `run()` returns one `AggregationState`
+per dataset and whose `metrics` and `variables` are mappings keyed by dataset. Each dataset is written to
+its own file through the `{dataset}` placeholder of `output.path`, with the same layout as any other
+result plus a `dataset` attribute. Merging is per dataset: `merge` refuses inputs whose `dataset` attrs
+differ, so a sharded multi-dataset run is merged once per dataset.
+
+Refused at construction: a checkpoint whose datasets disagree on the timestep, the input and output steps
+or the rollout shift, and a downscaling checkpoint whose model does not decode every dataset
+(anemoi-inference cannot run one either).
+
+The default weights (`{graph_attribute: area_weight}`) are read from each dataset's own node set of the
+model graph. When `graph_data` is a mapping it must be keyed by the dataset names — a key that names no
+dataset of a multi-dataset checkpoint raises rather than serving another dataset's graph. The node set is
+the one asked for; only the default name `data` falls back to the dataset's name, and only when the graph
+has no `data` node set. A node set the graph does not have raises with the ones it does.
 
 ### Weights
 
@@ -605,6 +653,7 @@ Attributes. Identity of the result:
 | Attr | Content |
 |---|---|
 | `members` | Ensemble size, as an int. |
+| `dataset` | The dataset of the checkpoint this result scores; written whenever the checkpoint has multiple datasets, including when the run scored only one of them. Absent for a checkpoint with a single dataset. |
 | `metrics` | JSON list of the metric specs, used by `merge` to rebuild them. |
 | `bin_kind`, `bin_by` | The binning rule. |
 | `init_times` | Compressed date list of the init times of this run. |
@@ -632,6 +681,12 @@ Timing, in seconds:
 | `time_statistics_s` | Wall time in the aggregator. |
 | `time_total_s` | Wall time of the init-time loop. |
 | `time_target_read_s` | Seconds the target source's reading thread spent. |
+
+In a multi-dataset run the datasets share one rollout, so `time_model_s` is that rollout's whole time and
+every dataset's result file carries the same value, not a share of it — the same convention `plan()` uses
+for its estimates. `time_target_s` and `time_statistics_s` are the dataset's own, and `time_total_s` is
+the sum of the three rather than the wall clock of the init-time loop, which would also be the same number
+in every file. The prefetch calls and the lead-0 frames are charged to no phase.
 
 Counters:
 
@@ -668,6 +723,8 @@ unsharded control; that is a measurement of one configuration, not a guarantee.
 - different coordinates (`lead_times`, `bins`, `variables`, `regions`) or different statistic sets;
 - different `members`;
 - overlapping `init_times` (the same init time counted twice);
+- inputs whose `dataset` attrs are not all the same (a multi-dataset run writes one file per dataset per
+  shard, and each dataset merges on its own); results of a single-dataset checkpoint carry no `dataset` attr;
 - a set of `shard` attrs that is neither all absent nor exactly the `0..n-1` of one run: a missing shard,
   a duplicate, disagreeing shard counts, a mix of tagged and untagged inputs, or a malformed tag. Inputs
   that all carry no tag (states built from the Python API, already-merged files) skip the check.
@@ -681,7 +738,7 @@ when the set is complete. Inputs carrying different `config` attrs produce a war
 
 ## Python API
 
-`anemoi.evaluation.__all__` holds 24 names and is the public surface. Five of them are modules
+`anemoi.evaluation.__all__` holds 26 names and is the public surface. Five of them are modules
 (`metrics`, `statistics`, `binning`, `weights`, `regions`), whose contents are public too. Every name not
 listed in this section is internal and may change without notice.
 
@@ -711,10 +768,13 @@ Weights and regions given as specs are resolved on first use.
 | `attrs(init_times=None, timing=None)` | `dict` of result-file attributes. |
 | `to_config()` | `dict`, YAML-ready; raises when weights or regions were given as arrays. |
 | `close()` | `None`; releases the forecast, target and climatology sources. |
-| `Evaluation.from_config(config, forecast=None, targets=None, climatology=None)` | classmethod; a path, a dict or an `EvaluationConfig`, with the source arguments overriding the configured ones. |
+| `Evaluation.from_config(config, forecast=None, targets=None, climatology=None)` | classmethod; a path, a dict or an `EvaluationConfig`, with the source arguments overriding the configured ones. Returns a `MultiEvaluation` when the run scores multiple datasets, and an `Evaluation` when the config's `datasets:` key selects one; `targets` and `climatology` may then be `{name: source}`. |
 
 Cached properties, resolved on first use: `weights -> np.ndarray`, `regions -> dict[str, np.ndarray]`,
 `aggregator -> Aggregator`.
+
+`begin()`, `frames(init_time)`, `add_frame(state, frame, timer)`, `charge(...)` and `finish(...)` are the
+halves of `run()`, for a driver that feeds the frames itself; `MultiEvaluation` uses them.
 
 | Attribute | Type | Content |
 |---|---|---|
@@ -729,6 +789,38 @@ Cached properties, resolved on first use: `weights -> np.ndarray`, `regions -> d
 | `device` | `torch.device` | The resolved device. |
 | `on_missing_target`, `include_lead_zero` | str, bool | As configured. |
 | `timing`, `model_calls`, `peak_memory_bytes`, `climatology_nonfinite` | dict, int, int or `None`, dict | Set by `run()`. |
+
+#### `MultiEvaluation`
+
+```python
+MultiEvaluation(evaluations, forecast=None)
+```
+
+One `Evaluation` per dataset of a multi-dataset checkpoint, sharing one runner and one rollout;
+`Evaluation.from_config` builds it. `forecast` is the shared `InferenceForecastSource`, or `None` when
+each evaluation runs on its own (a per-dataset persistence baseline).
+
+| Method or attribute | Returns |
+|---|---|
+| `run(init_times=None)` | `dict[str, AggregationState]`, one per dataset, each with a `dataset` attr. |
+| `pairs(init_times=None)` | `Iterator[tuple[str, Frame, torch.Tensor]]`. |
+| `plan(init_times=None, step_time=None, shards=1)` | `dict` with one plan per dataset under `datasets`, the names scored under `scored` and, when the run scores a subset, the others under `predicted_only`. |
+| `shard(index, count)` | `list[datetime]`, the same for every dataset. |
+| `attrs(init_times=None)` | `dict[str, dict]`, the result attrs of each dataset. |
+| `to_config()`, `close()` | As `Evaluation`; `close()` also releases the shared runner. |
+| `evaluations` | `dict[str, Evaluation]`. |
+| `dataset_names` | `list[str]`, in the checkpoint's order. |
+| `metrics`, `variables` | `dict[str, ...]` keyed by dataset. |
+| `init_times`, `lead_time`, `lead_times`, `device` | Shared by every dataset. |
+
+#### `DatasetForecast`
+
+One dataset of a multi-dataset `InferenceForecastSource`, as an ordinary single-dataset forecast source:
+`grid`, `variables`, `typed_variables` and `grid_indices` are its own, `frames()` raises (the rollout is
+shared, and the parent's `multi_frames()` drives it), and everything else is delegated to the parent.
+`InferenceForecastSource.datasets` maps each dataset name to one. A view whose `solo` flag is set is the
+only dataset the run scores: it then drives the rollout itself through `frames()` and owns the runner, so
+closing it closes the parent.
 
 #### The `plan()` dictionary
 
@@ -993,8 +1085,12 @@ Consequences:
 
 Constraints the code enforces, with the message or behaviour:
 
-- **Single-dataset checkpoints only.** `InferenceForecastSource` and `checkpoint_dataset_arguments`
-  raise for a multi-dataset checkpoint.
+- **Multi-dataset checkpoints must share the timing and decode every dataset.** A checkpoint whose
+  datasets disagree on the timestep or the input and output steps, and a downscaling checkpoint whose
+  model does not decode every dataset, are refused at construction.
+- **The `tools/` scripts take a single-dataset checkpoint.** `validate.py`, `make_climatology.py` and
+  `ab_prefetch.py` read `forecast.dataset_name`, the `forecast.anemoi_inference.input.dataset` block and
+  a plain `regions` block, all of which are per dataset on a multi-dataset checkpoint; they raise on one.
 - **One process per shard.** There is no multi-rank job and no model-parallel runner. Lockstep members
   cost GPU memory linearly.
 - **Target datasets must have one member** (`shape[2] == 1`).

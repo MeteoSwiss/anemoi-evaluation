@@ -187,7 +187,7 @@ def test_from_checkpoint(monkeypatch):
 
     def arguments(checkpoint):
         read.append(checkpoint)
-        return (RECORDED,), {"start": None, "end": 2023}
+        return {"data": ((RECORDED,), {"start": None, "end": 2023})}
 
     monkeypatch.setattr(config_module, "checkpoint_dataset_arguments", arguments)
     inference = CONFIG["forecast"]["anemoi_inference"]

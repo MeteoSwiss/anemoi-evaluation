@@ -11,6 +11,7 @@ from anemoi.evaluation import weights
 from anemoi.evaluation.aggregation import AggregationState
 from anemoi.evaluation.aggregation import Aggregator
 from anemoi.evaluation.evaluate import Evaluation
+from anemoi.evaluation.evaluate import MultiEvaluation
 from anemoi.evaluation.evaluate import init_times
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
@@ -18,6 +19,7 @@ from anemoi.evaluation.output import load_state
 from anemoi.evaluation.output import merge
 from anemoi.evaluation.output import to_xarray
 from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
+from anemoi.evaluation.sources.anemoi_inference import DatasetForecast
 from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
 from anemoi.evaluation.sources.base import ClimatologySourceBase
 from anemoi.evaluation.sources.base import ForecastSourceBase
@@ -38,6 +40,7 @@ __all__ = [
     "ArrayClimatology",
     "ArrayTargets",
     "ClimatologySourceBase",
+    "DatasetForecast",
     "DatasetTargets",
     "Evaluation",
     "FakeForecastSource",
@@ -45,6 +48,7 @@ __all__ = [
     "Frame",
     "Grid",
     "InferenceForecastSource",
+    "MultiEvaluation",
     "PersistenceForecastSource",
     "TargetSourceBase",
     "__version__",

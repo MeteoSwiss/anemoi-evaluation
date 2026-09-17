@@ -4,6 +4,7 @@
                              [--members 1 4] [--lead-zero] [--rtol 1e-5] [-o out.nc]
 
 Needs a GPU: it loads the checkpoint of the config's `forecast.anemoi_inference` block and runs it.
+Single-dataset checkpoints only: it reads `forecast.dataset_name` and a plain `regions` block.
 
 One process: the framework `Evaluation` (config members) and the direct loop share the loaded model and the seeding
 (`member_seed(seed, init, member, call)` before every member's model call), so the member draws are identical. For every

@@ -115,6 +115,7 @@ def merge(items: Iterable[AggregationState | str | Path], *, partial: bool = Fal
     if not states:
         raise ValueError("nothing to merge")
     labels = [str(item) if isinstance(item, (str, Path)) else f"input {i}" for i, item in enumerate(items)]
+    _check_one_dataset(states, labels)
     shard = _merged_shard(states, labels, partial)
     result = states[0]
     for state in states[1:]:
@@ -135,6 +136,18 @@ def merge(items: Iterable[AggregationState | str | Path], *, partial: bool = Fal
         attrs["shard"] = shard
     result.attrs = attrs
     return result
+
+
+def _check_one_dataset(states: list[AggregationState], labels: list[str]) -> None:
+    """Refuse a merge across datasets: a multi-dataset run writes one file per dataset per shard, and the shards of
+    one dataset are merged on their own. Results of a single-dataset run carry no `dataset` attr and merge as before.
+    """
+    found: dict[str, list[str]] = {}
+    for state, label in zip(states, labels):
+        found.setdefault(str(state.attrs.get("dataset", "")), []).append(label)
+    if len(found) > 1:
+        listed = ", ".join(f"{name or '(none)'} ({', '.join(names)})" for name, names in sorted(found.items()))
+        raise ValueError(f"the inputs are results of different datasets: {listed}; merge one dataset at a time")
 
 
 def _shard_tag(value: str, label: str) -> tuple[frozenset[int], int]:
