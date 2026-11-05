@@ -571,7 +571,9 @@ class InferenceForecastSource(ForecastSourceBase):
         if memo is None or memo[0] != init_time:
             runner = self.runner
             inputs = (runner.prognostics_inputs, runner.constant_forcings_inputs, runner.dynamic_forcings_inputs)
-            state = runner._combine_states(*(source[dataset].create_input_state(date=init_time) for source in inputs))
+            # The input window ending at init_time, as Runner.execute builds it (anemoi-inference >= 0.13).
+            dates = [init_time + lag for lag in runner.checkpoint.multi_dataset_metadata[dataset].lagged]
+            state = runner._combine_states(*(source[dataset].create_input_state(dates=dates) for source in inputs))
             self._initial[dataset] = (init_time, state)
         return self._initial[dataset][1]
 

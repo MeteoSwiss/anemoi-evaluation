@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+* Requires anemoi-inference >= 0.13, whose inputs take the list of input dates
+  (`create_input_state(dates=...)`) instead of one date.
+
+### Fixes
+
+* Runs on anemoi-inference >= 0.13: the initial state was built with `create_input_state(date=...)`, which
+  fails there with `missing 1 required keyword-only argument: 'dates'`.
+
+
+
 ## 0.3.0 — 2026-09-17
 
 Checkpoints trained on multiple datasets, scored as one evaluation per dataset that share the

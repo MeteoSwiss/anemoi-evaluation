@@ -143,9 +143,10 @@ weights = evaluation.weights
 masks = evaluation.regions
 fields_by_members = {}
 for members in members_list:
-    prognostic = runner.prognostics_inputs[name].create_input_state(date=init)
-    constant = runner.constant_forcings_inputs[name].create_input_state(date=init)
-    dynamic = runner.dynamic_forcings_inputs[name].create_input_state(date=init)
+    input_dates = [init + lag for lag in runner.checkpoint.multi_dataset_metadata[name].lagged]
+    prognostic = runner.prognostics_inputs[name].create_input_state(dates=input_dates)
+    constant = runner.constant_forcings_inputs[name].create_input_state(dates=input_dates)
+    dynamic = runner.dynamic_forcings_inputs[name].create_input_state(dates=input_dates)
     initial = runner._combine_states(prognostic, constant, dynamic)
     runner.reference_date = None
     torch.cuda.synchronize()
