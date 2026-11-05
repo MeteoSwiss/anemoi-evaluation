@@ -2,17 +2,11 @@
 
 ## Unreleased
 
-### Breaking
-
-* Requires anemoi-inference >= 0.13, whose inputs take the list of input dates
-  (`create_input_state(dates=...)`) instead of one date.
-
 ### Fixes
 
-* Runs on anemoi-inference >= 0.13: the initial state was built with `create_input_state(date=...)`, which
-  fails there with `missing 1 required keyword-only argument: 'dates'`.
-
-
+* Runs on anemoi-inference >= 0.13 as well as on older releases: the initial state was built with
+  `create_input_state(date=...)`, which fails on 0.13 with `missing 1 required keyword-only argument: 'dates'`;
+  the input's signature now decides between `dates=` and `date=`.
 
 ## 0.3.0 — 2026-09-17
 

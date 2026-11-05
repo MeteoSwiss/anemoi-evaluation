@@ -27,7 +27,7 @@ dynamic = [ "version" ]
 dependencies = [
   "anemoi-datasets",
   "anemoi-graphs",
-  "anemoi-inference>=0.13",
+  "anemoi-inference",
   "anemoi-transform",
   "anemoi-utils",
   "netcdf4",

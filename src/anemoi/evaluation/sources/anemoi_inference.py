@@ -6,6 +6,7 @@ import contextlib
 import datetime
 import gc
 import hashlib
+import inspect
 import itertools
 import logging
 import math
@@ -34,6 +35,13 @@ def member_seed(seed: int, init_time: datetime.datetime, member: int = 0, step: 
     does not depend on the ensemble size, on the other members or on how the rollouts are interleaved."""
     key = f"{seed}|{init_time.isoformat()}|{member}|{step}".encode()
     return int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big") >> 1
+
+
+def create_input_state(source: object, init_time: datetime.datetime, lagged: list[datetime.timedelta]) -> dict:
+    """Input state at `init_time`: anemoi-inference >= 0.13 takes `dates=`, older releases `date=`."""
+    if "dates" in inspect.signature(source.create_input_state).parameters:
+        return source.create_input_state(dates=[init_time + lag for lag in lagged])
+    return source.create_input_state(date=init_time)
 
 
 def required_dates(
@@ -571,9 +579,10 @@ class InferenceForecastSource(ForecastSourceBase):
         if memo is None or memo[0] != init_time:
             runner = self.runner
             inputs = (runner.prognostics_inputs, runner.constant_forcings_inputs, runner.dynamic_forcings_inputs)
-            # The input window ending at init_time, as Runner.execute builds it (anemoi-inference >= 0.13).
-            dates = [init_time + lag for lag in runner.checkpoint.multi_dataset_metadata[dataset].lagged]
-            state = runner._combine_states(*(source[dataset].create_input_state(dates=dates) for source in inputs))
+            lagged = runner.checkpoint.multi_dataset_metadata[dataset].lagged
+            state = runner._combine_states(
+                *(create_input_state(source[dataset], init_time, lagged) for source in inputs)
+            )
             self._initial[dataset] = (init_time, state)
         return self._initial[dataset][1]
 
