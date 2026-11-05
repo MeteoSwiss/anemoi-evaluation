@@ -44,7 +44,12 @@ def test_fixture_runner_yields_one_state_per_dataset(tmp_path):
         assert metadata[name].rollout_shift == 6 * fixture.HOUR
 
     init_time = fixture.init_times()[0]
-    states = {name: runner.prognostics_inputs[name].create_input_state(date=init_time) for name in grids}
+    states = {
+        name: runner.prognostics_inputs[name].create_input_state(
+            dates=[init_time + lag for lag in metadata[name].lagged]
+        )
+        for name in grids
+    }
     yields = []
     for step, output in enumerate(runner.run(input_states=states, lead_time="12h"), start=1):
         yields.append(output)
@@ -72,8 +77,12 @@ def test_fixture_runner_honours_return_numpy(tmp_path):
     """`frames()` asks for tensors; the fields are then non-contiguous float32 torch tensors."""
     runner = fixture.make_runner(fixture.save_checkpoint(tmp_path / "two.ckpt"))
     init_time = fixture.init_times()[0]
+    metadata = runner.checkpoint.multi_dataset_metadata
     states = {
-        name: runner.prognostics_inputs[name].create_input_state(date=init_time) for name in fixture.DATASET_NAMES
+        name: runner.prognostics_inputs[name].create_input_state(
+            dates=[init_time + lag for lag in metadata[name].lagged]
+        )
+        for name in fixture.DATASET_NAMES
     }
     output = next(runner.run(input_states=states, lead_time="6h", return_numpy=False))
     for name in fixture.DATASET_NAMES:

@@ -204,21 +204,22 @@ def _fixture_input_class() -> type:
         def __repr__(self) -> str:
             return f"FixtureInput({self.dataset.name})"
 
-        def create_input_state(self, *, date: datetime.datetime, **kwargs: Any) -> dict:
-            """The multi-step input state at `date`: every input variable the runner does not compute."""
+        def create_input_state(self, *, dates: list[datetime.datetime], **kwargs: Any) -> dict:
+            """The multi-step input state over `dates`, dated by the last one as anemoi-inference's DatasetInput
+            does: every input variable the runner does not compute."""
             typed = self.metadata.typed_variables
             variables = [
                 variable
                 for variable in self.metadata.variable_to_input_tensor_index
                 if not typed[variable].is_computed_forcing
             ]
-            rows = [self.dataset.row(self.dataset.index(date + lag)) for lag in self.metadata.lagged]
+            rows = [self.dataset.row(self.dataset.index(date)) for date in dates]
             index = self.dataset.name_to_index
             fields = {
                 variable: np.stack([row[index[variable]] for row in rows]).astype(np.float32) for variable in variables
             }
             return {
-                "date": date,
+                "date": dates[-1],
                 "latitudes": self.dataset.latitudes,
                 "longitudes": self.dataset.longitudes,
                 "fields": fields,

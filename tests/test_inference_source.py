@@ -10,6 +10,7 @@ from anemoi.evaluation.sources.anemoi_inference import CHUNKS_ENV
 from anemoi.evaluation.sources.anemoi_inference import PROCESSOR_CHUNKS_ENV
 from anemoi.evaluation.sources.anemoi_inference import ForcingsCache
 from anemoi.evaluation.sources.anemoi_inference import SharedForcings
+from anemoi.evaluation.sources.anemoi_inference import create_input_state
 from anemoi.evaluation.sources.anemoi_inference import inference_chunks
 from anemoi.evaluation.sources.anemoi_inference import inference_env
 
@@ -142,3 +143,21 @@ def test_graph_node_attribute_reads_both_graph_data_forms():
     np.testing.assert_array_equal(source.graph_node_attribute("area_weight"), [0.25, 0.75])
     with pytest.raises(ValueError, match="no attribute 'cutout_mask'"):
         source.graph_node_attribute("cutout_mask")
+
+
+def test_create_input_state_speaks_both_anemoi_inference_signatures():
+    """anemoi-inference >= 0.13 takes the input window as `dates`, older releases one `date` and apply the lags
+    themselves; the real inputs of this environment only exercise one of the two."""
+    init_time = datetime.datetime(2022, 1, 2)
+    lagged = [datetime.timedelta(hours=-6), datetime.timedelta(0)]
+
+    class Before013:
+        def create_input_state(self, *, date, **kwargs):
+            return {"date": date}
+
+    class From013:
+        def create_input_state(self, *, dates, ref_date_index=-1, **kwargs):
+            return {"dates": dates}
+
+    assert create_input_state(Before013(), init_time, lagged) == {"date": init_time}
+    assert create_input_state(From013(), init_time, lagged) == {"dates": [datetime.datetime(2022, 1, 1, 18), init_time]}

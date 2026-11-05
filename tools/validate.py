@@ -47,6 +47,7 @@ from anemoi.utils.dates import frequency_to_timedelta  # noqa: E402
 import anemoi.evaluation as ae  # noqa: E402
 from anemoi.evaluation.config import load_config  # noqa: E402
 from anemoi.evaluation.output import write  # noqa: E402
+from anemoi.evaluation.sources.anemoi_inference import create_input_state  # noqa: E402
 from anemoi.evaluation.sources.anemoi_inference import member_seed  # noqa: E402
 from anemoi.evaluation.sources.anemoi_inference import quiet_inference  # noqa: E402
 
@@ -143,9 +144,10 @@ weights = evaluation.weights
 masks = evaluation.regions
 fields_by_members = {}
 for members in members_list:
-    prognostic = runner.prognostics_inputs[name].create_input_state(date=init)
-    constant = runner.constant_forcings_inputs[name].create_input_state(date=init)
-    dynamic = runner.dynamic_forcings_inputs[name].create_input_state(date=init)
+    lagged = runner.checkpoint.multi_dataset_metadata[name].lagged
+    prognostic = create_input_state(runner.prognostics_inputs[name], init, lagged)
+    constant = create_input_state(runner.constant_forcings_inputs[name], init, lagged)
+    dynamic = create_input_state(runner.dynamic_forcings_inputs[name], init, lagged)
     initial = runner._combine_states(prognostic, constant, dynamic)
     runner.reference_date = None
     torch.cuda.synchronize()
