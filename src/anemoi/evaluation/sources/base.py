@@ -23,6 +23,10 @@ class MissingTargetError(LookupError):
     """Raised by a target source that has no data for the requested valid time."""
 
 
+class MissingGraphError(ValueError):
+    """Raised by a forecast source whose checkpoint stores no training graph to read a node attribute from."""
+
+
 class ForecastSource(Protocol):
     """Yields forecast frames for an init time; one member for deterministic models."""
 
@@ -31,6 +35,8 @@ class ForecastSource(Protocol):
     members: int
     device: torch.device | str | None
     grid_indices: Any
+    # May carry its training graph (anemoi-graphs, with node attributes such as area_weight), not the model's
+    # message-passing edges. Trimmed checkpoints store none; that is only found out when the model loads.
     has_graph: bool
     frames_per_pass: int
     supports_lead_zero: bool
@@ -58,7 +64,8 @@ class ForecastSource(Protocol):
         ...
 
     def graph_node_attribute(self, name: str, nodes: str = "data") -> np.ndarray:
-        """Per-node attribute of the model's graph, e.g. area weights; raises when `has_graph` is False."""
+        """Per-node attribute of the training graph, e.g. area weights; raises when the source has none
+        (`MissingGraphError` for a checkpoint saved without it)."""
         ...
 
     def variable_info(self, name: str) -> dict:

@@ -22,6 +22,7 @@ from anemoi.utils.dates import frequency_to_string
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import ForecastSourceBase
+from anemoi.evaluation.sources.base import MissingGraphError
 from anemoi.evaluation.sources.base import lead_time_steps
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.base import variable_info
@@ -337,7 +338,7 @@ class InferenceForecastSource(ForecastSourceBase):
     this runner and one rollout; `multi_frames()` yields one frame per dataset per step. A single-dataset
     checkpoint keeps the flat single-dataset API (`grid`, `variables`, `frames()`) unchanged."""
 
-    has_graph = True
+    has_graph = True  # may carry one: trimmed checkpoints store none, found out when the model loads
     supports_lead_zero = True
 
     def __init__(
@@ -637,7 +638,7 @@ class InferenceForecastSource(ForecastSourceBase):
     def graph_node_attribute(self, name: str, nodes: str = "data", dataset: str | None = None) -> np.ndarray:
         """Per-node attribute of the checkpoint's training graph as a flat numpy array."""
         chosen = self._resolve_dataset(dataset)
-        graph = self.runner.model.graph_data
+        graph = getattr(self.runner.model, "graph_data", None)
         # Some anemoi-models builds keep one HeteroData per input dataset in a dict, others
         # expose the HeteroData itself; a HeteroData indexed by an unknown name silently returns
         # an empty NodeStorage, so the dict has to be unwrapped first. The single entry of a
@@ -649,6 +650,12 @@ class InferenceForecastSource(ForecastSourceBase):
                     f"the model's graph_data is keyed by {sorted(graph)}, which does not name the dataset {chosen!r}"
                 )
             graph = graph[chosen] if chosen in graph else next(iter(graph.values()))
+        # anemoi-core >= 42260df6a ("trim checkpoint") saves inference checkpoints without the raw graph.
+        if graph is None:
+            raise MissingGraphError(
+                f"the checkpoint stores no training graph, so there is no {name!r} to read; "
+                f"replace `graph_attribute: {name}` in the evaluation config"
+            )
         # A multi-dataset graph names the node set after the dataset rather than 'data'; the fallback
         # is only from the default 'data', so an explicitly named node set is never substituted.
         types = tuple(getattr(graph, "node_types", ()))

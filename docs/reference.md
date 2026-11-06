@@ -130,7 +130,7 @@ before validation:
 | `init_times` | `InitTimesRange` or `InitTimesList` | required | See below. |
 | `variables` | list of str, `{datasets: {name: list of str}}` or null | null | Variables to score. Null means the variables shared by the two sources, in the forecast source's order (`[name for name in forecast.variables if name in targets.variables]`). A requested name that either source cannot deliver raises; an empty result raises `no variables to evaluate`. |
 | `metrics` | list of str or `{name: kwargs}` | `["rmse", "mae", "bias"]` | See [metrics](#metrics). Validated at config load. |
-| `weights` | `WeightsConfig`, `{datasets: {name: WeightsConfig}}` or null | null | Node weights. Null means `{graph_attribute: area_weight}` when the forecast source has a model graph, else `{uniform: {}}`. |
+| `weights` | `WeightsConfig`, `{datasets: {name: WeightsConfig}}` or null | null | Node weights. Null means `{graph_attribute: area_weight}` when the forecast source has a model graph, else `{uniform: {}}`; a checkpoint saved without its training graph falls back to `{spherical_voronoi: {}}` with a warning when the run starts. |
 | `regions` | map name to `RegionConfig`, or `{datasets: {name: map}}` | `{"global": "all"}` | Named node masks; they may overlap. An empty mapping falls back to the default. |
 | `bins` | `BinsConfig` | `{time: season, by: init_time}` | Time binning. |
 | `climatology` | `ClimatologyConfig`, `{datasets: {name: ClimatologyConfig}}` or null | null | Required by `acc`. |
@@ -271,7 +271,8 @@ use of `Evaluation.weights`, so `--dry-run` never loads a model graph.
 source at all, and `ForecastSourceBase.graph_node_attribute` raises
 `<Class> has no model graph to read the node attribute '<name>' from` when the source has no graph
 (`has_graph = False`). `InferenceForecastSource` raises a third message naming the available attributes
-when the graph has no such attribute.
+when the graph has no such attribute, and `MissingGraphError` (`the checkpoint stores no training graph ...`)
+when the checkpoint was saved without it.
 
 ### Regions
 
