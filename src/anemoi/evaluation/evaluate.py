@@ -44,6 +44,7 @@ from anemoi.evaluation.sources.anemoi_inference import DatasetForecast
 from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
 from anemoi.evaluation.sources.base import ClimatologySource
 from anemoi.evaluation.sources.base import ForecastSource
+from anemoi.evaluation.sources.base import MissingGraphError
 from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSource
 from anemoi.evaluation.sources.base import select_variables
@@ -153,6 +154,7 @@ class Evaluation:
         forecast.check_init_times(self.init_times, self.lead_time)
 
         grid = forecast.grid
+        self._default_weights = weights is None
         if weights is None:
             weights = {"graph_attribute": "area_weight"} if forecast.has_graph else {"uniform": {}}
         self._weights_spec = weights if isinstance(weights, dict) else None
@@ -179,6 +181,17 @@ class Evaluation:
     def weights(self) -> np.ndarray:
         """Node weights (N,) float64, resolved from the spec on first use."""
         if isinstance(self._weights, dict):
+            try:
+                return build_weights(self._weights, self.forecast.grid, self.forecast)
+            except MissingGraphError:
+                if not self._default_weights:
+                    raise
+            # A checkpoint saved without its graph (anemoi-core's trimmed ones) has no area_weight to default to.
+            LOG.warning(
+                "the checkpoint stores no training graph, so the default area_weight weights are unavailable; "
+                "using spherical_voronoi"
+            )
+            self._weights = self._weights_spec = {"spherical_voronoi": {}}
             return build_weights(self._weights, self.forecast.grid, self.forecast)
         return self._weights
 

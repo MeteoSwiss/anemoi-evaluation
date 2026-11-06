@@ -890,6 +890,7 @@ Dates, grids, variables and merging:
 | `source cannot deliver variables [...]` | a name is missing from the forecast outputs or the target dataset; omit `variables` to get the intersection |
 | `grids differ in size`, `grid coordinates differ by more than 1e-05 degrees` | the targets or the climatology are not on the model grid; with a cutout checkpoint take the targets from the forecast, which also applies `grid_indices` |
 | `a forecast source with a model graph is needed for the node attribute ...` | use `spherical_voronoi`, `uniform` or a `file:` mask instead |
+| `the checkpoint stores no training graph, so there is no '...' to read` | an anemoi-core inference checkpoint saved without its training graph, and the config names a `graph_attribute`; use `spherical_voronoi`, `uniform` or `file` weights, or a `bbox`, `grid` or `file` region. The default weights fall back to `spherical_voronoi` on their own, with a warning |
 | `graph nodes 'data' have no attribute '...'` | the training graph does not carry it; the error lists the ones it does |
 | `the metrics need at least 2 members, the forecast source has 1` | `crps`, `fair_crps`, `spread` and `spread_skill` need an ensemble; the rank histogram reports it itself |
 | `rank_histogram needs at least 2 members, the run has 1` | `rank_histogram` and `outlier_fraction` are ensemble metrics; drop them for a deterministic checkpoint |

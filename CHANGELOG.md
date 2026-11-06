@@ -7,6 +7,9 @@
 * Runs on anemoi-inference >= 0.13 as well as on older releases: the initial state was built with
   `create_input_state(date=...)`, which fails on 0.13 with `missing 1 required keyword-only argument: 'dates'`;
   the input's signature now decides between `dates=` and `date=`.
+* A checkpoint saved without its training graph (anemoi-core's trimmed inference checkpoints) no longer fails
+  with `'NoneType' object is not subscriptable`: the default weights fall back from `area_weight` to
+  `spherical_voronoi` with a warning, and an explicit `graph_attribute` raises `MissingGraphError` naming it.
 
 ## 0.3.0 — 2026-09-17
 

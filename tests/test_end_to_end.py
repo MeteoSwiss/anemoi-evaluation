@@ -344,3 +344,26 @@ def test_persistence_source():
     assert dataset["n_init"].values.tolist() == [1, 0, 1, 1]
     with pytest.raises(ValueError, match="targets"):
         Evaluation.from_config(config)
+
+
+def test_default_weights_fall_back_to_spherical_voronoi_without_a_graph(fake_sources, caplog):
+    """A checkpoint saved without its graph has no area_weight: the default falls back to spherical_voronoi with a
+    warning, while an explicit graph_attribute still raises."""
+    from anemoi.evaluation.sources.base import MissingGraphError
+    from anemoi.evaluation.weights import spherical_voronoi
+
+    forecast, targets = fake_sources()
+
+    class NoGraph(type(forecast)):
+        has_graph = True
+
+        def graph_node_attribute(self, name, nodes="data"):
+            raise MissingGraphError("no graph")
+
+    forecast.__class__ = NoGraph
+    with caplog.at_level(logging.WARNING):
+        weights = Evaluation(forecast, targets, [T0], "12h", ["rmse"]).weights
+    np.testing.assert_allclose(weights, spherical_voronoi(forecast.grid))
+    assert "using spherical_voronoi" in caplog.text
+    with pytest.raises(MissingGraphError):
+        Evaluation(forecast, targets, [T0], "12h", ["rmse"], weights={"graph_attribute": "area_weight"}).weights
