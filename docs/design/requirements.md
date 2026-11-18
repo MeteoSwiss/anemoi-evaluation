@@ -414,8 +414,9 @@ Deliberate non-goals at v0.3.0. Each is a decision, not an oversight.
   only gain is per-step Python overhead, which is nil at 1.7M nodes, and it is incompatible with a
   sharded model. Should the ensemble memory of NFR-13 ever bind, the fix is the opposite one,
   sequential members with a pinned host buffer ([`architecture.md`](architecture.md) section 9).
-* **Downscaling checkpoints** (`input_datasets != target_datasets`): anemoi-inference cannot run
-  them at all, so they are refused where the training config makes the routing readable (FR-39).
+* **Downscaling checkpoints** (`input_datasets != target_datasets`): anemoi-inference runs them since
+  ecmwf/anemoi-inference#605, but the evaluation does not score them yet, so they are refused where the
+  training config makes the routing readable (FR-39).
 * **Comparing several checkpoints in one run**: one checkpoint per run, comparison is offline from
   result files.
 * **Neighbourhood scores** (FSS and its relatives). They are not per-node reductions, and on an

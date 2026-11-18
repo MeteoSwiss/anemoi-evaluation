@@ -639,7 +639,10 @@ input and output steps, and a downscaling checkpoint whose model does not decode
 which the evaluation does not support yet. Only forecasters are scored, whatever the number of
 datasets: a temporal downscaler, an autoencoder or any other task is refused at construction with
 a message naming it, and so is an offset forecaster whose outputs skip a lead time (see the
-[reference](reference.md#limitations-and-undefined-behaviour)).
+[reference](reference.md#limitations-and-undefined-behaviour)). A checkpoint whose stored task is
+wrong is repaired in the `anemoi_inference` block with
+`patch_metadata: {metadata_inference: {task: forecaster}}`; an explicit `runner:` does not bypass
+the refusal.
 
 ### Scoring some of the datasets
 
@@ -884,7 +887,7 @@ Config and sources:
 | `from_checkpoint at <key> is only resolved in ...` | it was used in a nested block; move it to the top of the dataset block |
 | `checkpoint ... only a single mapping can be reused` | the recorded `open_dataset` arguments are not one mapping; spell the dataset out |
 | `target datasets must have one member` | the target zarr has an ensemble dimension; select a member in the `open_dataset` arguments |
-| `the checkpoint's task is '...'`, `the output offsets [...] ... do not fit the lead times` | the checkpoint is not a forecaster, or its outputs skip a lead time; only such forecasters are scored so far (MeteoSwiss/anemoi-evaluation#5) |
+| `the checkpoint's task is '...'`, `the output offsets [...] ... do not fit the lead times` | the checkpoint is not a forecaster, or its outputs skip a lead time; only such forecasters are scored so far (MeteoSwiss/anemoi-evaluation#5). A checkpoint whose stored task is wrong can be repaired with `patch_metadata` |
 
 Dates, grids, variables and merging:
 

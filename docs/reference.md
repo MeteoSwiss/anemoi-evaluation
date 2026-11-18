@@ -1028,7 +1028,8 @@ Useful when reading the code or writing a tool against it, but not part of the p
 - `sources.anemoi_inference.ForcingsCache(cache_bytes)` and `SharedForcings(provider, cache)`: the
   forcings cache and the provider wrapper that reads through it.
 - `sources.anemoi_inference.checkpoint_task(metadata) -> (task, origin)`, `check_task(metadata)` and
-  `check_output_offsets(metadata)`: the task lookup and the two refusals above, on a metadata mapping.
+  `check_output_offsets(metadata)`: the task lookup and the two refusals above, on a metadata mapping;
+  `patched_metadata(metadata, patch)` applies a `patch_metadata` block to it.
 
 ## Sharding
 
@@ -1090,17 +1091,29 @@ Consequences:
 Constraints the code enforces, with the message or behaviour:
 
 - **Only forecasters are scored.** The checkpoint's task is read from `metadata_inference.task`, else
-  `config.task._target_`, else `config.training.model_task`, else taken to be `forecaster`, as
-  anemoi-inference does; class paths count by their class name, so the ensemble and diffusion
-  forecasters are forecasters. Any task but `forecaster` and `offset-forecaster` (a temporal
-  downscaler, an autoencoder, a name the package does not know) is refused at construction with
-  `the checkpoint's task is '<task>' (<field>: <value>): only forecasters ... can be evaluated`,
-  before the runner is built.
+  the top-level `task`, else `config.task._target_`, else `config.training.model_task`, else taken to
+  be `forecaster`, anemoi-inference's default; anemoi-inference reads `metadata_inference.task` only, the
+  other fields are read by the evaluation alone. Class paths count by their class name, so the ensemble
+  and diffusion forecasters are forecasters. Any task but `forecaster` and `offset-forecaster` (a
+  temporal downscaler, an autoencoder, a task name the package does not know) is refused at
+  construction with `the checkpoint's task is '<task>' (<field>: <value>): only forecasters ... can be
+  evaluated`, before the runner is built. A class path the package does not know is evaluated as a
+  forecaster, as anemoi-inference runs it, with a warning naming it.
+- **`patch_metadata` is the override.** The task is read after the run configuration's
+  `patch_metadata` is applied, as anemoi-inference applies it, so `patch_metadata: {metadata_inference:
+  {task: forecaster}}` makes a checkpoint with a wrong task evaluable. An explicit `runner:` is no
+  override: anemoi-inference then builds that runner without reading the task, but the model still
+  computes what it was trained for, and that is what the evaluation cannot pair with lead times. The
+  output offsets and the routing are read unpatched.
 - **Outputs must fall on the lead times.** The lead times are `k * timestep`, so the output offsets of
   one model call must be `timestep, 2 * timestep, ..., n * timestep` with a rollout shift of
   `n * timestep`, as a `forecaster` has. An `offset-forecaster` with other offsets is refused at
   construction with `the output offsets [...] with rollout shift ... of dataset '<name>' do not fit the
   lead times`.
+- **The init-time pre-check assumes regular input steps.** `check_init_times` checks the input window
+  `init - (multi_step_input - 1) * timestep .. init`, not the checkpoint's input offsets, so irregular
+  input offsets (`[-12h, 0h]` at a 6 h timestep) are checked on the wrong dates; the forecast itself
+  reads the right ones.
 - **Multi-dataset checkpoints must share the timing and decode every dataset.** A checkpoint whose
   datasets disagree on the timestep or the input and output steps, and a downscaling checkpoint whose
   model does not decode every dataset, are refused at construction.

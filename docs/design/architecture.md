@@ -131,7 +131,9 @@ ecmwf/anemoi-inference#605, but the evaluation does not score one yet. A checkpo
 carry the routing is let through. Before any of these, and before the runner is built,
 `check_task()` refuses a checkpoint whose task is not a forecaster (anemoi-inference's `auto`
 runner would raise on a task it has no runner for, or pick one whose output the evaluation cannot
-read); after the timing check, `check_output_offsets()` refuses output offsets that are not
+read). It reads the metadata with the run configuration's `patch_metadata` applied, as the `auto`
+runner does, and lets an unknown class path through with a warning, as anemoi-inference runs one as
+a forecaster; after the timing check, `check_output_offsets()` refuses output offsets that are not
 `timestep, ..., n * timestep` with a rollout shift of `n * timestep`, the lead times frames are
 paired on.
 
