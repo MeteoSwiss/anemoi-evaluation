@@ -256,14 +256,15 @@ def write_zarr(path: Path, name: str, variables_metadata: dict | None = None, mi
     metadata = {**load_metadata()["dataset"][name]["variables_metadata"], **(variables_metadata or {})}
     data = np.stack([dataset.row(i)[:, None, :] for i in range(len(dataset))])
     root = zarr.open_group(str(path), mode="w")
-    root.create_array("data", data=data, chunks=(1, *data.shape[1:]))
-    root.create_array("dates", data=dataset.dates)
-    root.create_array("latitudes", data=dataset.latitudes)
-    root.create_array("longitudes", data=dataset.longitudes)
+    create = getattr(root, "create_array", None) or root.create_dataset  # zarr 3, zarr 2
+    create("data", data=data, chunks=(1, *data.shape[1:]))
+    create("dates", data=dataset.dates)
+    create("latitudes", data=dataset.latitudes)
+    create("longitudes", data=dataset.longitudes)
     for statistic, value in (("mean", dataset.mean), ("stdev", dataset.stdev)):
-        root.create_array(statistic, data=np.asarray(value, dtype=np.float64))
+        create(statistic, data=np.asarray(value, dtype=np.float64))
     for statistic in ("maximum", "minimum"):
-        root.create_array(statistic, data=np.zeros(len(dataset.variables)))
+        create(statistic, data=np.zeros(len(dataset.variables)))
     root.attrs.update(
         frequency="6h",
         resolution="fixture",
