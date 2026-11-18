@@ -84,7 +84,9 @@ class ErrorStd(Metric):
     removed, so `rmse^2 = bias^2 + error_std^2`.
 
     The difference is clamped at zero before the root: where the error is constant over the cell the two means agree
-    to rounding and could otherwise give a negative variance, hence NaN. A NaN mean stays NaN.
+    to rounding and could otherwise give a negative variance, hence NaN. A NaN mean stays NaN. The one-pass form
+    loses about `(bias / error_std)^2 * eps` of relative accuracy, so it reads 0 where the bias dwarfs the spread by
+    eight orders of magnitude; real forecast errors are far from that.
     """
 
     name = "error_std"
@@ -259,6 +261,19 @@ class ThresholdMetric(LabelledMetric, Metric):
         false_alarm = self._mean(means, "false_alarm")
         return hit, miss, false_alarm, 1.0 - hit - miss - false_alarm
 
+    def _stored_cells(
+        self, means: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The four contingency cells, each from its own stored sum, so an empty cell is an exact zero.
+
+        The remainder of `_cells` is a rounding residue of order 1e-16 where the true `cn` is zero (a forecast that
+        says yes everywhere in the cell), which a score dividing by `m fa` or taking `log(1 - F)` turns into an
+        infinity of either sign or a spurious 1, and a sharded run into a different value than the unsharded one.
+        The scores that existed before `correct_negative` keep `_cells`, so their values are unchanged.
+        """
+        hit, miss = self._mean(means, "hit"), self._mean(means, "miss")
+        return hit, miss, self._mean(means, "false_alarm"), self._mean(means, "correct_negative")
+
 
 class POD(ThresholdMetric):
     """Probability of detection, the fraction of observed events that were forecast."""
@@ -344,10 +359,10 @@ class POFD(ThresholdMetric):
     not to be confused with `far`, the false alarm ratio."""
 
     kind = "pofd"
-    needs = (st.Hit, st.Miss, st.FalseAlarm)
+    needs = (st.FalseAlarm, st.CorrectNegative)
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        _, _, false_alarm, negative = self._cells(means)
+        false_alarm, negative = self._mean(means, "false_alarm"), self._mean(means, "correct_negative")
         return false_alarm / (false_alarm + negative)
 
 
@@ -360,10 +375,10 @@ class SEDI(ThresholdMetric):
     """
 
     kind = "sedi"
-    needs = (st.Hit, st.Miss, st.FalseAlarm)
+    needs = (st.Hit, st.Miss, st.FalseAlarm, st.CorrectNegative)
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        hit, miss, false_alarm, negative = self._cells(means)
+        hit, miss, false_alarm, negative = self._stored_cells(means)
         hit_rate, false_alarm_rate = hit / (hit + miss), false_alarm / (false_alarm + negative)
         log_h, log_f = hit_rate.log(), false_alarm_rate.log()
         log_not_h, log_not_f = (1.0 - hit_rate).log(), (1.0 - false_alarm_rate).log()
@@ -375,10 +390,10 @@ class OddsRatio(ThresholdMetric):
     or no false alarm but a hit and a correct negative, NaN where both products are zero."""
 
     kind = "odds_ratio"
-    needs = (st.Hit, st.Miss, st.FalseAlarm)
+    needs = (st.Hit, st.Miss, st.FalseAlarm, st.CorrectNegative)
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        hit, miss, false_alarm, negative = self._cells(means)
+        hit, miss, false_alarm, negative = self._stored_cells(means)
         return (hit * negative) / (miss * false_alarm)
 
 
@@ -386,10 +401,10 @@ class ORSS(ThresholdMetric):
     """Odds ratio skill score (Yule's Q), `(h cn - m fa) / (h cn + m fa)`, the odds ratio mapped to [-1, 1]."""
 
     kind = "orss"
-    needs = (st.Hit, st.Miss, st.FalseAlarm)
+    needs = (st.Hit, st.Miss, st.FalseAlarm, st.CorrectNegative)
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        hit, miss, false_alarm, negative = self._cells(means)
+        hit, miss, false_alarm, negative = self._stored_cells(means)
         return (hit * negative - miss * false_alarm) / (hit * negative + miss * false_alarm)
 
 
@@ -400,7 +415,7 @@ class F1(ThresholdMetric):
     needs = (st.Hit, st.Miss, st.FalseAlarm)
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        hit, miss, false_alarm, _ = self._cells(means)
+        hit, miss, false_alarm = (self._mean(means, kind) for kind in ("hit", "miss", "false_alarm"))
         return 2.0 * hit / (2.0 * hit + miss + false_alarm)
 
 
@@ -581,6 +596,12 @@ class ReliabilityMetric(LabelledMetric, EnsembleSizeMetric):
 
         Level 0 is the decision that always forecasts the event, `(1, 1)` exactly since its cumulated sum is the
         denominator itself. Both rates are 0/0 NaN where the cell observed no event, or no non-event.
+
+        The non-events of a level are the difference `n_k - h_k`, unlike the contingency remainder this is safe: a
+        level whose nodes were all observed has identical count and event vectors, so the two sums are bit-identical
+        and the difference is an exact zero (a merge adds identical shard sums); otherwise the event values never
+        exceed the counts elementwise, the rounded sums keep that order, and the true difference is at least one
+        node's weight, far above the rounding.
         """
         counts, events = self._counts(means, members), self._events(means, members)
         hits = events.flip(-1).cumsum(-1).flip(-1)
@@ -659,11 +680,12 @@ class BrierResolution(ReliabilityMetric):
         return self._component(counts, observed - base_rate.unsqueeze(-1), total)
 
 
-class ROCHitRate(ReliabilityMetric):
-    """Hit rate of the ROC curve, the fraction of observed events forecast by "the event when `p >= k / M`", stacked
-    on the `probability` axis; level 0 is 1, the decision that always forecasts the event."""
+class ROCPOD(ReliabilityMetric):
+    """Probability of detection (hit rate) of the ROC curve, the fraction of observed events forecast by "the event
+    when `p >= k / M`", stacked on the `probability` axis; level 0 is 1, the decision that always forecasts the event.
+    The decision "never", `(0, 0)`, is not stored: a plotted curve has to append it."""
 
-    kind = "roc_hit_rate"
+    kind = "roc_pod"
 
     @property
     def output_dim(self) -> tuple[str, list] | None:
@@ -674,11 +696,12 @@ class ROCHitRate(ReliabilityMetric):
         return self._rates(means, self._bound(members))[0]
 
 
-class ROCFalseAlarmRate(ReliabilityMetric):
-    """False alarm rate (`pofd`) of the ROC curve, the fraction of observed non-events forecast by "the event when
-    `p >= k / M`", stacked on the `probability` axis; level 0 is 1."""
+class ROCPOFD(ReliabilityMetric):
+    """Probability of false detection (false alarm rate) of the ROC curve, the fraction of observed non-events
+    forecast by "the event when `p >= k / M`", stacked on the `probability` axis; level 0 is 1 and `(0, 0)` is not
+    stored."""
 
-    kind = "roc_false_alarm_rate"
+    kind = "roc_pofd"
 
     @property
     def output_dim(self) -> tuple[str, list] | None:
@@ -761,7 +784,7 @@ class RelativeEconomicValue(ReliabilityMetric):
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
         bound = self._bound(members)
         hit_rate, false_alarm_rate = self._rates(means, bound)
-        base_rate = self._levels(means, bound)[3]
+        base_rate = self._events(means, bound).sum(-1) / self._counts(means, bound).sum(-1)
         ratio = torch.tensor(self.cost_loss, dtype=hit_rate.dtype, device=hit_rate.device).unsqueeze(-1)  # (C, 1)
         hit_rate, false_alarm_rate = hit_rate[..., None, 1:], false_alarm_rate[..., None, 1:]  # (..., 1, M)
         s = base_rate[..., None, None]
@@ -818,8 +841,8 @@ REGISTRY: dict[str, type[Metric]] = {
     "brier_reliability": BrierReliability,
     "brier_resolution": BrierResolution,
     "brier_uncertainty": BrierUncertainty,
-    "roc_hit_rate": ROCHitRate,
-    "roc_false_alarm_rate": ROCFalseAlarmRate,
+    "roc_pod": ROCPOD,
+    "roc_pofd": ROCPOFD,
     "roc_area": ROCArea,
     "rev": RelativeEconomicValue,
     "rank_histogram": RankHistogram,

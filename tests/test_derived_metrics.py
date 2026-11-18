@@ -4,6 +4,9 @@ economic value. Each is checked against a naive numpy float64 computation from t
 
 import datetime
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,9 +15,13 @@ import xarray as xr
 from pydantic import ValidationError
 
 from anemoi.evaluation import metrics
+from anemoi.evaluation import statistics as st
 from anemoi.evaluation.__main__ import main
+from anemoi.evaluation.aggregation import Aggregator
+from anemoi.evaluation.binning import NoBinning
 from anemoi.evaluation.config import load_config
 from anemoi.evaluation.evaluate import Evaluation
+from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.output import load_state
 from anemoi.evaluation.output import write
@@ -30,7 +37,15 @@ LABEL = "warm"
 THRESHOLD = 0.3
 COST_LOSS = [0.05, 0.2, 0.5, 0.8]
 CONTINGENCY = ("pofd", "sedi", "odds_ratio", "orss", "f1")
-LEVELS = ("roc_hit_rate", "roc_false_alarm_rate", "roc_area")
+FOUR_CELLS = ("hit", "miss", "false_alarm", "correct_negative")
+CELLS = {  # the stored sums each contingency score reads; the fourth cell is stored, never the remainder
+    "pofd": ("false_alarm", "correct_negative"),
+    "sedi": FOUR_CELLS,
+    "odds_ratio": FOUR_CELLS,
+    "orss": FOUR_CELLS,
+    "f1": FOUR_CELLS[:3],
+}
+LEVELS = ("roc_pod", "roc_pofd", "roc_area")
 
 
 def spec(kind, label=LABEL, thresholds=None, **extra):
@@ -44,13 +59,25 @@ def spec(kind, label=LABEL, thresholds=None, **extra):
 ALL_SPECS = ["rmse", "error_std", *(spec(kind) for kind in (*CONTINGENCY, *LEVELS, "rev"))]
 
 
-def random_sources(members, n=400, seed=0, drift=0.1, spread=0.4):
+def trapezoid(y, x):
+    """Trapezoid area under `y(x)`; `np.trapezoid` needs numpy 2."""
+    return float(((x[1:] - x[:-1]) * (y[1:] + y[:-1]) / 2.0).sum())
+
+
+def random_sources(members, n=400, seed=0, drift=0.1, spread=0.4, rho=0.9):
     """Persistence forecasts of random, time-varying targets, so the errors vary over nodes and lead times and every
-    cell of the contingency table and every exceedance level is populated, unlike the constant targets of `conftest`."""
+    cell of the contingency table and every exceedance level is populated, unlike the constant targets of `conftest`.
+
+    The targets are an AR(1) in time with lag-one correlation `rho`, so persistence has real skill that decays with
+    lead time: the ROC area sits well above 0.5 and the economic value is positive for some users.
+    """
     rng = np.random.default_rng(seed)
     grid = Grid(rng.uniform(-90, 90, n), rng.uniform(0, 360, n))
     dates = [T0 + k * 6 * HOUR for k in range(7)]
-    fields = {date: rng.standard_normal((2, n)).astype(np.float32) for date in dates}
+    fields, field = {}, rng.standard_normal((2, n))
+    for date in dates:
+        fields[date] = field.astype(np.float32)
+        field = rho * field + np.sqrt(1 - rho**2) * rng.standard_normal((2, n))
     targets = ArrayTargets(grid, ["t", "q"], fields)
     return FakeForecastSource(targets, 6 * HOUR, members, drift, spread, device="cpu"), targets
 
@@ -84,7 +111,7 @@ def numpy_reference(evaluation, members, climatology=None):
             data["fa"].append(mean - c)
             data["ta"].append(truth - c)
 
-    expected = {name: [] for name in ("error_std", "activity_ratio", *CONTINGENCY, *LEVELS, "rev")}
+    expected = {name: [] for name in ("error_std", "activity_ratio", *CONTINGENCY, *LEVELS, "rev", "rev_level")}
     for lead in leads:
         data = {key: np.concatenate(values) if values else None for key, values in per_lead[lead].items()}
         w, e, o, binary, count = data["w"], data["e"], data["o"], data["binary"], data["count"]
@@ -111,18 +138,21 @@ def numpy_reference(evaluation, members, climatology=None):
         decisions = [(count >= k).astype(np.float64) for k in range(members + 1)]
         hit_rate = np.array([(w * d * o).sum() / (w * o).sum() for d in decisions])
         false_alarm_rate = np.array([(w * d * (1 - o)).sum() / (w * (1 - o)).sum() for d in decisions])
-        expected["roc_hit_rate"].append(hit_rate)
-        expected["roc_false_alarm_rate"].append(false_alarm_rate)
-        # np.trapezoid on the points in increasing F: (0, 0), the levels M..1, then (1, 1) which is level 0
-        expected["roc_area"].append(np.trapezoid(np.r_[0.0, hit_rate[::-1]], np.r_[0.0, false_alarm_rate[::-1]]))
+        expected["roc_pod"].append(hit_rate)
+        expected["roc_pofd"].append(false_alarm_rate)
+        # the points in increasing F: (0, 0), the levels M..1, then (1, 1) which is level 0
+        expected["roc_area"].append(trapezoid(np.r_[0.0, hit_rate[::-1]], np.r_[0.0, false_alarm_rate[::-1]]))
 
         s = (w * o).sum() / W
-        value = []
+        value, best = [], []
         for a in COST_LOSS:
             climate, perfect = min(a, s), s * a
             expenses = [(w * (a * d + (1 - d) * o)).sum() / W for d in decisions[1:]]
-            value.append(max((climate - expense) / (climate - perfect) for expense in expenses))
+            per_level = [(climate - expense) / (climate - perfect) for expense in expenses]
+            value.append(max(per_level))
+            best.append(1 + int(np.argmax(per_level)))  # the decision level k the envelope picked
         expected["rev"].append(np.array(value))
+        expected["rev_level"].append(np.array(best))
     return {name: np.array(values) for name, values in expected.items() if values}
 
 
@@ -133,6 +163,7 @@ def test_metrics_from_means():
         f"hit_{LABEL}": torch.tensor(h, dtype=torch.float64),
         f"miss_{LABEL}": torch.tensor(m, dtype=torch.float64),
         f"false_alarm_{LABEL}": torch.tensor(fa, dtype=torch.float64),
+        f"correct_negative_{LABEL}": torch.tensor(cn, dtype=torch.float64),
         "error": torch.tensor(0.3, dtype=torch.float64),
         "squared_error": torch.tensor(0.25, dtype=torch.float64),
         "forecast_anomaly_squared": torch.tensor(0.5, dtype=torch.float64),
@@ -151,7 +182,7 @@ def test_metrics_from_means():
     for kind, value in expected.items():
         metric = metrics.from_spec(spec(kind))
         assert metric.name == f"{kind}_{LABEL}" and metric.min_members == 1
-        assert sorted(metric.statistics) == [f"false_alarm_{LABEL}", f"hit_{LABEL}", f"miss_{LABEL}"]
+        assert sorted(metric.statistics) == sorted(f"{cell}_{LABEL}" for cell in CELLS[kind])
         values[kind] = float(metric.from_means(means, 3))
         assert values[kind] == pytest.approx(value, rel=1e-12)
     odds = values["odds_ratio"]
@@ -177,14 +208,17 @@ def test_metrics_from_means():
 
     # Nothing observed and nothing forecast: the scores dividing by an empty margin are NaN, as the existing ones;
     # pofd is a defined 0 there (every non-event was a correct negative).
-    empty = dict.fromkeys(
-        [f"hit_{LABEL}", f"miss_{LABEL}", f"false_alarm_{LABEL}"], torch.tensor(0.0, dtype=torch.float64)
-    )
+    empty = {f"{cell}_{LABEL}": torch.tensor(0.0, dtype=torch.float64) for cell in FOUR_CELLS}
+    empty[f"correct_negative_{LABEL}"] = torch.tensor(1.0, dtype=torch.float64)
     for kind in ("sedi", "odds_ratio", "orss", "f1"):
         assert np.isnan(float(metrics.from_spec(spec(kind)).from_means(empty, 3)))
     assert float(metrics.from_spec(spec("pofd")).from_means(empty, 3)) == 0.0
     # A perfect forecast: the odds ratio is infinite, its skill score and f1 are 1, and sedi is undefined (H = 1, F = 0)
-    perfect = {**empty, f"hit_{LABEL}": torch.tensor(0.3, dtype=torch.float64)}
+    perfect = {
+        **empty,
+        f"hit_{LABEL}": torch.tensor(0.3, dtype=torch.float64),
+        f"correct_negative_{LABEL}": torch.tensor(0.7, dtype=torch.float64),
+    }
     perfect_values = {kind: float(metrics.from_spec(spec(kind)).from_means(perfect, 3)) for kind in CONTINGENCY}
     assert perfect_values["odds_ratio"] == np.inf and perfect_values["orss"] == 1.0 and perfect_values["f1"] == 1.0
     assert perfect_values["pofd"] == 0.0 and np.isnan(perfect_values["sedi"])
@@ -202,11 +236,11 @@ def test_level_metrics_from_means():
     non_events = counts - events
     hit_rate = np.array([events[k:].sum() / events.sum() for k in range(members + 1)])
     false_alarm_rate = np.array([non_events[k:].sum() / non_events.sum() for k in range(members + 1)])
-    np.testing.assert_allclose(values["roc_hit_rate"], hit_rate, rtol=1e-12)
-    np.testing.assert_allclose(values["roc_false_alarm_rate"], false_alarm_rate, rtol=1e-12)
-    assert values["roc_hit_rate"][0] == 1.0 and values["roc_false_alarm_rate"][0] == 1.0  # exactly, at level 0
-    assert values["roc_hit_rate"][2] == values["roc_hit_rate"][3]  # the empty level repeats the next point
-    area = np.trapezoid(np.r_[0.0, hit_rate[::-1]], np.r_[0.0, false_alarm_rate[::-1]])
+    np.testing.assert_allclose(values["roc_pod"], hit_rate, rtol=1e-12)
+    np.testing.assert_allclose(values["roc_pofd"], false_alarm_rate, rtol=1e-12)
+    assert values["roc_pod"][0] == 1.0 and values["roc_pofd"][0] == 1.0  # exactly, at level 0
+    assert values["roc_pod"][2] == values["roc_pod"][3]  # the empty level repeats the next point
+    area = trapezoid(np.r_[0.0, hit_rate[::-1]], np.r_[0.0, false_alarm_rate[::-1]])
     assert float(values["roc_area"]) == pytest.approx(area, rel=1e-12)
     assert 0.5 < float(values["roc_area"]) <= 1.0
 
@@ -226,7 +260,7 @@ def test_level_metrics_from_means():
     for kind, metric in built.items():
         assert np.isnan(metric.from_means(nan_means, members).numpy()).all()
         result = metric.from_means(no_event, members).numpy()
-        if kind == "roc_false_alarm_rate":
+        if kind == "roc_pofd":
             assert np.isfinite(result).all()  # the non-events are all there
         else:
             assert np.isnan(result).all()  # the hit rate is 0/0, and with it the area and the value
@@ -241,9 +275,13 @@ def test_new_metrics_end_to_end():
     specs = [*ALL_SPECS, "bias", "acc", "activity_ratio"]
     evaluation = Evaluation(forecast, targets, INITS, "24h", specs, climatology=climatology)
     expected = numpy_reference(evaluation, members, climatology)
-    for name in CONTINGENCY:
-        assert np.isfinite(expected[name]).all()  # every cell populated, so no comparison is NaN against NaN
-    assert (expected["error_std"] > 0.1).all() and (expected["rev"] > -1).any()
+    levels = expected.pop("rev_level")
+    for name, values in expected.items():
+        assert np.isfinite(values).all(), name  # every cell populated, so no comparison is NaN against NaN
+    assert (expected["error_std"] > 0.1).all()
+    # the fake has skill, so the scores are exercised away from their no-skill values
+    assert (expected["roc_area"] > 0.6).all() and (expected["rev"] > 0).any() and (expected["rev"] < 0).any()
+    assert ((levels > 1) & (levels < members)).any()  # the envelope picks an interior decision level somewhere
 
     state = evaluation.run()
     dataset = state.to_xarray(evaluation.metrics)
@@ -279,8 +317,8 @@ def test_one_member_reduces_to_the_contingency_table():
     dataset = state.to_xarray(evaluation.metrics).sel(bin="all", region="global", variable="t")
     assert dataset["probability"].values.tolist() == [0.0, 1.0]
     pod, pofd = dataset[f"pod_{LABEL}"].values, dataset[f"pofd_{LABEL}"].values
-    np.testing.assert_allclose(dataset[f"roc_hit_rate_{LABEL}"].values[:, 1], pod, rtol=1e-12)
-    np.testing.assert_allclose(dataset[f"roc_false_alarm_rate_{LABEL}"].values[:, 1], pofd, rtol=1e-12)
+    np.testing.assert_allclose(dataset[f"roc_pod_{LABEL}"].values[:, 1], pod, rtol=1e-12)
+    np.testing.assert_allclose(dataset[f"roc_pofd_{LABEL}"].values[:, 1], pofd, rtol=1e-12)
     np.testing.assert_allclose(dataset[f"roc_area_{LABEL}"].values, (1 + pod - pofd) / 2, rtol=1e-12)
 
     means = state.means()
@@ -324,7 +362,7 @@ def test_specs_and_config_validation():
         "scalar": {"rev": {"label": LABEL, "thresholds": {"t": THRESHOLD}, "cost_loss": 0.1}},
         "no label": {"sedi": {"thresholds": {"t": THRESHOLD}}},
         "no thresholds": {"roc_area": {"label": LABEL}},
-        "members": spec("roc_hit_rate", members=8),
+        "members": spec("roc_pod", members=8),
         "cost_loss on roc": spec("roc_area", cost_loss=[0.1]),
         "kwargs on error_std": {"error_std": {"ddof": 1}},
     }
@@ -380,3 +418,90 @@ def test_round_trip_and_merge(tmp_path):
     with xr.open_dataset(output, decode_timedelta=True) as stored:
         stored = stored.load()
     xr.testing.assert_equal(stored.drop_attrs(), dataset.drop_attrs())
+
+
+def test_always_yes_and_always_observed_cells_are_exact():
+    """A region where the forecast says yes at every node (true `cn = 0`, `m = 0`) and one where the event is observed
+    at every node (no non-event): the scores must be the documented values, not functions of a rounding residue, and a
+    merged state must give the unsharded result.
+
+    The remainder `1 - h - m - fa` of the yes region is `0` or `±1e-16` depending on how the sums rounded, which is
+    what the stored `correct_negative` replaces; the level non-events of the observed region are the difference of
+    two sums of identical vectors, an exact zero."""
+    members, nodes, variables = 3, 300, ["a"]
+    rng = np.random.default_rng(11)
+    weights = rng.uniform(0.1, 1.0, nodes)
+    yes, observed = np.arange(nodes) < 100, (np.arange(nodes) >= 100) & (np.arange(nodes) < 200)
+    masks = np.stack([np.ones(nodes, dtype=bool), yes, observed], axis=1)
+    regions = ["all", "yes", "observed"]
+    leads = [k * 6 * HOUR for k in range(1, 21)]
+    specs = [spec(kind, thresholds={"a": 0.0}) for kind in ("csi", *CONTINGENCY, *LEVELS, "rev")]
+    built = metrics.build(specs, variables, members=members)
+    statistics = metrics.unique_statistics(built)
+    assert isinstance(statistics[f"correct_negative_{LABEL}"], st.CorrectNegative)
+    older = metrics.build([spec(kind, thresholds={"a": 0.0}) for kind in ("csi", "ets", "hss", "pss", "f1")])
+    assert f"correct_negative_{LABEL}" not in metrics.unique_statistics(older)  # the older scores' sums are unchanged
+
+    def frames(init, seed):
+        draw = np.random.default_rng(seed)
+        for lead in leads:
+            pred = draw.standard_normal((members, 1, nodes))
+            pred[:, 0, yes] = draw.uniform(0.1, 1.0, (members, yes.sum()))  # every member, so the mean, says yes
+            target = draw.standard_normal((1, 1, nodes))
+            target[0, 0, observed] = draw.uniform(0.1, 1.0, observed.sum())  # always observed
+            data = torch.from_numpy(pred.astype(np.float32))
+            yield Frame(init, lead, init + lead, variables, data), torch.from_numpy(target.astype(np.float32))
+
+    def accumulate(inits):
+        aggregator = Aggregator(weights, masks, statistics, NoBinning())
+        state = aggregator.new_state(leads, variables, regions, members)
+        for init in inits:
+            for frame, target in frames(init, seed=INITS.index(init)):
+                aggregator.add(state, frame, target)
+        return state
+
+    full = accumulate(INITS)
+    merged = accumulate(INITS[:1]).merge(accumulate(INITS[1:]))
+    for state in (full, merged):
+        means = state.means()
+        remainder = 1.0 - sum(means[f"{cell}_{LABEL}"] for cell in FOUR_CELLS[:3])
+        assert (remainder[:, 0, 0, 1] != 0).any()  # the residue the stored cell replaces does occur here
+        assert (means[f"correct_negative_{LABEL}"][:, 0, 0, 1] == 0).all()  # the stored cell is an exact zero
+        values = {metric.kind: metric.from_means(means, members).numpy()[:, 0, 0] for metric in built}
+        in_yes = {kind: value[:, 1] for kind, value in values.items()}
+        assert (in_yes["pofd"] == 1.0).all()  # every non-event was a false alarm, exactly
+        for kind in ("sedi", "odds_ratio", "orss"):  # h cn and m fa both zero, F = 1: 0/0
+            assert np.isnan(in_yes[kind]).all(), kind
+        assert np.isfinite(in_yes["f1"]).all() and np.isfinite(in_yes["roc_area"]).all()
+        counts = np.stack([state.sums[f"reliability_count_{LABEL}_{k}"].numpy() for k in range(members + 1)])
+        events = np.stack([state.sums[f"reliability_event_{LABEL}_{k}"].numpy() for k in range(members + 1)])
+        assert ((counts - events)[:, :, 0, 0, 2] == 0).all()  # no non-event in any level, exactly
+        in_observed = {kind: value[:, 2] for kind, value in values.items()}
+        for kind in ("roc_pofd", "roc_area", "rev", "pofd", "sedi"):  # no non-event: F is 0/0
+            assert np.isnan(in_observed[kind]).all(), kind
+        assert np.isfinite(in_observed["roc_pod"]).all()
+
+    full_values = {metric.name: metric.from_means(full.means(), members).numpy() for metric in built}
+    merged_values = {metric.name: metric.from_means(merged.means(), members).numpy() for metric in built}
+    for name, value in full_values.items():
+        assert (np.isnan(value) == np.isnan(merged_values[name])).all(), name  # NaN where and only where
+        np.testing.assert_allclose(merged_values[name], value, rtol=1e-12, err_msg=name)
+
+
+def test_inspect_results_reports_the_new_kinds(tmp_path):
+    """A label carrying only the new kinds is reported by `tools/inspect_results.py`, with its checks, not dropped."""
+    members = 4
+    forecast, targets = random_sources(members, seed=2)
+    climatology = climatology_for(forecast)
+    specs = ["rmse", "bias", "error_std", "acc", "activity_ratio", *(spec(kind) for kind in (*CONTINGENCY, *LEVELS))]
+    specs.append(spec("rev"))
+    evaluation = Evaluation(forecast, targets, INITS, "24h", specs, climatology=climatology)
+    path = tmp_path / "derived.nc"
+    write(evaluation.run().to_xarray(evaluation.metrics), path)
+    tool = Path(__file__).resolve().parents[1] / "tools" / "inspect_results.py"
+    result = subprocess.run([sys.executable, str(tool), str(path)], capture_output=True, text=True, check=False)
+    printed = result.stdout
+    assert result.returncode == 0 and "MECHANICS OK" in printed, printed + result.stderr
+    assert f"threshold label '{LABEL}'" in printed and f"reliability label '{LABEL}'" in printed
+    for name in ("sedi", "odds_ratio", "four cells", "roc_pod", "roc_pofd", "roc_area", "rev", "error_std", "activity"):
+        assert name in printed, name

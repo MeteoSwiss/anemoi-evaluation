@@ -392,6 +392,21 @@ class FalseAlarm(ThresholdStatistic):
         return forecast * (1.0 - observed)
 
 
+class CorrectNegative(ThresholdStatistic):
+    """Event neither forecast nor observed, `(1 - f) * (1 - o)`.
+
+    The older scores take this cell as the remainder `1 - h - m - fa`, which is a rounding residue of order 1e-16
+    rather than zero where the true cell is empty; the scores that divide by a product with it need it exact, so they
+    store it.
+    """
+
+    kind = "correct_negative"
+
+    def _compute(self, pred: torch.Tensor, target: torch.Tensor, aux: dict[str, torch.Tensor]) -> torch.Tensor:
+        forecast, observed = self._events(pred, target, aux)
+        return (1.0 - forecast) * (1.0 - observed)
+
+
 class Brier(ThresholdStatistic):
     """Squared error of the ensemble exceedance fraction, `(p - o)^2`; at one member `miss + false_alarm`."""
 
