@@ -357,6 +357,7 @@ Per variable and node, with `m` a member, `y` the target, `e` the ensemble mean 
 | `hit_<label>` | `f * o` | 1 | n/a |
 | `miss_<label>` | `(1 - f) * o` | 1 | n/a |
 | `false_alarm_<label>` | `f * (1 - o)` | 1 | n/a |
+| `correct_negative_<label>` | `(1 - f) * (1 - o)` | 1 | n/a |
 | `brier_<label>` | `(p - o)^2` | 1 | n/a |
 | `event_frequency_<label>` | `o` | 1 | n/a |
 | `rank_bin_<k>` | `1{below <= k <= below + ties} / (ties + 1)` | 2 | n/a |
@@ -390,7 +391,7 @@ no error. Pass a fresh mapping per frame, as the aggregator does.
 
 #### Thresholds
 
-The five threshold statistics of the categorical family score one binarised event (the reliability levels
+The six threshold statistics of the categorical family score one binarised event (the reliability levels
 have their own section below). With `t` the threshold of the variable, `y` the
 target, `e` the ensemble mean and `x_m` the members:
 
@@ -407,9 +408,14 @@ target, `e` the ensemble mean and `x_m` the members:
   "not defined for this variable" rather than as a count of zero.
 - A threshold naming a variable the run does not have is an error at `Evaluation` construction
   (`the thresholds of ... name variables the run does not have`).
-- `correct_negative = (1 - f) * (1 - o)` is not stored: the four cells sum to 1 elementwise, and the shared
-  validity mask drives both the statistic sums and the weight sum, so `cn = 1 - h - m - fa` holds on the
-  weighted means too, up to the float64 rounding of the division.
+- `correct_negative = (1 - f) * (1 - o)` is stored only for the metrics that need the fourth cell exactly
+  (`pofd`, `sedi`, `odds_ratio`, `orss`). The four cells sum to 1 elementwise, and the shared validity mask
+  drives both the statistic sums and the weight sum, so `cn = 1 - h - m - fa` holds on the weighted means
+  too, up to the float64 rounding of the division; the older scores (`ets`, `hss`, `pss`) take `cn` that
+  way, so their values and the sums of existing configs are unchanged. That rounding is harmless to them
+  but not to a score that divides by `m fa` or takes `log(1 - F)`: where the forecast says yes everywhere in
+  a cell, the true `cn` is 0 while the remainder is `0` or `±1e-16` depending on how the sums rounded, and
+  differently for a sharded run. The stored sum of an empty cell is an exact zero.
 - At `M = 1`, `brier = (f - o)^2`, which is 1 exactly on a miss or a false alarm and 0 otherwise, so
   `brier == miss + false_alarm` elementwise, exactly. The stored sums group those terms differently
   (`(m + fa) @ W` against `m @ W + fa @ W`), so on the sums and the means the two agree up to the float64
@@ -522,10 +528,10 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `frequency_bias_<label>` | `{frequency_bias: {...}}` | `hit`, `miss`, `false_alarm` | `(h + fa) / (h + m)` | 1 |
 | `hss_<label>` | `{hss: {...}}` | `hit`, `miss`, `false_alarm` | `2 (h cn - m fa) / ((h + m)(m + cn) + (h + fa)(fa + cn))` | 1 |
 | `pss_<label>` | `{pss: {...}}` | `hit`, `miss`, `false_alarm` | `h / (h + m) - fa / (fa + cn)` | 1 |
-| `pofd_<label>` | `{pofd: {...}}` | `hit`, `miss`, `false_alarm` | `F = fa / (fa + cn)` | 1 |
-| `sedi_<label>` | `{sedi: {...}}` | `hit`, `miss`, `false_alarm` | `(ln F - ln H - ln(1 - F) + ln(1 - H)) / (ln F + ln H + ln(1 - F) + ln(1 - H))`, `H = h / (h + m)` | 1 |
-| `odds_ratio_<label>` | `{odds_ratio: {...}}` | `hit`, `miss`, `false_alarm` | `(h cn) / (m fa)` | 1 |
-| `orss_<label>` | `{orss: {...}}` | `hit`, `miss`, `false_alarm` | `(h cn - m fa) / (h cn + m fa)` | 1 |
+| `pofd_<label>` | `{pofd: {...}}` | `false_alarm`, `correct_negative` | `F = fa / (fa + cn)` | 1 |
+| `sedi_<label>` | `{sedi: {...}}` | `hit`, `miss`, `false_alarm`, `correct_negative` | `(ln F - ln H - ln(1 - F) + ln(1 - H)) / (ln F + ln H + ln(1 - F) + ln(1 - H))`, `H = h / (h + m)` | 1 |
+| `odds_ratio_<label>` | `{odds_ratio: {...}}` | `hit`, `miss`, `false_alarm`, `correct_negative` | `(h cn) / (m fa)` | 1 |
+| `orss_<label>` | `{orss: {...}}` | `hit`, `miss`, `false_alarm`, `correct_negative` | `(h cn - m fa) / (h cn + m fa)` | 1 |
 | `f1_<label>` | `{f1: {...}}` | `hit`, `miss`, `false_alarm` | `2 h / (2 h + m + fa)` | 1 |
 | `brier_<label>` | `{brier: {...}}` | `brier` | `b` | 1 |
 | `bss_<label>` | `{bss: {...}}` | `brier`, `event_frequency` | `1 - b / (obar (1 - obar))` | 1 |
@@ -537,8 +543,8 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `brier_reliability_<label>` | `{brier_reliability: {...}}` | the `2 (M + 1)` level sums | `REL` | 1 |
 | `brier_resolution_<label>` | `{brier_resolution: {...}}` | the `2 (M + 1)` level sums | `RES` | 1 |
 | `brier_uncertainty_<label>` | `{brier_uncertainty: {...}}` | `event_frequency` | `obar (1 - obar)` | 1 |
-| `roc_hit_rate_<label>` | `{roc_hit_rate: {...}}` | the `2 (M + 1)` level sums | `H_k = (sum_{j >= k} h_j) / (sum_j h_j)`, on the `probability` axis | 1 |
-| `roc_false_alarm_rate_<label>` | `{roc_false_alarm_rate: {...}}` | the `2 (M + 1)` level sums | `F_k = (sum_{j >= k} (n_j - h_j)) / (sum_j (n_j - h_j))`, on the same axis | 1 |
+| `roc_pod_<label>` | `{roc_pod: {...}}` | the `2 (M + 1)` level sums | `H_k = (sum_{j >= k} h_j) / (sum_j h_j)`, on the `probability` axis | 1 |
+| `roc_pofd_<label>` | `{roc_pofd: {...}}` | the `2 (M + 1)` level sums | `F_k = (sum_{j >= k} (n_j - h_j)) / (sum_j (n_j - h_j))`, on the same axis | 1 |
 | `roc_area_<label>` | `{roc_area: {...}}` | the `2 (M + 1)` level sums | trapezoid area through `(0, 0)`, `(F_k, H_k)` for `k = M..1` and `(1, 1)` | 1 |
 | `rev_<label>` | `{rev: {label: L, thresholds: {...}, cost_loss: [a, ...]}}` | the `2 (M + 1)` level sums | `max_{k >= 1} (min(a, s) - F_k a (1 - s) + H_k s (1 - a) - s) / (min(a, s) - s a)`, on a `cost_loss` axis | 1 |
 
@@ -559,17 +565,18 @@ below `rmse`. A deterministic model is `M = 1`, where `member_squared_error` equ
 the metrics needing 2 members are rejected at construction (`the metrics need at least N members`).
 
 For an ensemble, the twelve contingency scores (`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`,
-`pofd`, `sedi`, `odds_ratio`, `orss`, `f1`) and the cells they come from binarise the **ensemble mean** and therefore score it as a point forecast.
-That is not the same event as the deterministic sibling's: the mean of a skewed variable has less spread
-than a member, so at a rare threshold it exceeds far less often and `frequency_bias` and `pod` fall well
-below a single member's. `brier` and `bss`, and the reliability diagram at one member, are what compares
-the two model kinds directly, since they use the exceedance fraction. The contingency table at a chosen
-probability level comes from the reliability level sums of the same label (`n_k`, `h_k`), and the ROC
-metrics and `rev` below are built from it.
+`pofd`, `sedi`, `odds_ratio`, `orss`, `f1`) and the cells they come from binarise the **ensemble mean** and
+therefore score it as a point forecast. That is not the same event as the deterministic sibling's: the mean
+of a skewed variable has less spread than a member, so at a rare threshold it exceeds far less often and
+`frequency_bias` and `pod` fall well below a single member's. `brier` and `bss`, and the reliability diagram
+at one member, are what compares the two model kinds directly, since they use the exceedance fraction. The
+contingency table at a chosen probability level comes from the reliability level sums of the same label
+(`n_k`, `h_k`), and the ROC metrics and `rev` below are built from it.
 
 The fifteen threshold metrics are functions of the weighted means of the threshold statistics of the same label:
 `h = mean(hit_L)`, `m = mean(miss_L)`, `fa = mean(false_alarm_L)`, `cn = 1 - h - m - fa`, `b = mean(brier_L)`
-and `obar = mean(event_frequency_L)`, each pooled over the nodes and init times of a cell.
+and `obar = mean(event_frequency_L)`, each pooled over the nodes and init times of a cell; `pofd`, `sedi`,
+`odds_ratio` and `orss` take `cn = mean(correct_negative_L)` instead (see [thresholds](#thresholds)).
 `hr = (h + fa) * (h + m)` is the random-hit rate, which needs no division because the four cells are
 normalised to 1 (see [thresholds](#thresholds)). All fifteen need only **one member**, so they work for a
 deterministic checkpoint.
@@ -595,17 +602,20 @@ threshold too rare for the sample; `event_frequency_<label>` in the same file is
 `sedi`, `odds_ratio`, `orss` and `f1` are 0/0 NaN in the same empty cell; `pofd` is 0 there, since every
 non-event was a correct negative. `sedi` (Ferro and Stephenson 2011) is also NaN wherever `H` or `F` is
 exactly 0 or 1, a perfect forecast included, as one of its logarithms is infinite. `odds_ratio` is plus
-infinity where `m fa = 0 < h cn`; `orss` is 1 there.
+infinity where `m fa = 0 < h cn`; `orss` is 1 there. Where `h cn` and `m fa` are both zero, a forecast
+saying yes everywhere in a cell included, both are 0/0 NaN.
 
-`error_std` is the standard deviation of the ensemble-mean error over the cell, so
-`rmse^2 = bias^2 + error_std^2` to float64 rounding. It is computed from the two means in one pass, and the
-difference is clamped at zero before the root because where the error is constant over the cell the two
-terms agree only to rounding. `activity_ratio` is pooled like `acc` and shares its caveat: the non-finite
-climatology nodes add zero to both anomaly sums while the weights count them, which the ratio cancels.
+`error_std` is the standard deviation of the ensemble-mean error over the cell, so `rmse^2 = bias^2 +
+error_std^2` to float64 rounding. It is computed from the two means in one pass, and the difference is
+clamped at zero before the root because where the error is constant over the cell the two terms agree only
+to rounding. The one-pass form loses about `(bias / error_std)^2 * eps` of relative accuracy, so where the
+bias dwarfs the spread by many orders of magnitude it is inaccurate or reads 0; real forecast errors are far
+from that. `activity_ratio` is pooled like `acc` and shares its caveat: the non-finite climatology nodes add
+zero to both anomaly sums while the weights count them, which the ratio cancels.
 
 `rank_histogram` is not one number per `(lead_time, bin, variable, region)`: it carries an extra `rank`
 axis of `M + 1` values, see the [NetCDF layout](#netcdf-layout). `reliability_<label>` and
-`forecast_frequency_<label>`, `roc_hit_rate_<label>` and `roc_false_alarm_rate_<label>` are the other
+`forecast_frequency_<label>`, `roc_pod_<label>` and `roc_pofd_<label>` are the other
 metrics carrying an extra axis, the `probability` one, and `rev_<label>` carries a `cost_loss` one; the
 three `brier_*` components and `roc_area_<label>` are ordinary scalars. The nine need only one member,
 unlike the rank histogram: at `M = 1` the diagram has the two points of a contingency table.
@@ -613,9 +623,12 @@ unlike the rank histogram: at `M = 1` the diagram has the two points of a contin
 The ROC point at `probability = k / M` is the decision "the event when `p >= k / M`", that is when at least
 `k` members exceed the threshold, with `H_k` the fraction of the observed events and `F_k` the fraction of
 the observed non-events it forecasts. Level 0 always forecasts the event and is `(1, 1)` exactly, its
-cumulated sum being the denominator itself. At `M = 1` the one interior point is `(pofd, pod)` of the same
-label, and `roc_area = (1 + pod - pofd) / 2`. The area joins the points by straight lines, so it is below the
-area of the smooth curve the ensemble samples, the more so the smaller `M`.
+cumulated sum being the denominator itself. The decision "never", `(0, 0)`, is not stored, so a plotted
+curve has to append it; `roc_area` includes it. The non-events of a level are the difference `n_k - h_k`,
+which, unlike the contingency remainder, is an exact zero where every node of the level was observed (the
+two sums are of identical vectors, in every shard). At `M = 1` the one interior point is `(pofd, pod)` of
+the same label, and `roc_area = (1 + pod - pofd) / 2`. The area joins the points by straight lines, so it is
+below the area of the smooth curve the ensemble samples, the more so the smaller `M`.
 
 `rev` is the relative economic value (Richardson 2000) of each decision for a user of cost/loss ratio `a`,
 with `s = (sum_k h_k) / (sum_k n_k)` the base rate from the level sums: the expense saved over climatology
@@ -626,9 +639,10 @@ of the deterministic forecast. `cost_loss` is required, a non-empty strictly inc
 strictly between 0 and 1, and is part of the spec, so `merge` rebuilds it from the `metrics` attr. A file has
 one `cost_loss` coordinate, so two `rev` metrics with different lists are refused by `build`, hence at config
 load (`disagree on the 'cost_loss' axis`). The ROC metrics and `rev` are NaN in a cell that observed no event
-or no non-event, where `H_k` or `F_k` is 0/0. `outlier_fraction`
-is the fraction of targets that fell outside the ensemble range, `2 / (M + 1)` for a calibrated ensemble,
-and stores only the two end bins when it is asked for alone.
+or no non-event, where `H_k` or `F_k` is 0/0.
+
+`outlier_fraction` is the fraction of targets that fell outside the ensemble range, `2 / (M + 1)` for a
+calibrated ensemble, and stores only the two end bins when it is asked for alone.
 
 Missing targets never enter the sums: with `on_missing_target: skip` the frame is dropped entirely, so
 its `n_init` is not incremented either. With `raise` the `MissingTargetError` propagates.
@@ -673,17 +687,17 @@ Dimensions and coordinates:
 | `param` | `variable` | str | Parameter of each variable, `""` when unknown. |
 | `level` | `variable` | float | Level of each variable, NaN when unknown. |
 | `rank` | `rank` | int64 | `0..M`, present only when a metric declares it (`rank_histogram`). |
-| `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`, `roc_hit_rate`, `roc_false_alarm_rate`). |
+| `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`, `roc_pod`, `roc_pofd`). |
 | `cost_loss` | `cost_loss` | float64 | The configured cost/loss ratios, present only when a metric declares it (`rev`). |
 
 Data variables:
 
 | Variable | Dimensions | Content |
 |---|---|---|
-| `<metric>` | `(lead_time, bin, variable, region)` plus any extra dimension the metric declares | One per configured metric, named by `Metric.name`, derived from the means including the pooled `all` bin. `rank_histogram` is on `(lead_time, bin, variable, region, rank)`, `reliability_<label>`, `forecast_frequency_<label>`, `roc_hit_rate_<label>` and `roc_false_alarm_rate_<label>` on `(lead_time, bin, variable, region, probability)`, `rev_<label>` on `(lead_time, bin, variable, region, cost_loss)`. |
+| `<metric>` | `(lead_time, bin, variable, region)` plus any extra dimension the metric declares | One per configured metric, named by `Metric.name`, derived from the means including the pooled `all` bin. `rank_histogram` is on `(lead_time, bin, variable, region, rank)`, `reliability_<label>`, `forecast_frequency_<label>`, `roc_pod_<label>` and `roc_pofd_<label>` on `(lead_time, bin, variable, region, probability)`, `rev_<label>` on `(lead_time, bin, variable, region, cost_loss)`. |
 | `n_init` | `(lead_time, bin)` | Frames, with the `all` bin summed. |
 | `weight_sum` | `(lead_time, bin, variable, region)` | Weight sum of the valid elements, with the `all` bin summed. |
-| `state_sum_<statistic>` | `(lead_time, state_bin, variable, region)` | The raw float64 sums, one per statistic. |
+| `state_sum_<statistic>` | `(lead_time, state_bin, variable, region)` | The raw float64 sums, one per statistic, for example `state_sum_correct_negative_<label>` when `pofd`, `sedi`, `odds_ratio` or `orss` asks for it. |
 | `state_weights` | `(lead_time, state_bin, variable, region)` | The raw weight sums. |
 | `state_n_init` | `(lead_time, state_bin)` | The raw frame counts. |
 
@@ -926,8 +940,8 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
   `LabelledMetric` mixin they take their label, name and spec from; `EnsembleSizeMetric` and its
   subclasses `RankHistogram` and `OutlierFraction`, which gain their statistics in `bind_members`;
   `ReliabilityMetric`, which depends on both the variables and the ensemble size, and its subclasses
-  `ReliabilityDiagram`, `ForecastFrequency`, `BrierReliability`, `BrierResolution`, `ROCHitRate`,
-  `ROCFalseAlarmRate`, `ROCArea` and `RelativeEconomicValue(label=None, thresholds=None, cost_loss=None)`;
+  `ReliabilityDiagram`, `ForecastFrequency`, `BrierReliability`, `BrierResolution`, `ROCPOD`,
+  `ROCPOFD`, `ROCArea` and `RelativeEconomicValue(label=None, thresholds=None, cost_loss=None)`;
   `validate_cost_loss(cost_loss)`; `REGISTRY`, the
   name-to-class mapping a new metric registers in; `from_spec(spec)`,
   `build(specs, variables=None, members=None)` (the constructor the driver and the config use: it refuses
@@ -937,8 +951,8 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
   `bind_variables(variables)`, `compute(pred, target, aux=None)`) and the statistics of the
   [statistics table](#statistics), the threshold ones through
   `ThresholdStatistic(label=None, thresholds=None)` with the subclasses `Hit`, `Miss`, `FalseAlarm`,
-  `Brier` and `EventFrequency`, the rank bins through `RankBin(k, members)` and the reliability levels
-  through `ReliabilityLevel(label=None, thresholds=None, *, k, members)` with the subclasses
+  `CorrectNegative`, `Brier` and `EventFrequency`, the rank bins through `RankBin(k, members)` and the
+  reliability levels through `ReliabilityLevel(label=None, thresholds=None, *, k, members)` with the subclasses
   `ReliabilityCount` and `ReliabilityEvent`;
   `crps_coefficient(alpha, members)`; `ensemble_mean(pred, aux=None)`.
   `per_variable(pred, target, function)`, `anomalies(mean, target, climatology)`,
@@ -1189,8 +1203,8 @@ Constraints the code enforces, with the message or behaviour:
   name `brier_reliability_heavy`, which collides with `{brier_reliability: {label: heavy, ...}}`; the
   collision is refused loudly (`duplicate metric names`), and the tools split such names longest kind first,
   but the confusion is avoidable.
-- **`acc` and `activity_ratio` need a climatology**; `AnomalyProduct` and the other anomaly statistics raise when
-  `climatology` is not in `aux`.
+- **`acc` and `activity_ratio` need a climatology**; `AnomalyProduct` and the other anomaly statistics raise
+  when `climatology` is not in `aux`.
 - **A climatology key that a valid time maps to must exist**, otherwise `ArrayClimatology.frame` raises.
   Non-finite climatology nodes are excluded from the anomaly statistics only, are counted in
   `climatology_nonfinite_nodes`, and produce a warning at the start of a run.

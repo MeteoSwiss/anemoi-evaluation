@@ -298,7 +298,7 @@ least two members and raise when the source has fewer. Five choices worth making
 | `member_rmse`, `member_mae` | the error of a randomly drawn member in expectation, never below `rmse` / `mae`, which are computed on the ensemble mean |
 | `rank_histogram`, `outlier_fraction` | whether the ensemble is calibrated rather than how accurate it is, see [Rank histogram](#rank-histogram) |
 | `reliability`, `forecast_frequency` | whether the forecast probabilities of a threshold mean what they say, see [Reliability diagram](#reliability-diagram); unlike the rank histogram they work at one member too |
-| `roc_hit_rate`, `roc_false_alarm_rate`, `roc_area`, `rev` | how well those probabilities separate events from non-events, and what that is worth to a user, see [ROC curve and economic value](#roc-curve-and-economic-value) |
+| `roc_pod`, `roc_pofd`, `roc_area`, `rev` | how well those probabilities separate events from non-events, and what that is worth to a user, see [ROC curve and economic value](#roc-curve-and-economic-value) |
 
 The full list is in the [reference](reference.md#metrics). A checkpoint with no `noise_injector`
 logs a warning and produces identical members, so `spread` is zero and `crps` equals `mae`.
@@ -371,7 +371,8 @@ metrics need a climatology source`.
 much the forecast anomalies vary against the observed ones. Below 1 the forecast is smoother than the
 truth, which is how a model loses activity with lead time; read it next to `acc`, since a forecast can
 keep its correlation while it damps. `error_std` needs no climatology: it is `sqrt(mse - bias^2)`, the
-part of the RMSE the bias does not explain.
+part of the RMSE the bias does not explain. It is computed from the two means, so it loses accuracy where
+the bias is many orders of magnitude larger than the spread of the error, which real errors are not.
 
 ### Building a climatology
 
@@ -414,8 +415,8 @@ climatology: {file: climatology.nc}
 ## Categorical scores at thresholds
 
 `pod`, `far`, `pofd`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`, `sedi`, `odds_ratio`, `orss` and `f1`
-score a binarised event, `brier`, `bss` and `event_frequency` score its probability. Each one takes a **label** and a per-variable **threshold**
-map, and is named after both:
+score a binarised event, `brier`, `bss` and `event_frequency` score its probability. Each one takes a
+**label** and a per-variable **threshold** map, and is named after both:
 
 ```yaml
 metrics:
@@ -470,6 +471,13 @@ where `csi` and `ets` all tend to zero whatever the model; it is undefined, NaN,
 the false alarm rate is exactly 0 or 1, a perfect forecast included. `odds_ratio` is infinite where there
 is no miss or no false alarm, and `orss` is the same information mapped to `[-1, 1]`. `f1` is the harmonic
 mean of `pod` and `1 - far`.
+
+`pofd`, `sedi`, `odds_ratio` and `orss` store a fourth sum, `state_sum_correct_negative_<label>`, rather
+than taking the correct negatives as what the other three cells leave of 1. Where a forecast says yes
+everywhere in a cell, that remainder is a rounding residue instead of zero, which those four scores would
+turn into an infinity, a spurious perfect score or a sharded run that disagrees with the unsharded one.
+The older scores (`ets`, `hss`, `pss`) keep the remainder, which they are not sensitive to, so their
+values and the files of existing configs are unchanged.
 
 All fifteen work for a deterministic checkpoint. What compares the two model kinds is `brier` and `bss`, and the
 reliability diagram at one member: they all read the fraction of members above the threshold, and at one
@@ -590,22 +598,25 @@ same stored level sums, so the metrics below cost nothing on top of a `reliabili
 
 ```yaml
 metrics:
-  - {roc_hit_rate:         {label: heavy, thresholds: {tp: 0.005}}}
-  - {roc_false_alarm_rate: {label: heavy, thresholds: {tp: 0.005}}}
-  - {roc_area:             {label: heavy, thresholds: {tp: 0.005}}}
+  - {roc_pod:  {label: heavy, thresholds: {tp: 0.005}}}
+  - {roc_pofd: {label: heavy, thresholds: {tp: 0.005}}}
+  - {roc_area: {label: heavy, thresholds: {tp: 0.005}}}
   - {rev: {label: heavy, thresholds: {tp: 0.005}, cost_loss: [0.02, 0.05, 0.1, 0.2, 0.5]}}
 ```
 
 Each point of the curve is a decision rule, "forecast the event when at least `k` of the `M` members
-exceed the threshold", and its hit rate (observed events forecast) and false alarm rate (observed
-non-events forecast). `roc_hit_rate_heavy` and `roc_false_alarm_rate_heavy` are on the same
+exceed the threshold", and its `pod` (observed events forecast, the hit rate) and `pofd` (observed
+non-events forecast, the false alarm rate). `roc_pod_heavy` and `roc_pofd_heavy` are on the same
 `probability` axis as the reliability diagram, the point at `probability = k / M` being the rule
-"`p >= k / M`"; the point at 0 always forecasts the event and is `(1, 1)`. Plot one against the other:
+"`p >= k / M`"; the point at 0 always forecasts the event and is `(1, 1)`. The decision "never", the
+point `(0, 0)`, is not stored, so append it before plotting one against the other, or the curve stops
+at level `M`:
 
 ```python
 cell = {"bin": "all", "region": "global", "variable": "tp"}
-hit = results["roc_hit_rate_heavy"].sel(**cell).isel(lead_time=-1)
-false_alarm = results["roc_false_alarm_rate_heavy"].sel(**cell).isel(lead_time=-1)
+pod = results["roc_pod_heavy"].sel(**cell).isel(lead_time=-1).values
+pofd = results["roc_pofd_heavy"].sel(**cell).isel(lead_time=-1).values
+pofd, pod = np.append(pofd, 0.0), np.append(pod, 0.0)                    # add the (0, 0) end point
 value = results["rev_heavy"].sel(**cell).isel(lead_time=-1)              # on the cost_loss axis
 ```
 

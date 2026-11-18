@@ -7,8 +7,9 @@
 * New metrics `error_std` (the error standard deviation) and `activity_ratio` (the forecast against the
   observed anomaly activity, with a climatology like `acc`).
 * New contingency scores `pofd`, `sedi`, `odds_ratio`, `orss` and `f1`, configured with a label and a
-  threshold map like `csi`.
-* New ROC metrics `roc_hit_rate` and `roc_false_alarm_rate` on the `probability` axis, and their area
+  threshold map like `csi`. The first four store a new `correct_negative_<label>` sum; the existing scores
+  and their sums are unchanged.
+* New ROC metrics `roc_pod` and `roc_pofd` on the `probability` axis, and their area
   `roc_area`, from the reliability level sums.
 * New metric `rev`, the relative economic value over a configured `cost_loss` list, written on a
   `cost_loss` axis.
