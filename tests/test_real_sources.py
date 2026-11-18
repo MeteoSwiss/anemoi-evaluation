@@ -50,14 +50,19 @@ def test_member_seed_and_required_dates():
         member_seed(0, T0, 0, 1),
     }
     assert len(seeds) == 5 and all(0 <= seed < 2**63 for seed in seeds)
-    assert required_dates(T0, 6 * HOUR, 2) == [T0 - 6 * HOUR, T0]
-    assert required_dates(T0, 6 * HOUR, 1, 6 * HOUR) == [T0]
-    required = required_dates(T0, 6 * HOUR, 2, 18 * HOUR)
+    six_hourly = ([-6 * HOUR, 0 * HOUR], [6 * HOUR], 6 * HOUR)
+    assert required_dates(T0, *six_hourly) == [T0 - 6 * HOUR, T0]
+    assert required_dates(T0, [0 * HOUR], [6 * HOUR], 6 * HOUR, 6 * HOUR) == [T0]
+    required = required_dates(T0, *six_hourly, 18 * HOUR)
     assert required == [T0 - 6 * HOUR, T0, T0 + 6 * HOUR, T0 + 12 * HOUR]
-    assert required_dates(T0, 6 * HOUR, 2, 18 * HOUR, 6 * HOUR) == required
+    hourly = ([k * HOUR for k in range(-6, 1)], [k * HOUR for k in range(1, 7)], 6 * HOUR)
     for lead in (9 * HOUR, 12 * HOUR):  # a 6-output hourly model makes two calls and loads forcings for the first only
-        assert required_dates(T0, HOUR, 7, lead, 6 * HOUR) == [T0 + k * HOUR for k in range(-6, 7)]
-    assert required_dates(T0, HOUR, 7, 6 * HOUR, 6 * HOUR) == [T0 + k * HOUR for k in range(-6, 1)]
+        assert required_dates(T0, *hourly, lead) == [T0 + k * HOUR for k in range(-6, 7)]
+    assert required_dates(T0, *hourly, 6 * HOUR) == [T0 + k * HOUR for k in range(-6, 1)]
+    # an offset forecaster reads its own input offsets and, for forcings, every output date of all but the last call
+    offset = ([-12 * HOUR, 0 * HOUR], [6 * HOUR, 12 * HOUR, 24 * HOUR], 24 * HOUR)
+    assert required_dates(T0, *offset) == [T0 - 12 * HOUR, T0]
+    assert required_dates(T0, *offset, 48 * HOUR) == [T0 + k * HOUR for k in (-12, 0, 6, 12, 24)]
     available = {T0, T0 + 6 * HOUR, T0 + 12 * HOUR}
     assert missing_dates(required, available, {T0 + 6 * HOUR}) == [T0 - 6 * HOUR, T0 + 6 * HOUR]
 

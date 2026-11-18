@@ -107,8 +107,11 @@ on the first forecast, which is what keeps a dry run model-free (FR-28).
 Construction enforces the invariants: `output` must be `"none"` (forecasts stay in memory, FR-1,
 and the process stays clear of anemoi-inference's never-cleared registry of output paths), `date`
 must not be set, the datasets must share the timing, the model must decode every dataset, and
-`verbosity` defaults to 0. From the checkpoint it takes the timestep, the two multi-step counts
-(hence `output_horizon` and `frames_per_pass`), and the uuid and run id for provenance (NFR-5).
+`verbosity` defaults to 0. From the checkpoint it takes the timestep, the two multi-step counts,
+the input and output offsets and the rollout shift (`output_horizon`; `frames_per_pass` is the
+number of output offsets), through anemoi-inference's public `Checkpoint` properties, and the uuid
+and run id for provenance (NFR-5). The lead times are `rollout_schedule()`, which follows the
+runner's calls ([lead times](../reference.md#lead-times)).
 With `quiet`, the anemoi-inference loggers and the per-step timer are raised to WARNING while the
 source runs.
 
@@ -130,13 +133,16 @@ config and refuses a downscaler: anemoi-inference runs input-only datasets since
 ecmwf/anemoi-inference#605, but the evaluation does not score one yet. A checkpoint that does not
 carry the routing is let through. Before the runner is built, `check_task()` refuses a checkpoint
 whose task is not a forecaster, reading the metadata with `patch_metadata` applied; an unknown
-class path passes with a warning. After the timing check, `check_output_offsets()` refuses output
-offsets other than `timestep, ..., n * timestep` with a rollout shift of `n * timestep`.
+class path passes with a warning. After the timing check, `check_rollout_timing()` refuses a timing
+anemoi-core's `OffsetForecaster` does not produce (hand-edited or patched): the lead times rely on
+the rollout starting at the init time (last input offset `0h`) and on every lead time coming from
+one call, in order (increasing outputs spanning less than the shift, which is one of them).
 
 **Lockstep members.** For one init time the source builds the initial state once, then advances
 `members` `run()` generators one step at a time, reseeding the global RNG with
 `member_seed(seed, init_time, member, call)` before each member's model call and stacking the
-members of a step into one frame. `member_seed` is a 63-bit blake2b hash of its four public
+members of a step into one frame. The call of each frame comes from `rollout_schedule()`, and each
+yielded step must be the lead time it schedules, or the source raises. `member_seed` is a 63-bit blake2b hash of its four public
 arguments, so a member depends neither on the ensemble size nor on the other members nor on the
 interleaving (FR-3). All members must stop together and agree on their step, or the source raises.
 
@@ -160,8 +166,9 @@ explicit value alone. `inference_chunks()` reports the counts a loaded model act
 (section 8).
 
 **Dates and the graph.** `required_dates()` and `missing_dates()` are the pure helpers behind
-`check_init_times()` (FR-7): the lagged input window ending at the init time, plus the valid dates
-of every model call but the last, since the runner loads no forcings after its last call.
+`check_init_times()` (FR-7): the init time plus every input offset, plus the output dates of every
+model call but the last, at which the runner loads the next call's forcings (all of them, even the
+ones the next input does not use); it loads none after its last call.
 `graph_node_attribute()` reads a per-node attribute off the loaded model's training graph, and
 `dataset_args_kwargs()` returns the `open_dataset` arguments of the runner's own prognostics input
 (FR-9). All three take the dataset: the dates are checked per dataset, the targets default to that
@@ -517,6 +524,10 @@ listed here because they are what to re-check when a pin moves.
 * **No dataset pre-processing and no top-level post-processing** happen on this path, so the fields
   are the model's output variables in training units; the source warns when pre-processors are
   configured.
+* **The rollout's timing**: the runner makes `ceil(lead_time / rollout_shift)` calls, yields the
+  outputs of a call in the order of the output offsets up to `lead_time`, and loads each next call's
+  forcings at all the output dates of the call before. `rollout_schedule()` and `required_dates()`
+  follow that; the yielded steps are checked against the schedule, the forcing dates are not.
 * **Forcings providers** are plain lists on the runner's per-dataset tensor handler, consulted at
   every model call, and anything with `variables`, `mask`, `kinds` and `load_forcings_array()` is a
   provider. That is what `SharedForcings` substitutes itself for, and the handler only reads the

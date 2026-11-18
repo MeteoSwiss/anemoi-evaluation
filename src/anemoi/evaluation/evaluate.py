@@ -236,10 +236,8 @@ class Evaluation:
         return {"param": params, "level": levels}
 
     def model_calls_per_init(self) -> tuple[int, datetime.timedelta]:
-        """Model calls one init time needs and the lead time they compute, from the source's frames per call."""
-        steps = [lead for lead in self.lead_times if lead > datetime.timedelta(0)]
-        calls = math.ceil(len(steps) / self.forecast.frames_per_pass)
-        return calls, calls * self.forecast.frames_per_pass * (steps[0] if steps else self.lead_time)
+        """Model calls one init time needs and the lead time they compute, from the forecast source."""
+        return self.forecast.model_calls(self.lead_time)
 
     def time_estimate(self, step_time: float, n_init: int, shards: int = 1) -> dict:
         """Model and wall seconds of a shard of `n_init` init times and of the whole run over `shards` shards, from

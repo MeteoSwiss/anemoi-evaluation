@@ -8,6 +8,7 @@ source subclasses a base and overrides what it can provide.
 from __future__ import annotations
 
 import datetime
+import math
 from collections.abc import Iterator
 from typing import Any
 from typing import Protocol
@@ -43,6 +44,10 @@ class ForecastSource(Protocol):
 
     def lead_times(self, lead_time: datetime.timedelta) -> list[datetime.timedelta]:
         """Lead times this source yields for a forecast up to `lead_time`."""
+        ...
+
+    def model_calls(self, lead_time: datetime.timedelta) -> tuple[int, datetime.timedelta]:
+        """Model calls a forecast up to `lead_time` makes and the lead time the last one computes."""
         ...
 
     def initial_frame(self, init_time: datetime.datetime, variables: list[str], device: torch.device) -> Frame:
@@ -177,6 +182,12 @@ class ForecastSourceBase:
     has_graph: bool = False
     frames_per_pass: int = 1
     supports_lead_zero: bool = False
+
+    def model_calls(self, lead_time: datetime.timedelta) -> tuple[int, datetime.timedelta]:
+        """`frames_per_pass` evenly spaced lead times per call."""
+        steps = self.lead_times(lead_time)
+        calls = math.ceil(len(steps) / self.frames_per_pass)
+        return calls, calls * self.frames_per_pass * (steps[0] if steps else lead_time)
 
     def initial_frame(self, init_time: datetime.datetime, variables: list[str], device: torch.device) -> Frame:
         """No initial state."""

@@ -292,6 +292,23 @@ def two_output_steps(metadata: dict) -> None:
         timesteps["advance_map"] = {"inin": [], "outin": [[0, 0], [1, 1]]}
 
 
+def offset_forecaster(metadata: dict) -> None:
+    """A `save_checkpoint` patch making the fake an offset forecaster with the timing of the ckpt-gen dummy: inputs
+    `[-12h, 0h]`, outputs `[6h, 12h, 1d]`, rollout shift `1d`."""
+    metadata["metadata_inference"]["task"] = "offset-forecaster"
+    metadata["config"]["training"]["multistep_output"] = 3
+    for name in metadata["metadata_inference"]["dataset_names"]:
+        metadata["metadata_inference"][name]["timesteps"].update(
+            relative_date_indices_training=[0, 1, 2, 3, 4],
+            input_relative_date_indices=[0, 1],
+            output_relative_date_indices=[2, 3, 4],
+            input_offsets=["-12h", "0h"],
+            output_offsets=["6h", "12h", "1d"],
+            rollout_shift="1d",
+            advance_map={"inin": [], "outin": [[1, 0], [2, 1]]},
+        )
+
+
 def init_times(name: str = DATASET_NAMES[0], count: int = 2) -> list[datetime.datetime]:
     """Init times the fixture can serve a multi-step input and a rollout from."""
     available = dates(load_metadata(), name)

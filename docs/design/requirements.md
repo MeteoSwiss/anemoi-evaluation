@@ -82,9 +82,9 @@ seed, the init time, the member index and the model call index only. It MUST NOT
 ensemble size, on the other members, or on how member rollouts are interleaved.
 
 **FR-4** The package MUST support models that emit several lead times per forward pass, scoring
-each output time as its own frame. When the requested lead time is not a multiple of the model's
-output horizon the package MUST warn, compute up to the next multiple and discard the extra
-outputs.
+each output time as its own frame, at the lead times the checkpoint's input and output offsets and
+rollout shift give (offset forecasters included). When the requested lead time ends before the
+model's last call does, the package MUST warn, compute that call and discard the extra outputs.
 
 **FR-5** The package SHOULD be able to score lead 0 from the model's initial state, without an
 extra model call or read, excluding the variables absent from that state (diagnostics).

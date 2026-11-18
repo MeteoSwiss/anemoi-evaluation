@@ -334,7 +334,8 @@ def test_downscaler_checkpoints_are_refused(tmp_path, monkeypatch):
 
 
 def test_other_tasks_and_offsets_are_refused(tmp_path, monkeypatch):
-    """A task other than a forecaster is refused from the metadata, before the runner is built."""
+    """A task other than a forecaster is refused from the metadata, before the runner is built; a timing anemoi-core
+    cannot produce (outputs that two model calls would repeat) is refused once the runner reads it."""
 
     def patch(metadata):
         metadata["metadata_inference"]["task"] = "temporal-downscaler"
@@ -350,14 +351,16 @@ def test_other_tasks_and_offsets_are_refused(tmp_path, monkeypatch):
     fix = {"metadata_inference": {"task": "forecaster"}}
     assert InferenceForecastSource(checkpoint=str(checkpoint), device="cpu", patch_metadata=fix).dataset_names
 
-    def skip_a_step(metadata):
+    def overlap(metadata):
         metadata["metadata_inference"]["task"] = "offset-forecaster"
         for name in fixture.DATASET_NAMES:
-            metadata["metadata_inference"][name]["timesteps"].update(output_offsets=["12h"], rollout_shift="12h")
+            metadata["metadata_inference"][name]["timesteps"].update(output_offsets=["6h", "18h"], rollout_shift="12h")
 
-    checkpoint = fixture.save_checkpoint(tmp_path / "offsets.ckpt", patch=skip_a_step)
+    checkpoint = fixture.save_checkpoint(tmp_path / "offsets.ckpt", patch=overlap)
     fixture.patch_create_runner(monkeypatch, checkpoint)
-    with pytest.raises(ValueError, match=r"output offsets \['12h'\]"):
+    with pytest.raises(
+        ValueError, match=r"invalid checkpoint timing: .*output offsets \['6h', '18h'\], rollout shift 12h"
+    ):
         InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
 
 
