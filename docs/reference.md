@@ -1104,7 +1104,9 @@ Constraints the code enforces, with the message or behaviour:
   {task: forecaster}}` makes a checkpoint with a wrong task evaluable. An explicit `runner:` is no
   override: anemoi-inference then builds that runner without reading the task, but the model still
   computes what it was trained for, and that is what the evaluation cannot pair with lead times. The
-  output offsets and the routing are read unpatched.
+  output offsets and the routing are read unpatched. The runner itself is not checked: an explicit
+  non-forecaster `runner:` (for example `temporal_downscaler`) on a forecaster checkpoint is a
+  configuration error the package does not catch.
 - **Outputs must fall on the lead times.** The lead times are `k * timestep`, so the output offsets of
   one model call must be `timestep, 2 * timestep, ..., n * timestep` with a rollout shift of
   `n * timestep`, as a `forecaster` has. An `offset-forecaster` with other offsets is refused at
