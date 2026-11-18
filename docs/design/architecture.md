@@ -128,14 +128,10 @@ anemoi-inference silently forwards the first dataset's timing as the checkpoint'
 `_check_every_dataset_is_decoded()` reads `config.model.encoders/decoders` from the stored training
 config and refuses a downscaler: anemoi-inference runs input-only datasets since
 ecmwf/anemoi-inference#605, but the evaluation does not score one yet. A checkpoint that does not
-carry the routing is let through. Before any of these, and before the runner is built,
-`check_task()` refuses a checkpoint whose task is not a forecaster (anemoi-inference's `auto`
-runner would raise on a task it has no runner for, or pick one whose output the evaluation cannot
-read). It reads the metadata with the run configuration's `patch_metadata` applied, as the `auto`
-runner does, and lets an unknown class path through with a warning, as anemoi-inference runs one as
-a forecaster; after the timing check, `check_output_offsets()` refuses output offsets that are not
-`timestep, ..., n * timestep` with a rollout shift of `n * timestep`, the lead times frames are
-paired on.
+carry the routing is let through. Before the runner is built, `check_task()` refuses a checkpoint
+whose task is not a forecaster, reading the metadata with `patch_metadata` applied; an unknown
+class path passes with a warning. After the timing check, `check_output_offsets()` refuses output
+offsets other than `timestep, ..., n * timestep` with a rollout shift of `n * timestep`.
 
 **Lockstep members.** For one init time the source builds the initial state once, then advances
 `members` `run()` generators one step at a time, reseeding the global RNG with

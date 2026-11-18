@@ -228,13 +228,13 @@ class SharedForcings:
 
 
 SUPPORTED_TASKS = ("forecaster", "offset-forecaster")
-# Tasks the evaluation cannot support until anemoi-inference does, with the reason the refusal names.
+# Tasks blocked by anemoi-inference, with the reason the refusal gives.
 INFERENCE_BLOCKERS = {
     "autoencoder": "anemoi-inference has no runner for it",
     "temporal-downscaler": "anemoi-inference runs it only through `execute()`, not step by step",
 }
-# Task classes (`config.task._target_`) and, before them, lightning modules (`config.training.model_task`) by class
-# name; ensemble and diffusion are training methods, so their modules are forecasters.
+# Class names of the task classes (`config.task._target_`) and of the older lightning modules
+# (`config.training.model_task`). Ensemble and diffusion modules are forecasters.
 TASK_CLASSES = {
     "Forecaster": "forecaster",
     "OffsetForecaster": "offset-forecaster",
@@ -248,13 +248,12 @@ TASK_CLASSES = {
     "GraphMultiOutInterpolator": "temporal-downscaler",
     "GraphAutoEncoder": "autoencoder",
 }
-# `metadata_inference.task` held the lightning module's `task_type` before the task classes.
+# Older name stored in `metadata_inference.task`.
 TASK_ALIASES = {"time-interpolator": "temporal-downscaler"}
 
 
 def task_name(value: str) -> str:
-    """The task name of a stored task: a class path by its class name, a name with `_` as `-`, as anemoi-inference's
-    runner registry does; a class path the table does not know is returned as is."""
+    """Map a stored task name or class path to a task name (`_` becomes `-`); an unknown class path is kept as is."""
     cls = value.rsplit(".", 1)[-1]
     if cls in TASK_CLASSES:
         return TASK_CLASSES[cls]
@@ -265,9 +264,8 @@ def task_name(value: str) -> str:
 
 
 def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
-    """The checkpoint's task and where it was read (`None` for the default): the task names in
-    `metadata_inference.task`, then the top-level `task` (anemoi-core #896 to #1450), then the class paths in
-    `config.task._target_` and `config.training.model_task`, else `forecaster`, anemoi-inference's default."""
+    """The checkpoint's task and the field it was read from (`None` for the default, `forecaster`). Lookup order:
+    `metadata_inference.task`, top-level `task`, `config.task._target_`, `config.training.model_task`."""
     config = metadata.get("config") or {}
     task = config.get("task")
     candidates = (
@@ -283,8 +281,7 @@ def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
 
 
 def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
-    """`metadata` with anemoi-inference's `patch_metadata` applied as its checkpoint applies it to the first dataset,
-    the view its `auto` runner reads the task from."""
+    """`metadata` with a `patch_metadata` block applied to the first dataset, as anemoi-inference does."""
     if not patch:
         return metadata
     from anemoi.inference.config.utils import multi_datasets_config
@@ -304,23 +301,22 @@ def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
 
 
 def check_task(metadata: Mapping) -> None:
-    """Refuse a checkpoint whose task is not supported yet (anything but a forecaster), from its metadata. A class path the evaluation does not know
-    is let through with a warning, since anemoi-inference runs such a checkpoint as a forecaster."""
+    """Refuse a checkpoint whose task is not supported yet. An unknown class path only warns: anemoi-inference runs
+    it as a forecaster."""
     task, origin = checkpoint_task(metadata)
     if task not in SUPPORTED_TASKS and "." in task:
         LOG.warning("unknown task class (%s), the checkpoint is evaluated as a forecaster", origin)
     elif task not in SUPPORTED_TASKS:
         raise ValueError(
-            f"the checkpoint's task is {task!r} ({origin}): this task is not supported yet"
+            f"the checkpoint's task is {task!r} ({origin}): not supported yet"
             + (f" ({INFERENCE_BLOCKERS[task]})" if task in INFERENCE_BLOCKERS else "")
             + f", only {', '.join(SUPPORTED_TASKS)} so far, see MeteoSwiss/anemoi-evaluation#5"
         )
 
 
 def check_output_offsets(metadata: Mapping) -> None:
-    """Refuse output offsets the lead times `k * timestep` cannot represent, from the checkpoint metadata: only
-    `timestep, 2 timestep, ..., n timestep` with a rollout shift of `n timestep`, which a checkpoint without
-    `output_offsets` has."""
+    """Refuse output offsets other than `timestep, ..., n * timestep` with a rollout shift of `n * timestep`, the
+    only ones that fall on the lead times. A checkpoint without `output_offsets` passes."""
     inference = metadata.get("metadata_inference") or {}
     for name in inference.get("dataset_names") or ():
         timesteps = (inference.get(name) or {}).get("timesteps") or {}
@@ -336,8 +332,8 @@ def check_output_offsets(metadata: Mapping) -> None:
             step = frequency_to_string(timestep)
             raise ValueError(
                 f"the output offsets {stored} with rollout shift {stored_shift} of dataset {name!r} do not fit the "
-                f"lead times: other offsets than {step}, 2 * {step}, ..., n * {step} with a rollout shift of n * {step} "
-                "are not supported yet, see MeteoSwiss/anemoi-evaluation#5"
+                f"lead times, not supported yet: expected {step}, 2 * {step}, ..., n * {step} with a rollout shift of "
+                f"n * {step}, see MeteoSwiss/anemoi-evaluation#5"
             )
 
 
@@ -485,7 +481,7 @@ class InferenceForecastSource(ForecastSourceBase):
         self._initial: dict[str, tuple[datetime.datetime, dict]] = {}
         with self._quiet():
             config = RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"})
-            # before the runner: anemoi-inference's `auto` runner raises on a task it has no runner for
+            # before the runner is built: the `auto` runner raises on a task it has no runner for
             metadata = load_metadata(Checkpoint(config.checkpoint).path)
             check_task(patched_metadata(metadata, config.patch_metadata))
             self.runner = create_runner(config)
@@ -575,9 +571,9 @@ class InferenceForecastSource(ForecastSourceBase):
     def _check_every_dataset_is_decoded(self, metadata: Mapping) -> None:
         """Refuse a checkpoint whose model does not decode every dataset (a downscaler).
 
-        anemoi-inference runs input-only datasets since ecmwf/anemoi-inference#605, but the evaluation scores every
-        dataset of the checkpoint against targets and does not support downscalers yet. The routing is only readable
-        from the stored training config, so a checkpoint that does not carry it is let through."""
+        anemoi-inference runs one since ecmwf/anemoi-inference#605, but the evaluation does not score it yet. The
+        routing is only readable from the stored training config, so a checkpoint that does not carry it is let
+        through."""
         routed = routed_datasets(metadata)
         if routed is None:
             return

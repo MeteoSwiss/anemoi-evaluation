@@ -334,8 +334,7 @@ def test_downscaler_checkpoints_are_refused(tmp_path, monkeypatch):
 
 
 def test_other_tasks_and_offsets_are_refused(tmp_path, monkeypatch):
-    """A task other than a forecaster is refused from the metadata, before anemoi-inference's `auto` runner would
-    raise on a task it has no runner for, or pick one whose output the evaluation cannot read."""
+    """A task other than a forecaster is refused from the metadata, before the runner is built."""
 
     def patch(metadata):
         metadata["metadata_inference"]["task"] = "temporal-downscaler"
@@ -345,7 +344,7 @@ def test_other_tasks_and_offsets_are_refused(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="task is 'temporal-downscaler'"):
         InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
     assert configs == []
-    # an explicit runner does not change what the model computes; `patch_metadata` is the override
+    # an explicit runner does not bypass the check; `patch_metadata` does
     with pytest.raises(ValueError, match="task is 'temporal-downscaler'"):
         InferenceForecastSource(checkpoint=str(checkpoint), device="cpu", runner="default")
     fix = {"metadata_inference": {"task": "forecaster"}}

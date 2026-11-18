@@ -169,7 +169,7 @@ def test_create_input_state_speaks_both_anemoi_inference_signatures():
 
 
 def metadata(task=None, top=None, target=None, model_task=None, **timesteps) -> dict:
-    """Checkpoint metadata carrying a task at each level anemoi-core has stored one, and one dataset's timesteps."""
+    """Checkpoint metadata with a task in each field anemoi-core has used, and one dataset's timesteps."""
     return {
         "task": top,
         "metadata_inference": {
@@ -182,29 +182,29 @@ def metadata(task=None, top=None, target=None, model_task=None, **timesteps) -> 
 
 
 def test_checkpoint_task_reads_each_level_anemoi_core_has_stored():
-    # legacy checkpoints carry no task at all: a forecaster, as anemoi-inference assumes
+    # no task at all: a forecaster
     assert checkpoint_task({}) == ("forecaster", None)
     assert checkpoint_task(metadata()) == ("forecaster", None)
-    # before anemoi-core #896: the lightning module; ensemble and diffusion forecasters are forecasters
+    # the lightning module (before anemoi-core #896); ensemble and diffusion count as forecasters
     for module in ("forecaster.GraphForecaster", "tasks.GraphEnsForecaster", "tasks.GraphDiffusionTendForecaster"):
         assert checkpoint_task(metadata(model_task=f"anemoi.training.train.{module}"))[0] == "forecaster"
     assert checkpoint_task(metadata(model_task="anemoi.training.train.tasks.GraphMultiOutInterpolator")) == (
         "temporal-downscaler",
         "config.training.model_task: anemoi.training.train.tasks.GraphMultiOutInterpolator",
     )
-    # the task config wins over the training method's module, `metadata_inference.task` over both
+    # the task config wins over the lightning module
     both = {
         "target": "anemoi.training.tasks.OffsetForecaster",
         "model_task": "anemoi.training.train.tasks.GraphForecaster",
     }
     assert checkpoint_task(metadata(**both))[0] == "offset-forecaster"
-    # the top-level name (anemoi-core #896 to #1450) wins over the class paths, `metadata_inference.task` over it
+    # the top-level name (anemoi-core #896 to #1450) wins over the class paths, `metadata_inference.task` over all
     assert checkpoint_task(metadata(top="temporal-downscaler", **both)) == (
         "temporal-downscaler",
         "task: temporal-downscaler",
     )
     assert checkpoint_task(metadata(task="autoencoder", top="forecaster", **both))[0] == "autoencoder"
-    # the names written over time, normalised as anemoi-inference's runner registry does
+    # older names and spellings
     assert checkpoint_task(metadata(task="time-interpolator"))[0] == "temporal-downscaler"
     assert checkpoint_task(metadata(task="temporal_downscaler"))[0] == "temporal-downscaler"
     assert checkpoint_task(metadata(task="my.package.Task")) == (
@@ -226,7 +226,7 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted(caplog):
         check_task(accepted)
         check_output_offsets(accepted)
     assert not caplog.records
-    # a class the evaluation does not know is run as a forecaster, as anemoi-inference runs it
+    # an unknown class passes with a warning
     check_task(metadata(target="my.package.DAForecaster"))
     assert "config.task._target_: my.package.DAForecaster" in caplog.text
     for task, named in (
@@ -238,7 +238,7 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted(caplog):
     ):
         with pytest.raises(ValueError, match=f"task is {named}.*not supported yet"):
             check_task(metadata(**task))
-    # a task blocked upstream says so; one that is not blocked there does not blame anemoi-inference
+    # the anemoi-inference blocker is named only where there is one
     with pytest.raises(ValueError, match=r"not supported yet \(anemoi-inference has no runner for it\)"):
         check_task(metadata(task="autoencoder"))
     with pytest.raises(ValueError, match=r"not supported yet \(anemoi-inference runs it only through"):
@@ -254,7 +254,7 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted(caplog):
 
 
 def test_patch_metadata_overrides_the_task():
-    """anemoi-inference's `patch_metadata` is applied as its checkpoint applies it, so it can repair a task."""
+    """`patch_metadata` can repair a stored task."""
     stored = metadata(task="da_forecaster")
     for patch in (
         {"metadata_inference": {"task": "forecaster"}},
