@@ -283,6 +283,15 @@ def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
     return "forecaster", None
 
 
+def recorded_variables_metadata(metadata: Mapping, name: str) -> dict:
+    """The `variables_metadata` a checkpoint's metadata records for dataset `name` (either layout of the `dataset`
+    block), read before anemoi-inference fills in assumed entries."""
+    block = metadata.get("dataset") or {}
+    if "variables_metadata" not in block:
+        block = block.get(name) or {}
+    return dict(block.get("variables_metadata") or {})
+
+
 def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
     """`metadata` with a `patch_metadata` block applied to the first dataset, as anemoi-inference does."""
     if not patch:
@@ -406,6 +415,13 @@ class DatasetForecast:
         names = metadata.output_tensor_index_to_variable
         self.variables = [names[i] for i in range(len(names))]
         self.typed_variables = dict(metadata.typed_variables)
+        # anemoi-inference fills in assumed periods where the checkpoint records no `variables_metadata` (its legacy
+        # path), so a period counts as known only where the recorded metadata gives one
+        recorded = recorded_variables_metadata(source._recorded_metadata, name)
+        self._accumulation_periods = {
+            name: period if "period" in (recorded.get(name) or {}) else None
+            for name, period in accumulation_periods(self.typed_variables).items()
+        }
         arrays = metadata.supporting_arrays
         self.grid_indices = arrays.get("grid_indices")
         index = slice(None) if self.grid_indices is None else self.grid_indices
@@ -466,8 +482,9 @@ class DatasetForecast:
         return variable_info(self.typed_variables.get(name))
 
     def accumulation_periods(self) -> dict:
-        """The period of each accumulated variable of this dataset, as the checkpoint records it."""
-        return accumulation_periods(self.typed_variables)
+        """The period of each accumulated variable of this dataset, as the checkpoint records it; None when not
+        recorded."""
+        return dict(self._accumulation_periods)
 
     def describe(self) -> dict:
         """What the parent reports for this dataset."""
@@ -522,6 +539,7 @@ class InferenceForecastSource(ForecastSourceBase):
             # before the runner is built: the `auto` runner raises on a task it has no runner for
             metadata = load_metadata(Checkpoint(config.checkpoint).path)
             patched = patched_metadata(metadata, config.patch_metadata)
+            self._recorded_metadata = patched  # as stored (and patched), before the runner fills anything in
             self.task = check_task(patched)
             self.runner = create_runner(config)
             check_runner(self.task, self.runner, config.runner, (patched.get("metadata_inference") or {}).get("task"))
@@ -1010,7 +1028,7 @@ class InferenceForecastSource(ForecastSourceBase):
 
     def accumulation_periods(self) -> dict:
         """The period of each accumulated variable, as the checkpoint records it (its training dataset's)."""
-        return accumulation_periods(self.typed_variables)
+        return self.datasets[self.dataset_name].accumulation_periods()
 
     def provenance(self) -> dict:
         """Result-file attrs identifying the checkpoint: its path, uuid and training run id; once the model is loaded,

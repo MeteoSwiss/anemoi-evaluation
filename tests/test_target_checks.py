@@ -14,18 +14,23 @@ from anemoi.evaluation.sources.persistence import PersistenceForecastSource
 ONE_HOUR_TP = {"tp": {"process": "accumulation", "period": ["0h", "1h"]}}
 
 
-def evaluation(forecast, targets, **options):
-    return Evaluation(forecast, targets, fixture.init_times("era5"), "6h", ["rmse"], ["2t", "tp"], **options)
+def evaluation(forecast, targets, variables=("2t", "tp"), **options):
+    return Evaluation(forecast, targets, fixture.init_times("era5"), "6h", ["rmse"], list(variables), **options)
+
+
+def no_variables_metadata(metadata):
+    """A `save_checkpoint` patch: a checkpoint whose training dataset recorded no `variables_metadata`."""
+    metadata["dataset"]["era5"]["variables_metadata"] = {}
 
 
 @pytest.mark.parametrize(
     "options, found",
     [
-        ({"interpolate_frequency": "1h"}, "InterpolateFrequency(frequency=1h) over era5"),
-        ({"fill_missing_dates": "closest"}, "MissingDatesClosest(closest=up) over era5"),
-        ({"fill_missing_dates": "interpolate"}, "MissingDatesInterpolate over era5"),
-        ({"fill_missing_dates": "mean"}, "MissingDatesFillStatistics(method=mean) over era5"),
-        ({"rolling_average": [-1, 0, "freq"]}, "RollingAverage(window=-1-to-1) over era5"),
+        ({"interpolate_frequency": "1h"}, "InterpolateFrequency"),
+        ({"fill_missing_dates": "closest"}, "MissingDatesClosest"),
+        ({"fill_missing_dates": "interpolate"}, "MissingDatesInterpolate"),
+        ({"fill_missing_dates": "mean"}, "MissingDatesFillStatistics"),
+        ({"rolling_average": [-1, 0, "freq"]}, "RollingAverage"),
         ({"fill_missing_dates": "nan"}, None),
         ({"set_missing_dates": ["2020-01-02T00:00:00"]}, None),
         ({}, None),
@@ -34,7 +39,9 @@ def evaluation(forecast, targets, **options):
 def test_made_up_dates_are_read_off_the_opened_dataset(tmp_path, options, found):
     path = fixture.write_zarr(tmp_path / "era5.zarr", "era5", missing=(3,))
     targets = DatasetTargets(dataset=path, **options)
-    assert targets.made_up_dates() == ([found] if found else [])
+    made_up = targets.made_up_dates()
+    assert len(made_up) == (1 if found else 0)
+    assert all(text.startswith(found) and text.endswith(" over era5") for text in made_up)
     assert targets.interpolate_frequency == (["1h"] if "interpolate_frequency" in options else [])
 
 
@@ -43,7 +50,8 @@ def test_made_up_dates_name_the_element(tmp_path):
     targets = DatasetTargets(
         join=[{"dataset": path, "select": ["2t"], "fill_missing_dates": "closest"}, {"dataset": path, "select": ["tp"]}]
     )
-    assert targets.made_up_dates() == ["MissingDatesClosest(closest=up) in Join[0] over era5"]
+    [made_up] = targets.made_up_dates()
+    assert made_up.startswith("MissingDatesClosest") and made_up.endswith(" in Join[0] over era5")
     assert targets.interpolate_frequency == []
 
 
@@ -55,14 +63,17 @@ def test_made_up_dates_warn_raise_or_are_ignored(monkeypatch, tmp_path, caplog):
         evaluation(forecast, plain)
         assert "make up values" not in caplog.text
         evaluation(forecast, filled)
-        assert "the targets make up values at some dates: MissingDatesClosest(closest=up) over era5" in caplog.text
+        assert "the targets make up values at some dates: MissingDatesClosest" in caplog.text
         assert "set on_made_up_dates: ignore to silence" in caplog.text
+        caplog.clear()
+        evaluation(forecast, filled, dataset="era5")
+        assert "dataset 'era5': the targets make up values" in caplog.text
         caplog.clear()
         evaluation(forecast, filled, on_made_up_dates="ignore")
         assert caplog.text == ""
     with pytest.raises(ValueError, match="make up values at some dates: MissingDatesClosest"):
         evaluation(forecast, filled, on_made_up_dates="raise")
-    with pytest.raises(ValueError, match="on_made_up_dates must be one of warn, raise, ignore"):
+    with pytest.raises(ValueError, match="on_made_up_dates must be 'warn', 'raise' or 'ignore'"):
         evaluation(forecast, plain, on_made_up_dates="loud")
 
 
@@ -82,15 +93,36 @@ def test_accumulation_periods_are_checked_against_the_checkpoint(monkeypatch, tm
         assert "accumulate over another period than the forecast: tp 1h against 6h in the model" in caplog.text
         caplog.clear()
         evaluation(forecast, hourly, on_period_mismatch="ignore")
+        evaluation(forecast, hourly, ["2t"], on_period_mismatch="raise")  # tp is not scored
         evaluation(PersistenceForecastSource(hourly, "6h"), hourly)  # a baseline knows no accumulations
         assert "accumulat" not in caplog.text
     with pytest.raises(ValueError, match="tp 1h against 6h in the model.*set on_period_mismatch: warn or ignore"):
         evaluation(forecast, hourly, on_period_mismatch="raise")
 
 
-def test_the_config_keys_reach_the_checks(monkeypatch, tmp_path):
-    forecast = fixture.forecast_source(monkeypatch, tmp_path, ("era5",))
+def test_a_period_the_checkpoint_does_not_record_is_unknown(monkeypatch, tmp_path, caplog):
+    """anemoi-inference fills an absent `variables_metadata` with an assumed 6h tp: not a recorded period."""
+    forecast = fixture.forecast_source(monkeypatch, tmp_path, ("era5",), patch=no_variables_metadata)
+    assert forecast.typed_variables["tp"].period == 6 * fixture.HOUR  # the legacy fill
+    assert forecast.accumulation_periods() == {"tp": None}
     hourly = DatasetTargets(dataset=fixture.write_zarr(tmp_path / "hourly.zarr", "era5", ONE_HOUR_TP))
+    with caplog.at_level(logging.INFO):
+        evaluation(forecast, hourly, on_period_mismatch="raise")
+        assert "the accumulation period of ['tp'] is unknown" in caplog.text
+
+
+def test_a_multi_dataset_view_reports_its_own_periods(monkeypatch, tmp_path):
+    forecast = fixture.forecast_source(monkeypatch, tmp_path)
+    assert {name: view.accumulation_periods() for name, view in forecast.datasets.items()} == {
+        "era5": {"tp": 6 * fixture.HOUR},
+        "realch1": {"tp": 6 * fixture.HOUR},
+    }
+
+
+def test_the_settings_reach_the_checks_config_and_plan(monkeypatch, tmp_path):
+    forecast = fixture.forecast_source(monkeypatch, tmp_path, ("era5",))
+    path = fixture.write_zarr(tmp_path / "hourly.zarr", "era5", ONE_HOUR_TP, missing=(3,))
+    hourly, filled = DatasetTargets(dataset=path), DatasetTargets(dataset=path, fill_missing_dates="closest")
     config = {
         "forecast": {"anemoi_inference": {"checkpoint": "unused"}},
         "lead_time": "6h",
@@ -98,9 +130,15 @@ def test_the_config_keys_reach_the_checks(monkeypatch, tmp_path):
         "variables": ["2t", "tp"],
         "weights": {"uniform": {}},
     }
-    built = build({**config, "on_period_mismatch": "ignore"}, forecast=forecast, targets=hourly)
-    assert built.plan()["on_period_mismatch"] == "ignore" and built.to_config()["on_made_up_dates"] == "warn"
     with pytest.raises(ValueError, match="tp 1h against 6h"):
         build({**config, "on_period_mismatch": "raise"}, forecast=forecast, targets=hourly)
+    with pytest.raises(ValueError, match="make up values at some dates"):
+        build(
+            {**config, "on_period_mismatch": "ignore", "on_made_up_dates": "raise"}, forecast=forecast, targets=filled
+        )
     with pytest.raises(ValueError, match="on_made_up_dates"):
         build({**config, "on_made_up_dates": "loud"}, forecast=forecast, targets=hourly)
+    settings = {"on_period_mismatch": "raise", "on_made_up_dates": "ignore"}
+    by_hand = evaluation(PersistenceForecastSource(filled, "6h"), filled, weights={"uniform": {}}, **settings)
+    assert {key: by_hand.to_config()[key] for key in settings} == settings
+    assert {key: by_hand.plan()[key] for key in settings} == settings

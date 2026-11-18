@@ -7,14 +7,6 @@ import logging
 from anemoi.utils.dates import frequency_to_string
 
 LOG = logging.getLogger(__name__)
-ACTIONS = ("warn", "raise", "ignore")
-
-
-def check_action(key: str, value: str) -> str:
-    """`value` if it is one of `ACTIONS`; raises naming `key` otherwise."""
-    if value not in ACTIONS:
-        raise ValueError(f"{key} must be one of {', '.join(ACTIONS)}, got {value!r}")
-    return value
 
 
 def check_targets(
@@ -23,25 +15,28 @@ def check_targets(
     variables: list[str],
     on_period_mismatch: str = "warn",
     on_made_up_dates: str = "warn",
+    dataset: str | None = None,
 ) -> None:
     """Report scored accumulations whose period differs between the targets and the forecast, and target dates
-    anemoi-datasets made up; each problem is warned about, raised as a ValueError or ignored as configured."""
-    check_action("on_period_mismatch", on_period_mismatch)
-    check_action("on_made_up_dates", on_made_up_dates)
-    _report(on_period_mismatch, "on_period_mismatch", _period_mismatch(forecast, targets, variables))
-    _report(on_made_up_dates, "on_made_up_dates", _made_up_dates(forecast, targets))
-
-
-def _report(action: str, key: str, message: str | None) -> None:
-    if message is None or action == "ignore":
-        return
-    if action == "raise":
-        raise ValueError(f"{message} (set {key}: warn or ignore to score anyway)")
-    LOG.warning("%s (set %s: ignore to silence)", message, key)
+    anemoi-datasets made up; each problem is warned about (naming `dataset`), raised as a ValueError or ignored."""
+    actions = {"on_period_mismatch": on_period_mismatch, "on_made_up_dates": on_made_up_dates}
+    for key, action in actions.items():
+        if action not in ("warn", "raise", "ignore"):
+            raise ValueError(f"{key} must be 'warn', 'raise' or 'ignore', got {action!r}")
+    messages = {
+        "on_period_mismatch": _period_mismatch(forecast, targets, variables),
+        "on_made_up_dates": _made_up_dates(forecast, targets),
+    }
+    for key, message in messages.items():
+        if message is None or actions[key] == "ignore":
+            continue
+        if actions[key] == "raise":
+            raise ValueError(f"{message} (set {key}: warn or ignore to score anyway)")
+        LOG.warning("%s%s (set %s: ignore to silence)", f"dataset {dataset!r}: " if dataset else "", message, key)
 
 
 def _period_mismatch(forecast: object, targets: object, variables: list[str]) -> str | None:
-    """The accumulations whose periods differ; the ones with a period unknown on either side are logged."""
+    """The scored accumulations whose periods differ; the ones with a period unknown on either side are logged."""
     model = getattr(forecast, "accumulation_periods", dict)()
     truth = getattr(targets, "accumulation_periods", dict)()
     unknown, differ = [], []

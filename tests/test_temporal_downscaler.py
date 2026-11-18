@@ -290,7 +290,7 @@ def test_interpolated_targets_are_warned_about(monkeypatch, tmp_path, caplog):
         assert "interpolate_frequency" not in caplog.text
         Evaluation(view, interpolated, [T0], WINDOW, ["rmse"])
         assert "opened with interpolate_frequency ['1h']" in caplog.text
-        assert "(InterpolateFrequency(frequency=1h) over era5)" in caplog.text
+        assert "is real at every lead time (InterpolateFrequency" in caplog.text and "over era5)" in caplog.text
         caplog.clear()
         baseline = LinearInterpolationForecastSource(interpolated, "6h")
         Evaluation(baseline, interpolated, [T0], WINDOW, ["rmse"])

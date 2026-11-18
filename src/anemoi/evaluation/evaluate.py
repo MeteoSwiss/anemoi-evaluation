@@ -140,7 +140,7 @@ class Evaluation:
         forecast.grid.check_compatible(targets.grid)
         targets.prefetch_hint(forecast.frames_per_pass)
         self.variables = self._resolve_variables(variables)
-        check_targets(forecast, targets, self.variables, on_period_mismatch, on_made_up_dates)
+        check_targets(forecast, targets, self.variables, on_period_mismatch, on_made_up_dates, dataset)
         self.on_period_mismatch, self.on_made_up_dates = on_period_mismatch, on_made_up_dates
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)

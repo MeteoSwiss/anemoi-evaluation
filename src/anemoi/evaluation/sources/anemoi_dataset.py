@@ -37,19 +37,15 @@ MADE_UP_DATES = (
 )
 
 
-def made_up_dates(node: Any, where: tuple = ()) -> list[tuple[str, dict, str]]:
-    """The wrappers of an anemoi-datasets `tree()` that make values up at some dates: class name, options and a
-    description naming the element they sit in (`Cutout[1]`) and the zarrs below them."""
+def made_up_dates(node: Any, where: tuple = ()) -> list[tuple[Any, str]]:
+    """The nodes of an anemoi-datasets `tree()` whose wrapper makes values up at some dates, each with a description
+    naming the element it sits in (`Cutout[1]`) and the zarrs below it."""
     name = type(node.dataset).__name__
     found = []
     if name in MADE_UP_DATES:
         options = ", ".join(f"{key}={_option(value)}" for key, value in node.kwargs.items())
-        text = (
-            (f"{name}({options})" if options else name)
-            + (f" in {' > '.join(where)}" if where else "")
-            + f" over {', '.join(_zarrs(node))}"
-        )
-        found.append((name, dict(node.kwargs), text))
+        text = f"{name}({options})" if options else name
+        found.append((node, text + (f" in {' > '.join(where)}" if where else "") + f" over {', '.join(_zarrs(node))}"))
     for i, kid in enumerate(node.kids):
         found += made_up_dates(kid, where + ((f"{name}[{i}]",) if len(node.kids) > 1 else ()))
     return found
@@ -137,10 +133,15 @@ class DatasetTargets(TargetSourceBase):
         except (AttributeError, KeyError, TypeError):
             self.typed_variables = {}
         try:
-            tree = dataset.tree()
-        except (AttributeError, NotImplementedError):  # not an anemoi-datasets dataset
-            tree = None
-        self._made_up = made_up_dates(tree) if tree is not None else []
+            found = made_up_dates(dataset.tree())
+        except (AttributeError, NotImplementedError, TypeError):  # not an anemoi-datasets gridded dataset
+            found = []
+        self._made_up = [text for _, text in found]
+        self._interpolate_frequency = [
+            frequency_to_string(node.dataset.frequency)
+            for node, _ in found
+            if type(node.dataset).__name__ == "InterpolateFrequency"
+        ]
         dates = dataset.dates.astype("datetime64[us]").tolist()
         self._dates = dates
         self._index = {date: i for i, date in enumerate(dates)}
@@ -158,11 +159,11 @@ class DatasetTargets(TargetSourceBase):
     @property
     def interpolate_frequency(self) -> list[str]:
         """The frequencies of the `interpolate_frequency` wrappers anywhere in the dataset; empty when none."""
-        return [_option(options["frequency"]) for name, options, _ in self._made_up if name == "InterpolateFrequency"]
+        return list(self._interpolate_frequency)
 
     def made_up_dates(self) -> list[str]:
         """The wrappers of the dataset that make values up at some dates, each naming where it sits."""
-        return [text for _, _, text in self._made_up]
+        return list(self._made_up)
 
     def accumulation_periods(self) -> dict:
         """The period of each accumulated variable, from the dataset's `variables_metadata`."""
