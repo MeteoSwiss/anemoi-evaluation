@@ -245,10 +245,9 @@ When the evaluation is built, every scored variable the forecast source reports 
 (`accumulation_periods()`; an inference source reports the periods its checkpoint records, the
 baselines none) is compared with the period in the targets' `variables_metadata`, and a difference
 is warned about. A period unknown on either side, including one anemoi-inference fills in for a
-checkpoint that records no `variables_metadata`, is logged at info level and not checked. Targets
-read from the forecast's own dataset carry the checkpoint's metadata, and a cutout's metadata is
-its first element's, so neither can differ. Other variables processed over a period are not
-checked yet.
+checkpoint that records no `variables_metadata`, is logged at info level and not checked. A mismatch
+needs targets, or a forecast input, other than the checkpoint's training dataset; a cutout reports
+its first element's periods only. Other variables processed over a period are not checked yet.
 
 ### Multi-dataset checkpoints
 

@@ -282,8 +282,8 @@ class Evaluation:
             LOG.info("the accumulation period of %s is unknown in the targets or the forecast, not checked", unknown)
         if differ:
             LOG.warning(
-                "%sthe targets accumulate over another period than the forecast: %s in the model; the scores compare "
-                "totals over different periods",
+                "%sthe targets accumulate over another period than the checkpoint: %s in the checkpoint; the scores "
+                "compare totals over different periods (check the targets and the forecast input)",
                 f"dataset {self.dataset!r}: " if self.dataset else "",
                 ", ".join(differ),
             )

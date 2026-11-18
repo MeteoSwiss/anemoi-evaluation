@@ -16,7 +16,7 @@ from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
 from anemoi.evaluation.sources.persistence import PersistenceForecastSource
 
 ONE_HOUR_TP = {"process": "accumulation", "period": ["0h", "1h"]}
-MISMATCH = "the targets accumulate over another period than the forecast: tp 1h against 6h in the model"
+MISMATCH = "the targets accumulate over another period than the checkpoint: tp 1h against 6h in the checkpoint"
 
 
 def targets(name="era5", tp=None):
