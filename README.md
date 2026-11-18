@@ -162,7 +162,6 @@ src/anemoi/evaluation/
     __main__.py          command line: run and merge
     config.py            YAML config model (pydantic), base: inheritance, from_checkpoint
     evaluate.py          the driver: sources in, aggregation state out
-    checks.py            checks on the targets: accumulation periods, made-up dates
     frame.py             Grid and Frame, the data model shared by sources and the aggregator
     statistics.py        per-element statistics in float64
     aggregation.py       weighted, masked, binned sums over nodes and init times

@@ -152,8 +152,6 @@ before validation:
 | `climatology` | `ClimatologyConfig`, `{datasets: {name: ClimatologyConfig}}` or null | null | Required by `acc`. |
 | `output` | `{path: str}` or null | null | Result file path; required by `anemoi-evaluation run`. `{shard}` and `{shards}` are filled in; `{dataset}` is required by, and only allowed for, a run that scores multiple datasets. |
 | `on_missing_target` | `"skip"` or `"raise"` | `"skip"` | What to do when the target for a valid time is absent. `skip` logs a warning and drops that frame. |
-| `on_period_mismatch` | `"warn"`, `"raise"` or `"ignore"` | `"warn"` | What to do when a scored accumulation covers another period in the targets than in the forecast. See [target checks](#target-checks). |
-| `on_made_up_dates` | `"warn"`, `"raise"` or `"ignore"` | `"warn"` | What to do when the targets make values up at some dates. See [target checks](#target-checks). |
 | `include_lead_zero` | bool | `false` | Prepend a lead-0 frame from the initial state. Raises at construction when the forecast source has `supports_lead_zero = False`. A `MissingTargetError` from `initial_frame` for one init time is caught and logged as `no lead-0 frame for init <date>`; that init time is scored without its lead-0 frame. |
 | `log_level` | str | `"INFO"` | Level passed to `logging.basicConfig` by the CLI. |
 
@@ -242,35 +240,6 @@ in float64 rounded to float32. An init time missing either bound produces no fra
 Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no `targets:` block at
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
-
-#### Target checks
-
-Run when the evaluation is built, on metadata only, so a dry run shows them. Each problem is one
-warning (naming the dataset in a multi-dataset run), or a `ValueError` with `raise`; `ignore`
-silences it.
-
-- **Accumulation period** (`on_period_mismatch`). For every scored variable the forecast source
-  reports as an accumulation, the period recorded in the targets' `variables_metadata` must equal
-  the forecast's. An inference source reports the periods its checkpoint records, those of its
-  training dataset, and none that anemoi-inference fills in for a checkpoint that records no
-  `variables_metadata`. The baselines, and sources without `accumulation_periods()` or built on
-  `ForecastSourceBase`, report none, so they are not checked. A period unknown on either side is
-  logged at info level and not checked. Other variables processed over a period (averages, maxima,
-  minima) are not checked yet.
-- **What the period check cannot see.** Targets read from the forecast's own dataset (no
-  `targets` block) carry the same metadata as the checkpoint, so only an explicit `targets` block
-  can differ. A cutout's `variables_metadata` is its first element's, so a different period in
-  another element is not seen.
-- **Made-up dates** (`on_made_up_dates`). The opened dataset's `tree()` is searched for the
-  anemoi-datasets wrappers that compute values at some dates instead of reading them:
-  `InterpolateFrequency` (`interpolate_frequency`), `MissingDatesClosest`, `MissingDatesInterpolate`
-  and `MissingDatesFillStatistics` (`fill_missing_dates: closest`, `interpolate`, `mean`,
-  `maximum`, `minimum`) and `RollingAverage` (`rolling_average`). The warning fires when one is
-  present, whether or not it changes a scored date, and names it, the element it sits in (`Cutout[1]`)
-  and the zarrs below it. `fill_missing_dates: nan`, `set_missing_dates` and `skip_missing_dates`
-  make nothing up. For a temporal downscaler or its baseline, `interpolate_frequency` gets the
-  wording of the [temporal downscalers](user-guide.md#temporal-downscalers) section. Target sources
-  report these wrappers through `made_up_dates()`; one without it reports none.
 
 ### Multi-dataset checkpoints
 
@@ -875,13 +844,11 @@ listed in this section is internal and may change without notice.
 ```python
 Evaluation(forecast, targets, init_times, lead_time, metrics, variables=None, weights=None,
            regions=None, bins=None, device=None, on_missing_target="skip",
-           include_lead_zero=False, climatology=None, dataset=None, on_period_mismatch="warn",
-           on_made_up_dates="warn")
+           include_lead_zero=False, climatology=None)
 ```
 
 The object behind the config. Construction validates the arguments, checks the grids for compatibility,
-resolves the variables, runs the [target checks](#target-checks) and calls
-`forecast.check_init_times(init_times, lead_time)`; it loads no model.
+resolves the variables and calls `forecast.check_init_times(init_times, lead_time)`; it loads no model.
 Weights and regions given as specs are resolved on first use.
 
 | Method | Returns |
@@ -1140,8 +1107,7 @@ close() -> None
 `ForecastSourceBase`, `TargetSourceBase` and `ClimatologySourceBase` implement the optional capabilities
 with defaults: no device preference, no graph, no date check, no sub-grids, no lead-0 frame,
 `frames_per_pass = 1`, `model_calls` counting `frames_per_pass` evenly spaced lead times per call, empty
-`stats` and `provenance`, unknown `variable_info`, no accumulation periods or made-up dates for the
-[target checks](#target-checks), and `to_config()` raising.
+`stats` and `provenance`, unknown `variable_info`, and `to_config()` raising.
 Their `describe()` reports the class name, the node count and the variable count, and the forecast base
 adds `members`. Helpers: `lead_time_steps(lead_time, timestep)`, `variable_info(variable)`,
 `select_variables(requested, available)`.

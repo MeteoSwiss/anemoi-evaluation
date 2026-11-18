@@ -135,8 +135,6 @@ evaluation = ae.Evaluation(
     regions,
     config.bins.model_dump(),
     on_missing_target=config.on_missing_target,
-    on_period_mismatch=config.on_period_mismatch,
-    on_made_up_dates=config.on_made_up_dates,
     **extra,
 )
 variables = evaluation.variables

@@ -247,41 +247,6 @@ def make_runner(checkpoint: str | Path, names: tuple[str, ...] = DATASET_NAMES, 
     return runner
 
 
-def write_zarr(path: Path, name: str, variables_metadata: dict | None = None, missing: tuple = ()) -> str:
-    """The fixture's dataset `name` written as a small anemoi-datasets zarr, for `open_dataset` and its wrappers;
-    `variables_metadata` replaces entries of the fixture's, `missing` lists rows recorded as missing dates."""
-    import zarr
-
-    dataset = FixtureDataset(name)
-    metadata = {**load_metadata()["dataset"][name]["variables_metadata"], **(variables_metadata or {})}
-    data = np.stack([dataset.row(i)[:, None, :] for i in range(len(dataset))])
-    root = zarr.open_group(str(path), mode="w")
-    create = getattr(root, "create_array", None) or root.create_dataset  # zarr 3, zarr 2
-    create("data", data=data, chunks=(1, *data.shape[1:]))
-    create("dates", data=dataset.dates)
-    create("latitudes", data=dataset.latitudes)
-    create("longitudes", data=dataset.longitudes)
-    for statistic, value in (("mean", dataset.mean), ("stdev", dataset.stdev)):
-        create(statistic, data=np.asarray(value, dtype=np.float64))
-    for statistic in ("maximum", "minimum"):
-        create(statistic, data=np.zeros(len(dataset.variables)))
-    root.attrs.update(
-        frequency="6h",
-        resolution="fixture",
-        variables=dataset.variables,
-        name_to_index=dataset.name_to_index,
-        variables_metadata=metadata,
-        constant_fields=[],
-        start_date=dataset._dates[0].isoformat(),
-        end_date=dataset._dates[-1].isoformat(),
-        missing_dates=[dataset._dates[i].isoformat() for i in missing],
-        data_request={"grid": 1, "area": "g", "param_level": {}},
-        ensemble_dimension=2,
-        flatten_grid=True,
-    )
-    return str(path)
-
-
 def make_targets(name: str, **kwargs: Any) -> DatasetTargets:
     """Targets over the same fixture dataset the forecast is initialised from."""
     return DatasetTargets.from_dataset(FixtureDataset(name), kwargs={"dataset": f"fixture-{name}"}, **kwargs)

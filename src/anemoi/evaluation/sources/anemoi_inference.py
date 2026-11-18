@@ -419,8 +419,8 @@ class DatasetForecast:
         # path), so a period counts as known only where the recorded metadata gives one
         recorded = recorded_variables_metadata(source._recorded_metadata, name)
         self._accumulation_periods = {
-            variable: period if "period" in (recorded.get(variable) or {}) else None
-            for variable, period in accumulation_periods(self.typed_variables).items()
+            name: period if "period" in (recorded.get(name) or {}) else None
+            for name, period in accumulation_periods(self.typed_variables).items()
         }
         arrays = metadata.supporting_arrays
         self.grid_indices = arrays.get("grid_indices")

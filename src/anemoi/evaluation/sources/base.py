@@ -207,10 +207,6 @@ class ForecastSourceBase:
         """Unknown."""
         return variable_info(None)
 
-    def accumulation_periods(self) -> dict[str, datetime.timedelta | None]:
-        """No accumulations known."""
-        return {}
-
     def provenance(self) -> dict:
         """Nothing to record."""
         return {}
@@ -269,14 +265,6 @@ class TargetSourceBase:
     def variable_info(self, name: str) -> dict:
         """Unknown."""
         return variable_info(None)
-
-    def accumulation_periods(self) -> dict[str, datetime.timedelta | None]:
-        """No accumulations known."""
-        return {}
-
-    def made_up_dates(self) -> list[str]:
-        """None known."""
-        return []
 
     def to_config(self) -> dict:
         """Not serialisable."""

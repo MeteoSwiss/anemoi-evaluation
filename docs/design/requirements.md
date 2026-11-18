@@ -103,13 +103,6 @@ targets are opened with `interpolate_frequency`.
 are planned (MeteoSwiss/anemoi-evaluation#5). Interpolated targets would score the distance to an
 interpolation, not to the truth.*
 
-**FR-41** Before a run, the package MUST warn, or refuse when configured, when a scored
-accumulation covers another period in the targets than in the checkpoint, and when the targets
-make values up at some dates (interpolated, filled or averaged by anemoi-datasets).
-*Rationale: a 1 h total scored against a 6 h one, or a filled date scored as truth, gives plausible
-numbers that mean nothing; both are visible in the metadata, so the check needs no model
-(MeteoSwiss/anemoi-evaluation#7).*
-
 **FR-7** Before a run, the package MUST refuse init times whose rollout would read dates absent
 from, or listed as missing in, the datasets the runner reads.
 *Rationale: a failure 40 minutes into a job array is expensive, and this check needs no model.*
