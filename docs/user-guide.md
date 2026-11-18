@@ -45,7 +45,8 @@ in the [reference](reference.md); the reasons behind the design are in the
   `state_sum_hit_heavy`.
 - **Weights** are one float per node and **regions** are boolean node masks, so a result is a
   weighted mean over the nodes of a region; regions may overlap. A **time bin** is the second
-  aggregation axis (season, month, date or a single bin); lead time is always its own axis.
+  aggregation axis (season, month, hour of day, date or a single bin); lead time is always its own
+  axis.
 - A checkpoint may be trained on several **datasets**, each with its own grid and variables. Such
   a run is one evaluation per dataset sharing one rollout, and it writes one result file per
   dataset (see [Multi-dataset checkpoints](#multi-dataset-checkpoints)).
@@ -365,9 +366,10 @@ Bins are the second aggregation axis:
 bins: {time: season, by: init_time}
 ```
 
-`time` is `season` (DJF, MAM, JJA, SON), `month` (`01` to `12`), `init_time` (one bin per date) or
-`none` (a single bin `all`); `by` is `init_time` or `valid_time`. Whatever the binning, the result
-file also carries a derived `all` bin, summed over the stored bins *before* the division, so
+`time` is `season` (DJF, MAM, JJA, SON), `month` (`01` to `12`), `hour` (the hour of day, `00` to
+`23`), `init_time` (one bin per date) or `none` (a single bin `all`); `by` is `init_time` or
+`valid_time`. `{time: hour, by: valid_time}` gives the diurnal cycle. Whatever the binning, the
+result file also carries a derived `all` bin, summed over the stored bins *before* the division, so
 `bin="all"` is the number over the whole run.
 
 ## Anomaly correlation with a climatology

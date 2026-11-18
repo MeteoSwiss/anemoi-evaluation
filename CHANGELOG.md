@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
+  diurnal cycle.
+
 ## 0.4.0 — 2026-11-18
 
 Offset forecasters and, for now between analysis bounds, temporal downscalers are scored, and the

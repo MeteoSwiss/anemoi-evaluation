@@ -292,10 +292,10 @@ mapping into the `(N, R)` matrix. The API boundary is the array, not the spec: t
 maps YAML onto these builders (FR-20, FR-21), and a notebook can pass arrays directly.
 
 `binning.py` implements the second state axis as a protocol with `kind`, `by`, `coords` and
-`index(frame)`: `SeasonBinning`, `MonthBinning`, `InitTimeBinning` and `NoBinning`, each keyed on
-the frame's init time or valid time (FR-22). `InitTimeBinning` with `by: valid_time` enumerates
-every valid time the init times reach, which is why shards must be built from the full init-time
-list for their bin coordinates to match.
+`index(frame)`: `SeasonBinning`, `MonthBinning`, `HourBinning`, `InitTimeBinning` and `NoBinning`,
+each keyed on the frame's init time or valid time (FR-22). `InitTimeBinning` with `by: valid_time`
+enumerates every valid time the init times reach, which is why shards must be built from the full
+init-time list for their bin coordinates to match.
 
 ### 3.9 The driver: `evaluate.py`
 

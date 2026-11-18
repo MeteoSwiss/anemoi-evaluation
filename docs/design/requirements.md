@@ -215,11 +215,12 @@ graph attributes and the sub-grids of a cutout dataset, and MAY overlap. At leas
 be configured, the default being one global region. Regions are per scored dataset: a mask is
 built over that dataset's grid, and a graph attribute is read from that dataset's node set.
 
-**FR-22** Time binning MUST offer at least seasonal, monthly, per-date and no binning, keyed on
-either the init time or the valid time of a frame. Lead time MUST always be an axis and never a
-bin, and the total over bins MUST be derived on output rather than stored. Per-date bins keyed by
-valid time MUST be built from the full init-time list in every shard, or the bin coordinates will
-not match at merge time.
+**FR-22** Time binning MUST offer at least seasonal, monthly, hour-of-day, per-date and no
+binning, keyed on either the init time or the valid time of a frame. Lead time MUST always be an
+axis and never a bin, and the total over bins MUST be derived on output rather than stored.
+Per-date bins keyed by valid time MUST be built from the full init-time list in every shard, or the
+bin coordinates will not match at merge time; hour-of-day bins MUST carry all 24 hours for the
+same reason.
 
 ### 3.5 Interfaces
 
