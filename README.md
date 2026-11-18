@@ -173,7 +173,7 @@ src/anemoi/evaluation/
 tests/                   CPU-only test suite on the in-memory fakes
 tools/                   validation, comparison and climatology scripts (not part of the package)
 docs/                    user guide, reference, design documents, benchmarks, contributing
-.github/workflows/ci.yml CI: pre-commit, tests on Python 3.11 and 3.13
+.github/workflows/ci.yml CI: pre-commit, tests on Python 3.11 and 3.13, nightly tests on upstream main
 ```
 
 ## License
