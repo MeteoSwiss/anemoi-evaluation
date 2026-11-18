@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime
 import gc
 import hashlib
@@ -248,7 +249,7 @@ TASK_ALIASES = {"time-interpolator": "temporal-downscaler"}
 
 def task_name(value: str) -> str:
     """The task name of a stored task: a class path by its class name, a name with `_` as `-`, as anemoi-inference's
-    runner registry does; an unknown class path is returned as is."""
+    runner registry does; a class path the table does not know is returned as is."""
     cls = value.rsplit(".", 1)[-1]
     if cls in TASK_CLASSES:
         return TASK_CLASSES[cls]
@@ -259,12 +260,14 @@ def task_name(value: str) -> str:
 
 
 def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
-    """The checkpoint's task and where it was read (`None` for the default): `metadata_inference.task`, then
-    `config.task._target_`, then `config.training.model_task`, else `forecaster` as anemoi-inference assumes."""
+    """The checkpoint's task and where it was read (`None` for the default): the task names in
+    `metadata_inference.task`, then the top-level `task` (anemoi-core #896 to #1450), then the class paths in
+    `config.task._target_` and `config.training.model_task`, else `forecaster`, anemoi-inference's default."""
     config = metadata.get("config") or {}
     task = config.get("task")
     candidates = (
         ("metadata_inference.task", (metadata.get("metadata_inference") or {}).get("task")),
+        ("task", metadata.get("task")),
         ("config.task._target_", task.get("_target_") if isinstance(task, Mapping) else None),
         ("config.training.model_task", (config.get("training") or {}).get("model_task")),
     )
@@ -274,10 +277,34 @@ def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
     return "forecaster", None
 
 
+def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
+    """`metadata` with anemoi-inference's `patch_metadata` applied as its checkpoint applies it to the first dataset,
+    the view its `auto` runner reads the task from."""
+    if not patch:
+        return metadata
+    from anemoi.inference.config.utils import multi_datasets_config
+
+    names = list((metadata.get("metadata_inference") or {}).get("dataset_names") or ["data"])
+
+    def merge(main: dict, update: Mapping) -> None:
+        for key, value in update.items():
+            if isinstance(value, Mapping) and isinstance(main.get(key, {}), Mapping):
+                merge(main.setdefault(key, {}), value)
+            else:
+                main[key] = value
+
+    result = copy.deepcopy(dict(metadata))
+    merge(result, multi_datasets_config(patch, names[0], names, strict=False))
+    return result
+
+
 def check_task(metadata: Mapping) -> None:
-    """Refuse a checkpoint whose task is not a forecaster, from its metadata."""
+    """Refuse a checkpoint whose task is not a forecaster, from its metadata. A class path the evaluation does not know
+    is let through with a warning, since anemoi-inference runs such a checkpoint as a forecaster."""
     task, origin = checkpoint_task(metadata)
-    if task not in SUPPORTED_TASKS:
+    if task not in SUPPORTED_TASKS and "." in task:
+        LOG.warning("unknown task class (%s), the checkpoint is evaluated as a forecaster", origin)
+    elif task not in SUPPORTED_TASKS:
         raise ValueError(
             f"the checkpoint's task is {task!r} ({origin}): only forecasters ({', '.join(SUPPORTED_TASKS)}) can be "
             "evaluated, see MeteoSwiss/anemoi-evaluation#5"
@@ -454,7 +481,7 @@ class InferenceForecastSource(ForecastSourceBase):
             config = RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"})
             # before the runner: anemoi-inference's `auto` runner raises on a task it has no runner for
             metadata = load_metadata(Checkpoint(config.checkpoint).path)
-            check_task(metadata)
+            check_task(patched_metadata(metadata, config.patch_metadata))
             self.runner = create_runner(config)
         self.dataset_names = list(self.runner.dataset_names)
         # One cache per dataset: the arrays depend on the state's latitudes and longitudes, so a single cache

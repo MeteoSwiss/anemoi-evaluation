@@ -17,6 +17,7 @@ from anemoi.evaluation.sources.anemoi_inference import checkpoint_task
 from anemoi.evaluation.sources.anemoi_inference import create_input_state
 from anemoi.evaluation.sources.anemoi_inference import inference_chunks
 from anemoi.evaluation.sources.anemoi_inference import inference_env
+from anemoi.evaluation.sources.anemoi_inference import patched_metadata
 
 HOUR = datetime.timedelta(hours=1)
 T0 = datetime.datetime(2024, 1, 1)
@@ -167,9 +168,10 @@ def test_create_input_state_speaks_both_anemoi_inference_signatures():
     assert create_input_state(From013(), init_time, lagged) == {"dates": [datetime.datetime(2022, 1, 1, 18), init_time]}
 
 
-def metadata(task=None, target=None, model_task=None, **timesteps) -> dict:
+def metadata(task=None, top=None, target=None, model_task=None, **timesteps) -> dict:
     """Checkpoint metadata carrying a task at each level anemoi-core has stored one, and one dataset's timesteps."""
     return {
+        "task": top,
         "metadata_inference": {
             "task": task,
             "dataset_names": ["ds"],
@@ -196,7 +198,12 @@ def test_checkpoint_task_reads_each_level_anemoi_core_has_stored():
         "model_task": "anemoi.training.train.tasks.GraphForecaster",
     }
     assert checkpoint_task(metadata(**both))[0] == "offset-forecaster"
-    assert checkpoint_task(metadata(task="autoencoder", **both))[0] == "autoencoder"
+    # the top-level name (anemoi-core #896 to #1450) wins over the class paths, `metadata_inference.task` over it
+    assert checkpoint_task(metadata(top="temporal-downscaler", **both)) == (
+        "temporal-downscaler",
+        "task: temporal-downscaler",
+    )
+    assert checkpoint_task(metadata(task="autoencoder", top="forecaster", **both))[0] == "autoencoder"
     # the names written over time, normalised as anemoi-inference's runner registry does
     assert checkpoint_task(metadata(task="time-interpolator"))[0] == "temporal-downscaler"
     assert checkpoint_task(metadata(task="temporal_downscaler"))[0] == "temporal-downscaler"
@@ -206,9 +213,11 @@ def test_checkpoint_task_reads_each_level_anemoi_core_has_stored():
     )
 
 
-def test_only_forecasters_on_the_lead_time_grid_are_accepted():
+def test_only_forecasters_on_the_lead_time_grid_are_accepted(caplog):
     for accepted in (
         {},
+        metadata(target="anemoi.training.tasks.Forecaster"),  # most checkpoints of anemoi-core #896 to #1450
+        metadata(top="forecaster", target="anemoi.training.tasks.Forecaster"),
         metadata(model_task="anemoi.training.train.tasks.GraphEnsForecaster"),
         metadata(task="forecaster"),
         metadata(task="offset-forecaster", output_offsets=["6h", "12h"], rollout_shift="12h"),
@@ -216,8 +225,13 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted():
     ):
         check_task(accepted)
         check_output_offsets(accepted)
+    assert not caplog.records
+    # a class the evaluation does not know is run as a forecaster, as anemoi-inference runs it
+    check_task(metadata(target="my.package.DAForecaster"))
+    assert "config.task._target_: my.package.DAForecaster" in caplog.text
     for task, named in (
         ({"task": "temporal-downscaler"}, "'temporal-downscaler' \\(metadata_inference.task"),
+        ({"top": "da_forecaster"}, "'da-forecaster' \\(task: da_forecaster"),
         ({"target": "anemoi.training.tasks.Autoencoder"}, "'autoencoder' \\(config.task._target_"),
         ({"model_task": "anemoi.training.train.tasks.GraphAutoEncoder"}, "'autoencoder' \\(config.training"),
         ({"task": "spatial-downscaler"}, "'spatial-downscaler'"),
@@ -228,3 +242,18 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted():
         check_output_offsets(metadata(task="offset-forecaster", output_offsets=["6h", "12h", "24h"]))
     with pytest.raises(ValueError, match=r"offsets \['12h'\] with rollout shift 12h"):
         check_output_offsets(metadata(task="offset-forecaster", output_offsets=["12h"], rollout_shift="12h"))
+    with pytest.raises(ValueError, match=r"offsets \['6h', '12h'\] with rollout shift 6h"):
+        check_output_offsets(metadata(task="offset-forecaster", output_offsets=["6h", "12h"], rollout_shift="6h"))
+
+
+def test_patch_metadata_overrides_the_task():
+    """anemoi-inference's `patch_metadata` is applied as its checkpoint applies it, so it can repair a task."""
+    stored = metadata(task="da_forecaster")
+    for patch in (
+        {"metadata_inference": {"task": "forecaster"}},
+        {"ds": {"metadata_inference": {"task": "forecaster"}}},
+    ):
+        check_task(patched_metadata(stored, patch))
+    assert patched_metadata(stored, {}) is stored and stored["metadata_inference"]["task"] == "da_forecaster"
+    with pytest.raises(ValueError, match="'autoencoder'"):
+        check_task(patched_metadata(metadata(), {"metadata_inference": {"task": "autoencoder"}}))

@@ -340,11 +340,16 @@ def test_other_tasks_and_offsets_are_refused(tmp_path, monkeypatch):
     def patch(metadata):
         metadata["metadata_inference"]["task"] = "temporal-downscaler"
 
-    checkpoint = fixture.save_checkpoint(tmp_path / "downscaler.ckpt", patch=patch)
+    checkpoint = fixture.save_checkpoint(tmp_path / "temporal.ckpt", patch=patch)
     configs = fixture.patch_create_runner(monkeypatch, checkpoint)
     with pytest.raises(ValueError, match="task is 'temporal-downscaler'"):
         InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
     assert configs == []
+    # an explicit runner does not change what the model computes; `patch_metadata` is the override
+    with pytest.raises(ValueError, match="task is 'temporal-downscaler'"):
+        InferenceForecastSource(checkpoint=str(checkpoint), device="cpu", runner="default")
+    fix = {"metadata_inference": {"task": "forecaster"}}
+    assert InferenceForecastSource(checkpoint=str(checkpoint), device="cpu", patch_metadata=fix).dataset_names
 
     def skip_a_step(metadata):
         metadata["metadata_inference"]["task"] = "offset-forecaster"
