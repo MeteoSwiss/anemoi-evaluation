@@ -46,33 +46,16 @@ def create_input_state(source: object, init_time: datetime.datetime, lagged: lis
     return source.create_input_state(date=init_time)
 
 
-def rollout_schedule(
-    lead_time: datetime.timedelta, output_offsets: list[datetime.timedelta], rollout_shift: datetime.timedelta
-) -> list[tuple[int, datetime.timedelta]]:
-    """The outputs a rollout up to `lead_time` yields, in order, as `(model call, lead time)`.
-
-    As anemoi-inference's runner does: it makes `ceil(lead_time / rollout_shift)` calls, call `s` outputs
-    `s * rollout_shift + offset` for every output offset, and the outputs beyond `lead_time` are not yielded. A forecaster
-    (output offsets `timestep, ..., n * timestep`, shift `n * timestep`) gives `k * timestep`."""
-    calls = math.ceil(lead_time / rollout_shift)
-    return [
-        (call, call * rollout_shift + offset)
-        for call in range(calls)
-        for offset in output_offsets
-        if call * rollout_shift + offset <= lead_time
-    ]
-
-
 def required_dates(
     init_time: datetime.datetime,
     input_offsets: list[datetime.timedelta],
+    output_offsets: list[datetime.timedelta],
+    rollout_shift: datetime.timedelta,
     lead_time: datetime.timedelta | None = None,
-    output_offsets: list[datetime.timedelta] = (),
-    rollout_shift: datetime.timedelta | None = None,
 ) -> list[datetime.datetime]:
     """Dates an input reads, sorted: `init_time` plus every input offset, plus, for forcings read during the rollout
-    (`lead_time` given), the output dates of every model call but the last, at which anemoi-inference's runner loads
-    the next call's forcings (all of them, also the ones the next input does not use)."""
+    (`lead_time` given), every output date of each model call but the last, at which the runner loads the next call's
+    forcings."""
     dates = {init_time + offset for offset in input_offsets}
     if lead_time is not None:
         calls = math.ceil(lead_time / rollout_shift)
@@ -332,27 +315,24 @@ def check_rollout_timing(
     output_offsets: list[datetime.timedelta],
     rollout_shift: datetime.timedelta,
 ) -> None:
-    """Refuse the input and output offsets the evaluation cannot score yet.
-
-    The last input offset must be `0h`: anemoi-inference starts the rollout at the last input date, and the lead times
-    are counted from the init time. The output offsets must be positive, increasing and span less than the rollout
-    shift, so that every lead time comes from one model call and the lead times increase along the rollout."""
-    if not input_offsets or input_offsets[-1] != datetime.timedelta(0):
-        raise ValueError(
-            f"the input offsets {[frequency_to_string(offset) for offset in input_offsets]} do not end at 0h: "
-            "not supported yet, see MeteoSwiss/anemoi-evaluation#5"
-        )
+    """Refuse a timing anemoi-core's `OffsetForecaster` does not produce (a hand-edited or patched checkpoint): the
+    last input offset `0h`, positive increasing output offsets, a rollout shift that is one of them and longer than
+    their span. The lead times rely on it: counted from the init time, one model call each, increasing."""
     increasing = all(a < b for a, b in zip(output_offsets, output_offsets[1:]))
-    if (
-        not output_offsets
-        or output_offsets[0] <= datetime.timedelta(0)
-        or not increasing
-        or output_offsets[-1] - output_offsets[0] >= rollout_shift
+    if not (
+        input_offsets
+        and input_offsets[-1] == datetime.timedelta(0)
+        and output_offsets
+        and output_offsets[0] > datetime.timedelta(0)
+        and increasing
+        and rollout_shift in output_offsets
+        and output_offsets[-1] - output_offsets[0] < rollout_shift
     ):
         raise ValueError(
-            f"the output offsets {[frequency_to_string(offset) for offset in output_offsets]} with rollout shift "
-            f"{frequency_to_string(rollout_shift)} are not positive, increasing and within one rollout shift, so model "
-            "calls would repeat or reorder lead times: not supported yet, see MeteoSwiss/anemoi-evaluation#5"
+            f"invalid checkpoint timing: input offsets {[frequency_to_string(o) for o in input_offsets]}, output "
+            f"offsets {[frequency_to_string(o) for o in output_offsets]}, rollout shift "
+            f"{frequency_to_string(rollout_shift)}; the last input offset must be 0h and the output offsets positive, "
+            "increasing and spanning less than the rollout shift, which must be one of them"
         )
 
 
@@ -524,7 +504,6 @@ class InferenceForecastSource(ForecastSourceBase):
         self.multi_step_input = self.runner.checkpoint.multi_step_input
         self.multi_step_output = self.runner.checkpoint.multi_step_output
         self._check_shared_timing()
-        # `timestep * k` for a forecaster; an offset forecaster's own offsets otherwise
         self.input_offsets = list(self.runner.checkpoint.lagged)
         self.output_offsets = list(self.runner.checkpoint.output_offsets)
         self.output_horizon = self.runner.checkpoint.rollout_shift
@@ -613,9 +592,20 @@ class InferenceForecastSource(ForecastSourceBase):
         return self.runner.device
 
     def lead_times(self, lead_time: datetime.timedelta) -> list[datetime.timedelta]:
-        """Lead times of the model's outputs up to `lead_time`, `k * output_horizon + offset` for every output offset
-        (`k * timestep` for a forecaster); warns when the model's last call computes beyond `lead_time`."""
-        lead_time_steps(lead_time, self.timestep)  # raises unless a positive multiple of the timestep
+        """Lead times of the model's outputs up to `lead_time` (see `rollout_schedule`); warns when the model's last
+        call computes beyond `lead_time`. A forecaster's `lead_time` must be a multiple of its timestep."""
+        n = len(self.output_offsets)
+        regular = self.output_offsets == [(i + 1) * self.timestep for i in range(n)]
+        if regular and self.output_horizon == n * self.timestep:
+            lead_time_steps(lead_time, self.timestep)  # raises unless a positive multiple of the timestep
+        elif lead_time <= datetime.timedelta(0):
+            raise ValueError(f"lead time {lead_time} must be positive")
+        leads = [lead for _, lead in self.rollout_schedule(lead_time)]
+        if not leads:
+            raise ValueError(
+                f"lead time {frequency_to_string(lead_time)} is shorter than the model's first output offset "
+                f"{frequency_to_string(self.output_offsets[0])}"
+            )
         calls, computed = self.model_calls(lead_time)
         if computed > lead_time:
             LOG.warning(
@@ -627,11 +617,19 @@ class InferenceForecastSource(ForecastSourceBase):
                 frequency_to_string(self.output_horizon),
                 frequency_to_string(lead_time),
             )
-        return [lead for _, lead in self.rollout_schedule(lead_time)]
+        return leads
 
     def rollout_schedule(self, lead_time: datetime.timedelta) -> list[tuple[int, datetime.timedelta]]:
-        """`(model call, lead time)` of every frame a rollout up to `lead_time` yields, in order."""
-        return rollout_schedule(lead_time, self.output_offsets, self.output_horizon)
+        """`(model call, lead time)` of every frame a rollout up to `lead_time` yields, in order: as anemoi-inference's
+        runner, `ceil(lead_time / output_horizon)` calls, call `k` at `k * output_horizon + offset` for every output
+        offset, the outputs beyond `lead_time` dropped."""
+        shift = self.output_horizon
+        return [
+            (call, call * shift + offset)
+            for call in range(math.ceil(lead_time / shift))
+            for offset in self.output_offsets
+            if call * shift + offset <= lead_time
+        ]
 
     def model_calls(self, lead_time: datetime.timedelta) -> tuple[int, datetime.timedelta]:
         """Model calls a rollout up to `lead_time` makes and the lead time the last one computes."""
@@ -676,8 +674,7 @@ class InferenceForecastSource(ForecastSourceBase):
                 self.runner.run(input_states=states, lead_time=lead_time, return_numpy=False)
                 for _ in range(self.members)
             ]
-            # The frames the runner yields, in order, with the model call each comes from: the global RNG is reseeded
-            # before the `next()` that makes a call, and every yielded step is checked against its lead time.
+            # reseeded before the `next()` that makes a call; every yielded step must be the scheduled one
             schedule = self.rollout_schedule(lead_time)
             try:
                 for step_index in itertools.count():
@@ -691,17 +688,14 @@ class InferenceForecastSource(ForecastSourceBase):
                     if all(output is None for output in outputs) and lead is None:
                         return
                     if any(output is None for output in outputs):
-                        raise RuntimeError(
-                            f"the rollout at {init_time} stopped at step {step_index} before lead time {lead} "
-                            "(members out of step, or fewer outputs than the checkpoint's offsets give)"
-                        )
+                        raise RuntimeError(f"members out of step, or fewer outputs than scheduled, at {init_time}")
                     step, date = outputs[0][names[0]]["step"], outputs[0][names[0]]["date"]
                     if any(output[names[0]]["step"] != step for output in outputs):
                         raise RuntimeError(f"members out of step at {init_time} + {step}")
+                    if lead is None:
+                        raise RuntimeError(f"the runner yielded more outputs than scheduled at {init_time} + {step}")
                     if step != lead:
-                        raise RuntimeError(
-                            f"the runner yielded step {step} at {init_time} where lead time {lead} was due"
-                        )
+                        raise RuntimeError(f"the runner yielded step {step} at {init_time}, lead time {lead} was due")
                     frames = {}
                     for name in names:
                         columns = list(variables[name])
@@ -779,9 +773,9 @@ class InferenceForecastSource(ForecastSourceBase):
                     required = required_dates(
                         init_time,
                         self.input_offsets,
-                        lead_time if rollout else None,
                         self.output_offsets,
                         self.output_horizon,
+                        lead_time if rollout else None,
                     )
                     absent = missing_dates(required, available, missing)
                     if absent:
