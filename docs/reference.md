@@ -506,6 +506,7 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `bias` | `bias` | `error` | `mean(error)` | 1 |
 | `mae` | `mae` | `absolute_error` | `mean(absolute_error)` | 1 |
 | `rmse` | `rmse` | `squared_error` | `sqrt(mean(squared_error))` | 1 |
+| `error_std` | `error_std` | `error`, `squared_error` | `sqrt(max(mean(squared_error) - mean(error)^2, 0))` | 1 |
 | `crps` | `crps` or `{crps: {alpha: a}}` | `skill`, `pairs` | `mean(skill) - c(alpha, M) * mean(pairs)` | 2 |
 | `fair_crps` | `fair_crps` | `skill`, `pairs` | the same with `alpha = 1` | 2 |
 | `spread` | `spread` | `ensemble_variance` | `sqrt(mean(ensemble_variance))` | 2 |
@@ -513,6 +514,7 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `member_rmse` | `member_rmse` | `member_squared_error` | `sqrt(mean(member_squared_error))` | 1 |
 | `member_mae` | `member_mae` | `skill` | `mean(skill)` | 1 |
 | `acc` | `acc` | the three anomaly statistics | `mean(ap) / sqrt(mean(fas) * mean(tas))` | 1 |
+| `activity_ratio` | `activity_ratio` | `forecast_anomaly_squared`, `target_anomaly_squared` | `sqrt(mean(fas) / mean(tas))` | 1 |
 | `pod_<label>` | `{pod: {label: L, thresholds: {...}}}` | `hit`, `miss` | `h / (h + m)` | 1 |
 | `far_<label>` | `{far: {...}}` | `hit`, `false_alarm` | `fa / (h + fa)` | 1 |
 | `csi_<label>` | `{csi: {...}}` | `hit`, `miss`, `false_alarm` | `h / (h + m + fa)` | 1 |
@@ -520,6 +522,11 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `frequency_bias_<label>` | `{frequency_bias: {...}}` | `hit`, `miss`, `false_alarm` | `(h + fa) / (h + m)` | 1 |
 | `hss_<label>` | `{hss: {...}}` | `hit`, `miss`, `false_alarm` | `2 (h cn - m fa) / ((h + m)(m + cn) + (h + fa)(fa + cn))` | 1 |
 | `pss_<label>` | `{pss: {...}}` | `hit`, `miss`, `false_alarm` | `h / (h + m) - fa / (fa + cn)` | 1 |
+| `pofd_<label>` | `{pofd: {...}}` | `hit`, `miss`, `false_alarm` | `F = fa / (fa + cn)` | 1 |
+| `sedi_<label>` | `{sedi: {...}}` | `hit`, `miss`, `false_alarm` | `(ln F - ln H - ln(1 - F) + ln(1 - H)) / (ln F + ln H + ln(1 - F) + ln(1 - H))`, `H = h / (h + m)` | 1 |
+| `odds_ratio_<label>` | `{odds_ratio: {...}}` | `hit`, `miss`, `false_alarm` | `(h cn) / (m fa)` | 1 |
+| `orss_<label>` | `{orss: {...}}` | `hit`, `miss`, `false_alarm` | `(h cn - m fa) / (h cn + m fa)` | 1 |
+| `f1_<label>` | `{f1: {...}}` | `hit`, `miss`, `false_alarm` | `2 h / (2 h + m + fa)` | 1 |
 | `brier_<label>` | `{brier: {...}}` | `brier` | `b` | 1 |
 | `bss_<label>` | `{bss: {...}}` | `brier`, `event_frequency` | `1 - b / (obar (1 - obar))` | 1 |
 | `event_frequency_<label>` | `{event_frequency: {...}}` | `event_frequency` | `obar` | 1 |
@@ -530,6 +537,10 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `brier_reliability_<label>` | `{brier_reliability: {...}}` | the `2 (M + 1)` level sums | `REL` | 1 |
 | `brier_resolution_<label>` | `{brier_resolution: {...}}` | the `2 (M + 1)` level sums | `RES` | 1 |
 | `brier_uncertainty_<label>` | `{brier_uncertainty: {...}}` | `event_frequency` | `obar (1 - obar)` | 1 |
+| `roc_hit_rate_<label>` | `{roc_hit_rate: {...}}` | the `2 (M + 1)` level sums | `H_k = (sum_{j >= k} h_j) / (sum_j h_j)`, on the `probability` axis | 1 |
+| `roc_false_alarm_rate_<label>` | `{roc_false_alarm_rate: {...}}` | the `2 (M + 1)` level sums | `F_k = (sum_{j >= k} (n_j - h_j)) / (sum_j (n_j - h_j))`, on the same axis | 1 |
+| `roc_area_<label>` | `{roc_area: {...}}` | the `2 (M + 1)` level sums | trapezoid area through `(0, 0)`, `(F_k, H_k)` for `k = M..1` and `(1, 1)` | 1 |
+| `rev_<label>` | `{rev: {label: L, thresholds: {...}, cost_loss: [a, ...]}}` | the `2 (M + 1)` level sums | `max_{k >= 1} (min(a, s) - F_k a (1 - s) + H_k s (1 - a) - s) / (min(a, s) - s a)`, on a `cost_loss` axis | 1 |
 
 `c(alpha, M) = alpha / (M * (M - 1)) + (1 - alpha) / M^2`, with `M` the ensemble size of the run.
 `alpha = 0` is the standard kernel CRPS, `alpha = 1` the fair CRPS; `alpha` must be in `[0, 1]`.
@@ -547,20 +558,20 @@ Ensemble conventions: `bias`, `mae`, `rmse`, `spread_skill` and `acc` score the 
 below `rmse`. A deterministic model is `M = 1`, where `member_squared_error` equals `squared_error` and
 the metrics needing 2 members are rejected at construction (`the metrics need at least N members`).
 
-For an ensemble, the seven contingency scores (`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`)
-and the cells they come from binarise the **ensemble mean** and therefore score it as a point forecast.
+For an ensemble, the twelve contingency scores (`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`,
+`pofd`, `sedi`, `odds_ratio`, `orss`, `f1`) and the cells they come from binarise the **ensemble mean** and therefore score it as a point forecast.
 That is not the same event as the deterministic sibling's: the mean of a skewed variable has less spread
 than a member, so at a rare threshold it exceeds far less often and `frequency_bias` and `pod` fall well
 below a single member's. `brier` and `bss`, and the reliability diagram at one member, are what compares
-the two model kinds directly, since they use the exceedance fraction. The contingency table at a chosen probability level is derivable from the
-reliability level sums of the same label (`n_k`, `h_k`), and is a natural follow-up rather than something
-the file lacks.
+the two model kinds directly, since they use the exceedance fraction. The contingency table at a chosen
+probability level comes from the reliability level sums of the same label (`n_k`, `h_k`), and the ROC
+metrics and `rev` below are built from it.
 
-The ten threshold metrics are functions of the weighted means of the threshold statistics of the same label:
+The fifteen threshold metrics are functions of the weighted means of the threshold statistics of the same label:
 `h = mean(hit_L)`, `m = mean(miss_L)`, `fa = mean(false_alarm_L)`, `cn = 1 - h - m - fa`, `b = mean(brier_L)`
 and `obar = mean(event_frequency_L)`, each pooled over the nodes and init times of a cell.
 `hr = (h + fa) * (h + m)` is the random-hit rate, which needs no division because the four cells are
-normalised to 1 (see [thresholds](#thresholds)). All ten need only **one member**, so they work for a
+normalised to 1 (see [thresholds](#thresholds)). All fifteen need only **one member**, so they work for a
 deterministic checkpoint.
 
 Their names are `<kind>_<label>`, for example `csi_heavy`, and the sums they store are
@@ -581,12 +592,41 @@ giving NaN when `b` is 0 and minus infinity otherwise. `pod`, `far`, `csi`, `ets
 0/0 NaN in a cell where nothing was observed and nothing was forecast, which is the honest reading of a
 threshold too rare for the sample; `event_frequency_<label>` in the same file is how a reader sees why.
 `pss` is close to `pod` for rare events, since `fa / (fa + cn)` is tiny when the correct negatives dominate.
+`sedi`, `odds_ratio`, `orss` and `f1` are 0/0 NaN in the same empty cell; `pofd` is 0 there, since every
+non-event was a correct negative. `sedi` (Ferro and Stephenson 2011) is also NaN wherever `H` or `F` is
+exactly 0 or 1, a perfect forecast included, as one of its logarithms is infinite. `odds_ratio` is plus
+infinity where `m fa = 0 < h cn`; `orss` is 1 there.
+
+`error_std` is the standard deviation of the ensemble-mean error over the cell, so
+`rmse^2 = bias^2 + error_std^2` to float64 rounding. It is computed from the two means in one pass, and the
+difference is clamped at zero before the root because where the error is constant over the cell the two
+terms agree only to rounding. `activity_ratio` is pooled like `acc` and shares its caveat: the non-finite
+climatology nodes add zero to both anomaly sums while the weights count them, which the ratio cancels.
 
 `rank_histogram` is not one number per `(lead_time, bin, variable, region)`: it carries an extra `rank`
 axis of `M + 1` values, see the [NetCDF layout](#netcdf-layout). `reliability_<label>` and
-`forecast_frequency_<label>` are the other metrics carrying an extra axis, the `probability` one; the three
-`brier_*` components are ordinary scalars. The five need only one member, unlike the rank histogram: at
-`M = 1` the diagram has the two points of a contingency table. `outlier_fraction`
+`forecast_frequency_<label>`, `roc_hit_rate_<label>` and `roc_false_alarm_rate_<label>` are the other
+metrics carrying an extra axis, the `probability` one, and `rev_<label>` carries a `cost_loss` one; the
+three `brier_*` components and `roc_area_<label>` are ordinary scalars. The nine need only one member,
+unlike the rank histogram: at `M = 1` the diagram has the two points of a contingency table.
+
+The ROC point at `probability = k / M` is the decision "the event when `p >= k / M`", that is when at least
+`k` members exceed the threshold, with `H_k` the fraction of the observed events and `F_k` the fraction of
+the observed non-events it forecasts. Level 0 always forecasts the event and is `(1, 1)` exactly, its
+cumulated sum being the denominator itself. At `M = 1` the one interior point is `(pofd, pod)` of the same
+label, and `roc_area = (1 + pod - pofd) / 2`. The area joins the points by straight lines, so it is below the
+area of the smooth curve the ensemble samples, the more so the smaller `M`.
+
+`rev` is the relative economic value (Richardson 2000) of each decision for a user of cost/loss ratio `a`,
+with `s = (sum_k h_k) / (sum_k n_k)` the base rate from the level sums: the expense saved over climatology
+(`min(a, s)`, the better of always and never protecting) as a fraction of what a perfect forecast (`s a`)
+would save. The stored value is the maximum over the `M` decisions `k >= 1`, the envelope of the
+ensemble's value curves, and it is negative where no decision beats climatology; at `M = 1` it is the value
+of the deterministic forecast. `cost_loss` is required, a non-empty strictly increasing list of numbers
+strictly between 0 and 1, and is part of the spec, so `merge` rebuilds it from the `metrics` attr. A file has
+one `cost_loss` coordinate, so two `rev` metrics with different lists are refused by `build`, hence at config
+load (`disagree on the 'cost_loss' axis`). The ROC metrics and `rev` are NaN in a cell that observed no event
+or no non-event, where `H_k` or `F_k` is 0/0. `outlier_fraction`
 is the fraction of targets that fell outside the ensemble range, `2 / (M + 1)` for a calibrated ensemble,
 and stores only the two end bins when it is asked for alone.
 
@@ -633,13 +673,14 @@ Dimensions and coordinates:
 | `param` | `variable` | str | Parameter of each variable, `""` when unknown. |
 | `level` | `variable` | float | Level of each variable, NaN when unknown. |
 | `rank` | `rank` | int64 | `0..M`, present only when a metric declares it (`rank_histogram`). |
-| `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`). |
+| `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`, `roc_hit_rate`, `roc_false_alarm_rate`). |
+| `cost_loss` | `cost_loss` | float64 | The configured cost/loss ratios, present only when a metric declares it (`rev`). |
 
 Data variables:
 
 | Variable | Dimensions | Content |
 |---|---|---|
-| `<metric>` | `(lead_time, bin, variable, region)` plus any extra dimension the metric declares | One per configured metric, named by `Metric.name`, derived from the means including the pooled `all` bin. `rank_histogram` is on `(lead_time, bin, variable, region, rank)`, `reliability_<label>` and `forecast_frequency_<label>` on `(lead_time, bin, variable, region, probability)`. |
+| `<metric>` | `(lead_time, bin, variable, region)` plus any extra dimension the metric declares | One per configured metric, named by `Metric.name`, derived from the means including the pooled `all` bin. `rank_histogram` is on `(lead_time, bin, variable, region, rank)`, `reliability_<label>`, `forecast_frequency_<label>`, `roc_hit_rate_<label>` and `roc_false_alarm_rate_<label>` on `(lead_time, bin, variable, region, probability)`, `rev_<label>` on `(lead_time, bin, variable, region, cost_loss)`. |
 | `n_init` | `(lead_time, bin)` | Frames, with the `all` bin summed. |
 | `weight_sum` | `(lead_time, bin, variable, region)` | Weight sum of the valid elements, with the `all` bin summed. |
 | `state_sum_<statistic>` | `(lead_time, state_bin, variable, region)` | The raw float64 sums, one per statistic. |
@@ -878,16 +919,19 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 
 - `metrics`: the `Metric` base class (`name`, `statistics`, `spec`, `min_members`, `output_dim`,
   `bind_members(members)`, `from_means(means, members)`); `Bias`, `MAE`, `RMSE`, `CRPS(alpha=0.0)`,
-  `FairCRPS`, `Spread`, `SpreadSkill`, `MemberRMSE`, `MemberMAE`, `ACC`; the threshold metrics
-  `ThresholdMetric(label=None, thresholds=None)` and its subclasses `POD`, `FAR`, `CSI`, `ETS`,
-  `FrequencyBias`, `HSS`, `PSS`, `BrierScore`, `BSS`, `EventFrequency` and `BrierUncertainty`; the
+  `FairCRPS`, `Spread`, `SpreadSkill`, `MemberRMSE`, `MemberMAE`, `ErrorStd`, `ACC`, `ActivityRatio`; the
+  threshold metrics `ThresholdMetric(label=None, thresholds=None)` and its subclasses `POD`, `FAR`, `CSI`,
+  `ETS`, `FrequencyBias`, `HSS`, `PSS`, `POFD`, `SEDI`, `OddsRatio`, `ORSS`, `F1`, `BrierScore`, `BSS`,
+  `EventFrequency` and `BrierUncertainty`; the
   `LabelledMetric` mixin they take their label, name and spec from; `EnsembleSizeMetric` and its
   subclasses `RankHistogram` and `OutlierFraction`, which gain their statistics in `bind_members`;
   `ReliabilityMetric`, which depends on both the variables and the ensemble size, and its subclasses
-  `ReliabilityDiagram`, `ForecastFrequency`, `BrierReliability` and `BrierResolution`; `REGISTRY`, the
+  `ReliabilityDiagram`, `ForecastFrequency`, `BrierReliability`, `BrierResolution`, `ROCHitRate`,
+  `ROCFalseAlarmRate`, `ROCArea` and `RelativeEconomicValue(label=None, thresholds=None, cost_loss=None)`;
+  `validate_cost_loss(cost_loss)`; `REGISTRY`, the
   name-to-class mapping a new metric registers in; `from_spec(spec)`,
   `build(specs, variables=None, members=None)` (the constructor the driver and the config use: it refuses
-  duplicate names and conflicting statistics, binds the metrics to the ensemble size and the statistics to
+  duplicate names, two metrics giving one extra axis different coordinates and conflicting statistics, binds the metrics to the ensemble size and the statistics to
   the variables), `unique_statistics(metrics)`, `required_aux(metrics)`, `min_members(metrics)`.
 - `statistics`: the `Statistic` base class (`name`, `min_members`, `aux`, `parameters`, `__eq__`,
   `bind_variables(variables)`, `compute(pred, target, aux=None)`) and the statistics of the
@@ -1145,7 +1189,7 @@ Constraints the code enforces, with the message or behaviour:
   name `brier_reliability_heavy`, which collides with `{brier_reliability: {label: heavy, ...}}`; the
   collision is refused loudly (`duplicate metric names`), and the tools split such names longest kind first,
   but the confusion is avoidable.
-- **`acc` needs a climatology**; `AnomalyProduct` and the other anomaly statistics raise when
+- **`acc` and `activity_ratio` need a climatology**; `AnomalyProduct` and the other anomaly statistics raise when
   `climatology` is not in `aux`.
 - **A climatology key that a valid time maps to must exist**, otherwise `ArrayClimatology.frame` raises.
   Non-finite climatology nodes are excluded from the anomaly statistics only, are counted in
@@ -1164,9 +1208,11 @@ Constraints the code enforces, with the message or behaviour:
 - **Duplicate metric names** are refused at construction, including `metrics: [rmse, rmse]`, and so are two
   metrics whose statistics share a name but not their parameters, and a label used with two different
   threshold maps (`one label, one threshold map`), which is refused before any binding.
-- **Threshold metrics are legitimately NaN** where their cell is degenerate: `pod`, `far`, `csi`, `ets` and
-  `frequency_bias` where nothing was observed and nothing forecast, `bss` where the base rate is 0 or 1 (NaN
-  or minus infinity, depending on the Brier score).
+- **Threshold metrics are legitimately NaN** where their cell is degenerate: `pod`, `far`, `csi`, `ets`,
+  `frequency_bias`, `sedi`, `odds_ratio`, `orss` and `f1` where nothing was observed and nothing forecast,
+  `sedi` wherever the hit rate or the false alarm rate is 0 or 1, `bss` where the base rate is 0 or 1 (NaN
+  or minus infinity, depending on the Brier score), and the ROC metrics and `rev` where no event or no
+  non-event was observed. `odds_ratio` is infinite, not NaN, where `m fa = 0 < h cn`.
 - **Regions.** An empty `regions` mapping falls back to `{global: all}` rather than raising; regions may
   overlap and no check is made that they partition the grid. `regions.stack({}, n)`, called directly,
   raises `at least one region is required`.

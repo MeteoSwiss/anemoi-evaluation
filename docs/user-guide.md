@@ -17,6 +17,7 @@ in the [reference](reference.md); the reasons behind the design are in the
 - [Categorical scores at thresholds](#categorical-scores-at-thresholds)
 - [Rank histogram](#rank-histogram)
 - [Reliability diagram](#reliability-diagram)
+- [ROC curve and economic value](#roc-curve-and-economic-value)
 - [Persistence and the other included sources](#persistence-and-the-other-included-sources)
 - [Sharding and merging](#sharding-and-merging)
 - [Reading the results](#reading-the-results)
@@ -297,6 +298,7 @@ least two members and raise when the source has fewer. Five choices worth making
 | `member_rmse`, `member_mae` | the error of a randomly drawn member in expectation, never below `rmse` / `mae`, which are computed on the ensemble mean |
 | `rank_histogram`, `outlier_fraction` | whether the ensemble is calibrated rather than how accurate it is, see [Rank histogram](#rank-histogram) |
 | `reliability`, `forecast_frequency` | whether the forecast probabilities of a threshold mean what they say, see [Reliability diagram](#reliability-diagram); unlike the rank histogram they work at one member too |
+| `roc_hit_rate`, `roc_false_alarm_rate`, `roc_area`, `rev` | how well those probabilities separate events from non-events, and what that is worth to a user, see [ROC curve and economic value](#roc-curve-and-economic-value) |
 
 The full list is in the [reference](reference.md#metrics). A checkpoint with no `noise_injector`
 logs a warning and produces identical members, so `spread` is zero and `crps` equals `mae`.
@@ -365,6 +367,12 @@ init times within a bin: `mean(fa * ta) / sqrt(mean(fa^2) * mean(ta^2))`, where 
 the forecast and target anomalies. Without a `climatology` block it fails with `the anomaly
 metrics need a climatology source`.
 
+`activity_ratio` uses the same climatology and the same sums: `sqrt(mean(fa^2) / mean(ta^2))`, how
+much the forecast anomalies vary against the observed ones. Below 1 the forecast is smoother than the
+truth, which is how a model loses activity with lead time; read it next to `acc`, since a forecast can
+keep its correlation while it damps. `error_std` needs no climatology: it is `sqrt(mse - bias^2)`, the
+part of the RMSE the bias does not explain.
+
 ### Building a climatology
 
 `tools/make_climatology.py` builds one from the target dataset of an existing config:
@@ -405,8 +413,8 @@ climatology: {file: climatology.nc}
 
 ## Categorical scores at thresholds
 
-`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss` and `pss` score a binarised event, `brier`, `bss`
-and `event_frequency` score its probability. Each one takes a **label** and a per-variable **threshold**
+`pod`, `far`, `pofd`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`, `sedi`, `odds_ratio`, `orss` and `f1`
+score a binarised event, `brier`, `bss` and `event_frequency` score its probability. Each one takes a **label** and a per-variable **threshold**
 map, and is named after both:
 
 ```yaml
@@ -453,9 +461,17 @@ time, bin and region. A column of NaN therefore means "no threshold for this var
 threshold naming a variable the run does not evaluate is an error instead, since it is almost always a
 typo. Read `event_frequency_<label>` first: it is the base rate, and it tells you whether the
 threshold was scorable at all. Where nothing was observed and nothing forecast, `pod`, `far`, `csi`,
-`ets` and `frequency_bias` are 0/0 NaN, which is the honest answer, not a bug.
+`ets`, `frequency_bias`, `sedi`, `odds_ratio`, `orss` and `f1` are 0/0 NaN, which is the honest answer,
+not a bug.
 
-All ten work for a deterministic checkpoint. What compares the two model kinds is `brier` and `bss`, and the
+Of the five less common ones, `pofd` is the false alarm *rate*, false alarms over observed non-events,
+not to be confused with `far`, the false alarm *ratio*. `sedi` is the score to read for rare events,
+where `csi` and `ets` all tend to zero whatever the model; it is undefined, NaN, wherever the hit rate or
+the false alarm rate is exactly 0 or 1, a perfect forecast included. `odds_ratio` is infinite where there
+is no miss or no false alarm, and `orss` is the same information mapped to `[-1, 1]`. `f1` is the harmonic
+mean of `pod` and `1 - far`.
+
+All fifteen work for a deterministic checkpoint. What compares the two model kinds is `brier` and `bss`, and the
 reliability diagram at one member: they all read the fraction of members above the threshold, and at one
 member the Brier score collapses to `miss + false_alarm` exactly at every element, and so to within float64
 rounding once summed.
@@ -465,8 +481,8 @@ The contingency scores do not, and this is the one trap of the family. For an en
 member, so it crosses a rare threshold far less often than a single member of the same calibrated ensemble
 does. A calibrated ensemble therefore reads as badly under-forecasting heavy events, and `pod_heavy` or
 `frequency_bias_heavy` must not be compared between a deterministic checkpoint and its ensemble sibling. What you usually want instead is the contingency table
-at a chosen forecast probability, which the reliability level sums already contain (see
-[Reliability diagram](#reliability-diagram)) and which a later release can derive with no new statistic.
+at a chosen forecast probability, which is what the ROC curve gives at every probability level (see
+[ROC curve and economic value](#roc-curve-and-economic-value)).
 
 Note that `bss` is a skill score against the base rate of its own cell, so it does not compare across lead
 times, regions or bins; on a rare event with `bins: {time: init_time}` most dates have a base rate of 0 or
@@ -565,6 +581,52 @@ one, so only the two end levels are populated and the diagram says nothing about
 one member the levels are `{0, 1}`: the diagram has two points and is the contingency table in
 disguise, which is what lets it, `brier` and `bss` put a deterministic checkpoint and its ensemble sibling
 on one axis.
+
+## ROC curve and economic value
+
+The reliability diagram asks whether a probability means what it says; the ROC curve asks whether the
+probabilities separate events from non-events at all, whatever their calibration. Both come from the
+same stored level sums, so the metrics below cost nothing on top of a `reliability` of the same label.
+
+```yaml
+metrics:
+  - {roc_hit_rate:         {label: heavy, thresholds: {tp: 0.005}}}
+  - {roc_false_alarm_rate: {label: heavy, thresholds: {tp: 0.005}}}
+  - {roc_area:             {label: heavy, thresholds: {tp: 0.005}}}
+  - {rev: {label: heavy, thresholds: {tp: 0.005}, cost_loss: [0.02, 0.05, 0.1, 0.2, 0.5]}}
+```
+
+Each point of the curve is a decision rule, "forecast the event when at least `k` of the `M` members
+exceed the threshold", and its hit rate (observed events forecast) and false alarm rate (observed
+non-events forecast). `roc_hit_rate_heavy` and `roc_false_alarm_rate_heavy` are on the same
+`probability` axis as the reliability diagram, the point at `probability = k / M` being the rule
+"`p >= k / M`"; the point at 0 always forecasts the event and is `(1, 1)`. Plot one against the other:
+
+```python
+cell = {"bin": "all", "region": "global", "variable": "tp"}
+hit = results["roc_hit_rate_heavy"].sel(**cell).isel(lead_time=-1)
+false_alarm = results["roc_false_alarm_rate_heavy"].sel(**cell).isel(lead_time=-1)
+value = results["rev_heavy"].sel(**cell).isel(lead_time=-1)              # on the cost_loss axis
+```
+
+`roc_area` is the area under the curve by the trapezoid rule through `(0, 0)`, the levels and
+`(1, 1)`: 0.5 is no discrimination, 1 a perfect one. The trapezoids join the `M` points by straight lines,
+so a small ensemble reads a little lower than a large one of the same skill, and areas compare between
+runs of the same `M` only. At one member there is one point, `(pofd, pod)`, and the area is
+`(1 + pod - pofd) / 2`.
+
+`rev` is the relative economic value of the forecast to a user who pays `C` to protect against a
+loss `L`, for each cost/loss ratio `C / L` in `cost_loss`, on a `cost_loss` axis. 1 is the value of a
+perfect forecast, 0 that of climatology (always or never protecting, whichever is cheaper) and below 0
+the forecast does worse than that. For an ensemble each user picks the decision level that serves them
+best, so the stored value is the best over the `M` levels, the envelope of the per-level curves; at one
+member it is the value of the deterministic forecast. The ratios must be strictly increasing and strictly
+between 0 and 1, and every `rev` of a run must give the same list, since the file has one `cost_loss`
+coordinate. Value is highest near `C / L` equal to the base rate, so put ratios on both sides of
+`event_frequency`.
+
+All four are NaN in a cell that observed no event, or no non-event, as the hit rate or the false alarm
+rate is 0/0 there.
 
 ## Multi-dataset checkpoints
 
@@ -906,6 +968,8 @@ Dates, grids, variables and merging:
 | `... both need a statistic named ... with different parameters` | two statistics of one name disagree on their parameters; give the metrics different labels |
 | `label 'warm' is used with different thresholds by csi_warm ({...}) and reliability_warm ({...}); one label, one threshold map` | a label names one event, so every metric carrying it must give the same threshold map, across every family; give the two events different labels |
 | `duplicate metric names: ... appears 2 times` | the same metric, or the same kind and label, is listed twice |
+| `rev needs cost_loss ratios`, `cost_loss must be strictly increasing` | `rev` takes a `cost_loss` list of ratios strictly between 0 and 1, in increasing order |
+| `rev_heavy and rev_rain disagree on the 'cost_loss' axis` | the file has one `cost_loss` coordinate, so every `rev` of a run must give the same list |
 | `N of the M shards of the run were given, missing ...` | rerun the shard, or merge with `--partial` |
 | `cannot merge states that share init times`, `duplicate shards of n` | the same result would be counted twice |
 | `cannot merge states with different coordinates or statistics` | the inputs came from different configs |

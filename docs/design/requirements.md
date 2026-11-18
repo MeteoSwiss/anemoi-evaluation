@@ -144,9 +144,9 @@ parameter (the CRPS `alpha`) is baked into a file.
 
 **FR-13** The catalogue MUST cover the deterministic scores (bias, MAE, RMSE), the ensemble
 scores (member MAE and RMSE, CRPS for any `alpha` in [0, 1] including the standard and fair
-cases, spread, spread-skill), the anomaly correlation, the categorical and probabilistic scores at
-user-given thresholds, the rank histogram of an ensemble, and the reliability diagram and Brier
-decomposition of a threshold, each available per lead time, bin, variable and region. The exact names and formulas are in [`../reference.md`](../reference.md).
+cases, spread, spread-skill), the anomaly correlation and activity ratio, the categorical and
+probabilistic scores at user-given thresholds, the rank histogram of an ensemble, the reliability
+diagram and Brier decomposition of a threshold, and its ROC curve and relative economic value, each available per lead time, bin, variable and region. The exact names and formulas are in [`../reference.md`](../reference.md).
 
 **FR-14** A metric needing more members than the run has MUST fail at construction, not mid-run.
 
