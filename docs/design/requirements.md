@@ -1,7 +1,7 @@
 # Requirements
 
 What anemoi-evaluation must do, and why. The obligations below are the contract the package is
-built and validated against at v0.3.0. How they are met is in
+built and validated against at v0.4.0. How they are met is in
 [`architecture.md`](architecture.md); measured evidence is in [`../benchmarks.md`](../benchmarks.md);
 the surface a user types is in [`../user-guide.md`](../user-guide.md) and
 [`../reference.md`](../reference.md).
@@ -28,15 +28,16 @@ kept light: numbered requirements, MUST / SHOULD / MAY, a rationale where one is
 
 ### 1.2 Scope
 
-In scope at v0.3.0: deterministic and ensemble forecasts from an anemoi checkpoint trained on one
-or multiple datasets, gridded targets from an anemoi dataset on the same grid, deterministic and
-ensemble metrics, weighting, regions, time bins, a persistence baseline, a climatology for anomaly
-scores, a YAML configuration and CLI, and sharding with exact merging. Section 5 lists what is
-deliberately outside. The goal is to score every anemoi task: forecasters, and for now temporal
-downscalers between analysis bounds, are supported; the others (temporal downscalers with forecast
-bounds, spatial downscalers, autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5.
-The package itself is device-agnostic, but the anemoi checkpoints it is validated against do not
-run on CPU, so an end-to-end exercise needs a GPU.
+In scope at v0.4.0: deterministic and ensemble forecasts from an anemoi checkpoint trained on one
+or multiple datasets (offset forecasters included), gridded targets from an anemoi dataset on the
+same grid, deterministic and ensemble metrics, weighting, regions, time bins, persistence and
+linear-interpolation baselines, a climatology for anomaly scores, a YAML configuration and CLI, and
+sharding with exact merging. Section 5 lists what is deliberately outside. The goal is to score
+every anemoi task: forecasters, and for now temporal downscalers between analysis bounds, are
+supported; the others (temporal downscalers with forecast bounds, spatial downscalers,
+autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. The package itself is
+device-agnostic, but the anemoi checkpoints it is validated against do not run on CPU, so an
+end-to-end exercise needs a GPU.
 
 ### 1.3 Audience
 
@@ -57,7 +58,7 @@ before they trust a score. Users who only want to run it should read the user gu
 
 MUST is an obligation, SHOULD a strong preference that may be traded away with a recorded reason,
 MAY an option. IDs are stable: a dropped requirement keeps its ID, marked withdrawn. A requirement
-not fully met at v0.3.0 carries a **Status** line.
+not fully met at v0.4.0 carries a **Status** line.
 
 ## 2. Stakeholders and users
 
@@ -95,9 +96,9 @@ end-to-end check of the whole pipeline.*
 **FR-6** The package MUST provide a persistence forecast source (the target at init time repeated
 at every lead) as a baseline and as a model-free end-to-end check.
 
-**FR-40** The package MUST score a temporal downscaler between analysis bounds, one window per init
-time, against linear interpolation between the same bounds, and MUST warn when the targets are opened
-with `interpolate_frequency`.
+**FR-40** The package MUST, for now, score a temporal downscaler between analysis bounds, one
+window per init time, against linear interpolation between the same bounds, and MUST warn when the
+targets are opened with `interpolate_frequency`.
 *Rationale: a first step that compares downscalers; forecast bounds, a downscaler after a forecaster,
 are planned (MeteoSwiss/anemoi-evaluation#5). Interpolated targets would score the distance to an
 interpolation, not to the truth.*
@@ -412,7 +413,7 @@ commit.
 
 ## 5. Out of scope
 
-Deliberate non-goals at v0.3.0. Each is a decision, not an oversight.
+Deliberate non-goals at v0.4.0. Each is a decision, not an oversight.
 
 * **Spectra, and any statistic that is not a per-node reduction.**
 * **Observations as targets.** Targets are gridded anemoi datasets on the model's grid.
