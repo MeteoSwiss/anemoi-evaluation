@@ -169,6 +169,10 @@ targets:
     prefetch: 4
 ```
 
+Targets opened with `interpolate_frequency`, `fill_missing_dates` (other than `nan`) or
+`rolling_average` are not truth at the dates they make up. On a cutout whose global element is
+interpolated, score the LAM with `regions: {lam: {grid: 0}}`.
+
 ### Reusing configs: `base` and `from_checkpoint`
 
 `base: <path>` merges this file on top of another one. The path is relative to the file naming it,

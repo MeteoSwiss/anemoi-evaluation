@@ -241,6 +241,15 @@ Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
 
+When the evaluation is built, every scored variable the forecast source reports as an accumulation
+(`accumulation_periods()`; an inference source reports the periods its checkpoint records, the
+baselines none) is compared with the period in the targets' `variables_metadata`, and a difference
+is warned about. A period unknown on either side, including one anemoi-inference fills in for a
+checkpoint that records no `variables_metadata`, is logged at info level and not checked. Targets
+read from the forecast's own dataset carry the checkpoint's metadata, and a cutout's metadata is
+its first element's, so neither can differ. Other variables processed over a period are not
+checked yet.
+
 ### Multi-dataset checkpoints
 
 A checkpoint trained on multiple datasets is scored as one evaluation per dataset, sharing one runner and
@@ -698,7 +707,7 @@ The state holds float64 sums over the four axes `(lead_time, bin, variable, regi
 | `weights` | float64 tensor `(L, B, V, R)` | Weight sum of the valid elements. |
 | `n_init` | int64 tensor `(L, B)` | Frames added. |
 | `members` | int | Ensemble size of the frames. |
-| `variable_coords` | dict name to list | Per-variable labels (`param`, `level`). |
+| `variable_coords` | dict name to list | Per-variable labels (`param`, `level`, `period`). |
 | `init_times` | list of datetime | Init times whose frames were added. |
 | `attrs` | dict | Result-file attributes. |
 
@@ -721,6 +730,7 @@ Dimensions and coordinates:
 | `init_time` | `init_time` | `datetime64[ns]` | Init times that contributed. |
 | `param` | `variable` | str | Parameter of each variable, `""` when unknown. |
 | `level` | `variable` | float | Level of each variable, NaN when unknown. |
+| `period` | `variable` | str | Accumulation period of each variable (`6h`), the forecast's, else the targets'; `""` when not an accumulation or unknown. Absent from files written by 0.4.0 or earlier. |
 | `rank` | `rank` | int64 | `0..M`, present only when a metric declares it (`rank_histogram`). |
 | `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`, `roc_pod`, `roc_pofd`). |
 | `cost_loss` | `cost_loss` | float64 | The configured cost/loss ratios, present only when a metric declares it (`rev`). |
@@ -816,6 +826,8 @@ unsharded control; that is a measurement of one configuration, not a guarantee.
 `merge` refuses:
 
 - different coordinates (`lead_times`, `bins`, `variables`, `regions`) or different statistic sets;
+- different per-variable labels (`param`, `level`, `period`); a label only some inputs carry, such as
+  the `period` of a file written by 0.4.0 or earlier, is dropped from the merged state;
 - different `members`;
 - overlapping `init_times` (the same init time counted twice);
 - inputs whose `dataset` attrs are not all the same (a multi-dataset run writes one file per dataset per
@@ -860,7 +872,7 @@ Weights and regions given as specs are resolved on first use.
 | `shard(index, count)` | `list[datetime]`, `init_times[index::count]`. |
 | `split_members(group)` | `None`; makes the evaluation rank `group.rank` of a `MemberGroup`: `run()` then returns the rank's state, of its variable block. Raises `ValueError` for a forecast source without `split_members` (only `InferenceForecastSource` has one). See [member-parallel runs](#member-parallel-runs). |
 | `model_calls_per_init()` | `tuple[int, timedelta]`: calls per init time and the lead time they compute. |
-| `variable_coords()` | `dict[str, list]`: `param` and `level` per variable. |
+| `variable_coords()` | `dict[str, list]`: `param`, `level` and `period` per variable. |
 | `attrs(init_times=None, timing=None)` | `dict` of result-file attributes. |
 | `to_config()` | `dict`, YAML-ready; raises when weights or regions were given as arrays. |
 | `close()` | `None`; releases the forecast, target and climatology sources. |
@@ -934,7 +946,7 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 | `model_calls` | Calls per init time times the number of init times. |
 | `computed_lead_time` | The lead time those calls actually compute. |
 | `include_lead_zero` | The flag. |
-| `variables` | `{names, param, level}`. |
+| `variables` | `{names, param, level, period}`. |
 | `metrics`, `statistics` | The metric specs, and the sorted names of the statistics they need. |
 | `weights` | The weight spec, or `"array"` when given as an array. |
 | `regions` | Name to spec, or `"array"`. |
