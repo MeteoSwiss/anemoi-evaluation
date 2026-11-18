@@ -32,10 +32,10 @@ In scope at v0.3.0: deterministic and ensemble forecasts from an anemoi checkpoi
 or multiple datasets, gridded targets from an anemoi dataset on the same grid, deterministic and
 ensemble metrics, weighting, regions, time bins, a persistence baseline, a climatology for anomaly
 scores, a YAML configuration and CLI, and sharding with exact merging. Section 5 lists what is
-deliberately outside. Only forecasters are scored at v0.3.0; the other anemoi tasks (downscalers,
-autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. The package itself is
-device-agnostic, but the anemoi checkpoints it is validated against do not run on CPU, so an
-end-to-end exercise needs a GPU.
+deliberately outside. The goal is to score every anemoi task: at v0.3.0 only forecasters are
+supported, the others (downscalers, autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5.
+The package itself is device-agnostic, but the anemoi checkpoints it is validated against do not
+run on CPU, so an end-to-end exercise needs a GPU.
 
 ### 1.3 Audience
 
