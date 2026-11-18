@@ -152,6 +152,11 @@ attributes is a change to `reference.md`.
   `quality` job that runs `pre-commit run --all-files` on Python 3.12, and a `tests` job on
   Python 3.11 and 3.13 that installs the package with `--torch-backend=cpu`, asserts that no
   `nvidia-*` or `triton` wheel was pulled in, and runs `pytest tests -q`. Both must pass.
+  The workflow also runs every night.
+* A third job, `tests-upstream-main`, runs the same tests on Python 3.12 with anemoi-utils,
+  anemoi-transform, anemoi-datasets, anemoi-inference and anemoi-graphs installed from their
+  `main` branches, and prints the upstream commits it used. It is not a required check: a failure
+  usually comes from an upstream change, which then needs a fix here or a report upstream.
 
 ## Releases
 

@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Nightly, so an upstream change that breaks the package shows within a day. GitHub notifies
+  # whoever last edited the cron line, and disables the schedule after 60 days without activity
+  # in the repository.
+  schedule:
+  - cron: "17 3 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -45,4 +51,33 @@ jobs:
     - run: uv pip install --torch-backend=cpu -e .[tests]
     - name: no cuda wheels
       run: "! uv pip list | grep -iE '^(nvidia-|triton)'"
+    - run: uv run --no-sync pytest tests -q
+
+  # The same tests against the main branches of the anemoi packages, for those who develop against
+  # them. A failure here usually comes from an upstream change, not from the pull request: keep
+  # this job out of the required checks.
+  tests-upstream-main:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0 # setuptools-scm needs the tags to compute the version
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        python-version: "3.12"
+    - run: uv venv --python 3.12
+    # One resolution for the package and the upstream branches, so that --torch-backend=cpu
+    # covers all of it (see the tests job).
+    - run: >-
+        uv pip install --torch-backend=cpu -e .[tests]
+        "anemoi-utils @ git+https://github.com/ecmwf/anemoi-utils@main"
+        "anemoi-transform @ git+https://github.com/ecmwf/anemoi-transform@main"
+        "anemoi-datasets @ git+https://github.com/ecmwf/anemoi-datasets@main"
+        "anemoi-inference @ git+https://github.com/ecmwf/anemoi-inference@main"
+        "anemoi-graphs @ git+https://github.com/ecmwf/anemoi-core@main#subdirectory=graphs"
+    - name: no cuda wheels
+      run: "! uv pip list | grep -iE '^(nvidia-|triton)'"
+    - name: upstream commits
+      run: uv pip freeze | grep -i '^anemoi-'
     - run: uv run --no-sync pytest tests -q
