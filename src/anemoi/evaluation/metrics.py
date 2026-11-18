@@ -79,6 +79,23 @@ class RMSE(Metric):
         return means["squared_error"].sqrt()
 
 
+class ErrorStd(Metric):
+    """Standard deviation of the ensemble-mean error over the cell, `sqrt(mse - bias^2)`: the RMSE with the bias
+    removed, so `rmse^2 = bias^2 + error_std^2`.
+
+    The difference is clamped at zero before the root: where the error is constant over the cell the two means agree
+    to rounding and could otherwise give a negative variance, hence NaN. A NaN mean stays NaN.
+    """
+
+    name = "error_std"
+
+    def __init__(self) -> None:
+        self.statistics = {"error": st.Error(), "squared_error": st.SquaredError()}
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        return (means["squared_error"] - means["error"] ** 2).clamp(min=0.0).sqrt()
+
+
 class CRPS(Metric):
     """Mean kernel CRPS from the `skill` and `pairs` means; `crps` for alpha 0, `fair_crps` for alpha 1."""
 
@@ -171,6 +188,26 @@ class ACC(Metric):
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
         return means["anomaly_product"] / (means["forecast_anomaly_squared"] * means["target_anomaly_squared"]).sqrt()
+
+
+class ActivityRatio(Metric):
+    """Activity of the ensemble-mean anomalies against the observed ones, sqrt(mean(fa^2) / mean(ta^2)), pooled like
+    `acc` and needing the same climatology. Below 1 the forecast is smoother than the truth.
+
+    As for `acc`, the nodes where the climatology is non-finite contribute zero to both sums while the shared weights
+    still count them, which the ratio cancels; the raw means of the two statistics are not meaningful on their own.
+    """
+
+    name = "activity_ratio"
+
+    def __init__(self) -> None:
+        self.statistics = {
+            "forecast_anomaly_squared": st.ForecastAnomalySquared(),
+            "target_anomaly_squared": st.TargetAnomalySquared(),
+        }
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        return (means["forecast_anomaly_squared"] / means["target_anomaly_squared"]).sqrt()
 
 
 class LabelledMetric:
@@ -300,6 +337,71 @@ class PSS(ThresholdMetric):
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
         hit, miss, false_alarm, negative = self._cells(means)
         return hit / (hit + miss) - false_alarm / (false_alarm + negative)
+
+
+class POFD(ThresholdMetric):
+    """Probability of false detection (the false alarm rate), the fraction of observed non-events that were forecast;
+    not to be confused with `far`, the false alarm ratio."""
+
+    kind = "pofd"
+    needs = (st.Hit, st.Miss, st.FalseAlarm)
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        _, _, false_alarm, negative = self._cells(means)
+        return false_alarm / (false_alarm + negative)
+
+
+class SEDI(ThresholdMetric):
+    """Symmetric extremal dependence index of Ferro and Stephenson (2011), from the hit rate `H` and the false alarm
+    rate `F`: `(ln F - ln H - ln(1 - F) + ln(1 - H)) / (ln F + ln H + ln(1 - F) + ln(1 - H))`.
+
+    It does not degenerate to 0 or 1 for rare events, which is what it is for. It is undefined where `H` or `F` is 0
+    or 1, a perfect forecast included, and the logarithms then give NaN.
+    """
+
+    kind = "sedi"
+    needs = (st.Hit, st.Miss, st.FalseAlarm)
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        hit, miss, false_alarm, negative = self._cells(means)
+        hit_rate, false_alarm_rate = hit / (hit + miss), false_alarm / (false_alarm + negative)
+        log_h, log_f = hit_rate.log(), false_alarm_rate.log()
+        log_not_h, log_not_f = (1.0 - hit_rate).log(), (1.0 - false_alarm_rate).log()
+        return (log_f - log_h - log_not_f + log_not_h) / (log_f + log_h + log_not_f + log_not_h)
+
+
+class OddsRatio(ThresholdMetric):
+    """Odds ratio `(h cn) / (m fa)`, the odds of a hit over the odds of a false alarm; infinite where there is no miss
+    or no false alarm but a hit and a correct negative, NaN where both products are zero."""
+
+    kind = "odds_ratio"
+    needs = (st.Hit, st.Miss, st.FalseAlarm)
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        hit, miss, false_alarm, negative = self._cells(means)
+        return (hit * negative) / (miss * false_alarm)
+
+
+class ORSS(ThresholdMetric):
+    """Odds ratio skill score (Yule's Q), `(h cn - m fa) / (h cn + m fa)`, the odds ratio mapped to [-1, 1]."""
+
+    kind = "orss"
+    needs = (st.Hit, st.Miss, st.FalseAlarm)
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        hit, miss, false_alarm, negative = self._cells(means)
+        return (hit * negative - miss * false_alarm) / (hit * negative + miss * false_alarm)
+
+
+class F1(ThresholdMetric):
+    """F1 score `2 h / (2 h + m + fa)`, the harmonic mean of `pod` and the success ratio `1 - far`."""
+
+    kind = "f1"
+    needs = (st.Hit, st.Miss, st.FalseAlarm)
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        hit, miss, false_alarm, _ = self._cells(means)
+        return 2.0 * hit / (2.0 * hit + miss + false_alarm)
 
 
 class BrierScore(ThresholdMetric):
@@ -456,19 +558,34 @@ class ReliabilityMetric(LabelledMetric, EnsembleSizeMetric):
         """This label's level weights, stacked on a trailing level axis."""
         return torch.stack([means[f"reliability_count_{self.label}_{k}"] for k in range(members + 1)], dim=-1)
 
+    def _events(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        """This label's observed weight within each level, stacked on a trailing level axis."""
+        return torch.stack([means[f"reliability_event_{self.label}_{k}"] for k in range(members + 1)], dim=-1)
+
     def _levels(
         self, means: dict[str, torch.Tensor], members: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The level weights, the observed frequency within each level, the total weight and the base rate, the last
         two from the level sums themselves so that each metric of the family is self-contained."""
-        counts = self._counts(means, members)
-        events = torch.stack([means[f"reliability_event_{self.label}_{k}"] for k in range(members + 1)], dim=-1)
+        counts, events = self._counts(means, members), self._events(means, members)
         total = counts.sum(-1)
         return counts, events / counts, total, events.sum(-1) / total
 
     def _probabilities(self, counts: torch.Tensor, members: int) -> torch.Tensor:
         """The forecast probability of each level, `k / M`, shaped to broadcast against the level axis."""
         return torch.arange(members + 1, dtype=counts.dtype, device=counts.device) / members
+
+    def _rates(self, means: dict[str, torch.Tensor], members: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The hit rate and the false alarm rate of the decision "forecast the event when `p >= k / M`", one per level
+        `k` on a trailing axis, from the level sums cumulated from the top.
+
+        Level 0 is the decision that always forecasts the event, `(1, 1)` exactly since its cumulated sum is the
+        denominator itself. Both rates are 0/0 NaN where the cell observed no event, or no non-event.
+        """
+        counts, events = self._counts(means, members), self._events(means, members)
+        hits = events.flip(-1).cumsum(-1).flip(-1)
+        alarms = (counts - events).flip(-1).cumsum(-1).flip(-1)
+        return hits / hits[..., :1], alarms / alarms[..., :1]
 
     def _component(self, counts: torch.Tensor, difference: torch.Tensor, total: torch.Tensor) -> torch.Tensor:
         """A weighted mean of squared differences over the levels, skipping the empty ones.
@@ -542,6 +659,119 @@ class BrierResolution(ReliabilityMetric):
         return self._component(counts, observed - base_rate.unsqueeze(-1), total)
 
 
+class ROCHitRate(ReliabilityMetric):
+    """Hit rate of the ROC curve, the fraction of observed events forecast by "the event when `p >= k / M`", stacked
+    on the `probability` axis; level 0 is 1, the decision that always forecasts the event."""
+
+    kind = "roc_hit_rate"
+
+    @property
+    def output_dim(self) -> tuple[str, list] | None:
+        """The `probability` axis."""
+        return self.probability_axis
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        return self._rates(means, self._bound(members))[0]
+
+
+class ROCFalseAlarmRate(ReliabilityMetric):
+    """False alarm rate (`pofd`) of the ROC curve, the fraction of observed non-events forecast by "the event when
+    `p >= k / M`", stacked on the `probability` axis; level 0 is 1."""
+
+    kind = "roc_false_alarm_rate"
+
+    @property
+    def output_dim(self) -> tuple[str, list] | None:
+        """The `probability` axis."""
+        return self.probability_axis
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        return self._rates(means, self._bound(members))[1]
+
+
+class ROCArea(ReliabilityMetric):
+    """Area under the ROC curve by the trapezoid rule through `(0, 0)`, the `M` levels `k >= 1` and `(1, 1)`.
+
+    0.5 is no discrimination, 1 a perfect one. At one member the curve has a single interior point and the area is
+    `(1 + pod - pofd) / 2`. The trapezoids join the points by straight lines, so the area of a small ensemble is
+    below that of the smooth curve it samples.
+    """
+
+    kind = "roc_area"
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        hit_rate, false_alarm_rate = self._rates(means, self._bound(members))
+        zero = torch.zeros_like(hit_rate[..., :1])
+        hit_rate, false_alarm_rate = torch.cat([hit_rate, zero], -1), torch.cat([false_alarm_rate, zero], -1)
+        widths = false_alarm_rate[..., :-1] - false_alarm_rate[..., 1:]
+        return (widths * (hit_rate[..., :-1] + hit_rate[..., 1:]) / 2.0).sum(-1)
+
+
+def validate_cost_loss(cost_loss: list[float] | None) -> list[float]:
+    """The cost/loss ratios of a relative economic value, or a ValueError naming the fault: a non-empty, strictly
+    increasing list of numbers strictly between 0 and 1."""
+    example = "{rev: {label: heavy, thresholds: {tp: 0.005}, cost_loss: [0.05, 0.1, 0.2, 0.5]}}"
+    if cost_loss is None:
+        raise ValueError(f"rev needs cost_loss ratios, e.g. {example}")
+    if not isinstance(cost_loss, (list, tuple)) or not cost_loss:
+        raise ValueError(f"cost_loss must be a non-empty list of ratios, e.g. {example}, got {cost_loss!r}")
+    values = []
+    for value in cost_loss:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 < value < 1.0:
+            raise ValueError(f"a cost/loss ratio must be a number strictly between 0 and 1, got {value!r}")
+        values.append(float(value))
+    if any(later <= earlier for earlier, later in zip(values, values[1:])):
+        raise ValueError(f"cost_loss must be strictly increasing, got {values}")
+    return values
+
+
+class RelativeEconomicValue(ReliabilityMetric):
+    """Relative economic value (Richardson 2000) of the decision "protect when `p >= k / M`" for a user with
+    cost/loss ratio `a`, the best over the `M` levels `k >= 1`, on a `cost_loss` axis.
+
+    With base rate `s`, hit rate `H` and false alarm rate `F`, the value of one level is
+    `(min(a, s) - F a (1 - s) + H s (1 - a) - s) / (min(a, s) - s a)`: 1 is a perfect forecast, 0 climatology (the
+    better of always and never protecting), and it is negative where the level does worse than that. Taking the best
+    level is the envelope of the ensemble's value curves; at one member there is one level, the deterministic
+    forecast. NaN where the cell observed no event or no non-event.
+    """
+
+    kind = "rev"
+
+    def __init__(
+        self,
+        label: str | None = None,
+        thresholds: dict[str, float] | None = None,
+        cost_loss: list[float] | None = None,
+    ) -> None:
+        super().__init__(label, thresholds)
+        self.cost_loss = validate_cost_loss(cost_loss)
+
+    @property
+    def spec(self) -> str | dict:
+        return {
+            self.kind: {"label": self.label, "thresholds": dict(self.thresholds), "cost_loss": list(self.cost_loss)}
+        }
+
+    @property
+    def output_dim(self) -> tuple[str, list] | None:
+        """The `cost_loss` axis, known from the spec alone."""
+        return ("cost_loss", list(self.cost_loss))
+
+    def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
+        bound = self._bound(members)
+        hit_rate, false_alarm_rate = self._rates(means, bound)
+        base_rate = self._levels(means, bound)[3]
+        ratio = torch.tensor(self.cost_loss, dtype=hit_rate.dtype, device=hit_rate.device).unsqueeze(-1)  # (C, 1)
+        hit_rate, false_alarm_rate = hit_rate[..., None, 1:], false_alarm_rate[..., None, 1:]  # (..., 1, M)
+        s = base_rate[..., None, None]
+        climate = torch.minimum(ratio, s)
+        value = (climate - false_alarm_rate * ratio * (1.0 - s) + hit_rate * s * (1.0 - ratio) - s) / (
+            climate - s * ratio
+        )
+        return value.amax(-1)
+
+
 class BrierUncertainty(ThresholdMetric):
     """The uncertainty component `UNC` of the Brier score, `obar (1 - obar)`: the difficulty of the threshold in this
     cell, a property of the observations alone. It needs neither levels nor an ensemble size, so it costs the one sum
@@ -559,6 +789,7 @@ REGISTRY: dict[str, type[Metric]] = {
     "bias": Bias,
     "mae": MAE,
     "rmse": RMSE,
+    "error_std": ErrorStd,
     "crps": CRPS,
     "fair_crps": FairCRPS,
     "spread": Spread,
@@ -566,6 +797,7 @@ REGISTRY: dict[str, type[Metric]] = {
     "member_rmse": MemberRMSE,
     "member_mae": MemberMAE,
     "acc": ACC,
+    "activity_ratio": ActivityRatio,
     "pod": POD,
     "far": FAR,
     "csi": CSI,
@@ -573,6 +805,11 @@ REGISTRY: dict[str, type[Metric]] = {
     "frequency_bias": FrequencyBias,
     "hss": HSS,
     "pss": PSS,
+    "pofd": POFD,
+    "sedi": SEDI,
+    "odds_ratio": OddsRatio,
+    "orss": ORSS,
+    "f1": F1,
     "brier": BrierScore,
     "bss": BSS,
     "event_frequency": EventFrequency,
@@ -581,6 +818,10 @@ REGISTRY: dict[str, type[Metric]] = {
     "brier_reliability": BrierReliability,
     "brier_resolution": BrierResolution,
     "brier_uncertainty": BrierUncertainty,
+    "roc_hit_rate": ROCHitRate,
+    "roc_false_alarm_rate": ROCFalseAlarmRate,
+    "roc_area": ROCArea,
+    "rev": RelativeEconomicValue,
     "rank_histogram": RankHistogram,
     "outlier_fraction": OutlierFraction,
 }
@@ -624,8 +865,9 @@ def unique_statistics(metrics: list[Metric]) -> dict[str, st.Statistic]:
 def build(
     specs: list[str | dict | Metric], variables: list[str] | None = None, members: int | None = None
 ) -> list[Metric]:
-    """Metrics from their specs: duplicate names, a label used with two threshold maps and conflicting statistics are
-    refused, and the metrics and their statistics are bound to `members` and to `variables` when they are known.
+    """Metrics from their specs: duplicate names, a label used with two threshold maps, two metrics giving one extra
+    axis different coordinates (two `rev` with different `cost_loss` lists) and conflicting statistics are refused,
+    and the metrics and their statistics are bound to `members` and to `variables` when they are known.
 
     The ensemble size is bound first, because a metric whose statistics depend on it has none until then and the
     statistic checks below would see nothing to check. The label check needs no binding, so it catches a label meaning
@@ -651,6 +893,17 @@ def build(
             raise ValueError(
                 f"label {metric.label!r} is used with different thresholds by {owner} ({thresholds}) "
                 f"and {metric.name} ({metric.thresholds}); one label, one threshold map"
+            )
+    axes: dict[str, tuple[str, list]] = {}
+    for metric in built:
+        extra = metric.output_dim
+        if extra is None:
+            continue
+        owner, values = axes.setdefault(extra[0], (metric.name, list(extra[1])))
+        if values != list(extra[1]):
+            raise ValueError(
+                f"{owner} and {metric.name} disagree on the {extra[0]!r} axis, {values} and {list(extra[1])}; "
+                f"the metrics of a run share one {extra[0]!r} coordinate"
             )
     unique_statistics(built)
     if variables is not None:
