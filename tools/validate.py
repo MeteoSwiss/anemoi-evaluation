@@ -8,8 +8,9 @@ Single-dataset checkpoints only: it reads `forecast.dataset_name` and a plain `r
 
 One process: the framework `Evaluation` (config members) and the direct loop share the loaded model and the seeding
 (`member_seed(seed, init, member, call)` before every member's model call), so the member draws are identical. For every
---members value the direct loop times every `next()` (model calls flagged: the first `next()` of each block of
-`frames_per_pass` frames) and records its peak GPU memory; the numpy statistics (rmse, mae, bias, crps, fair_crps, spread,
+--members value the direct loop times every `next()` (model calls flagged: the first `next()` of each model call, from
+the source's `rollout_schedule`), checks that the runner's steps are the source's `lead_times` (`k * rollout shift +
+offset` for an offset forecaster) and records its peak GPU memory; the numpy statistics (rmse, mae, bias, crps, fair_crps, spread,
 spread_skill, member_rmse, member_mae, error_std, acc and activity_ratio when the config has a climatology, and the
 threshold metrics, the rank histogram and the reliability-level metrics, ROC and rev included, the config asks for)
 are compared for the config's member count; a metric carrying an extra axis, such as `rank_histogram`, is compared
@@ -79,10 +80,12 @@ members_list = args.members or [forecast.members]
 name = forecast.dataset_name
 runner = forecast.runner
 device = forecast.device
-mso = forecast.frames_per_pass
+calls_of = [call for call, _ in forecast.rollout_schedule(lead)]
 log(
     f"checkpoint {forecast.checkpoint}: timestep {forecast.timestep}, multi_step_input {forecast.multi_step_input}, "
-    f"multi_step_output {forecast.multi_step_output}, lead {lead}, targets prefetch {targets.lookahead}"
+    f"multi_step_output {forecast.multi_step_output}, input offsets {[str(t) for t in forecast.input_offsets]}, "
+    f"output offsets {[str(t) for t in forecast.output_offsets]}, rollout shift {forecast.output_horizon}, lead {lead}, "
+    f"targets prefetch {targets.lookahead}"
 )
 
 climatology = None
@@ -115,7 +118,7 @@ assert "weights" not in evaluation.__dict__, "weights resolved at construction"
 fields0 = {}
 if args.lead_zero:  # the init-time slice of the input state; the framework reuses the memoised state
     t0 = time.perf_counter()
-    state0 = forecast._initial_state(init)["fields"]
+    state0 = forecast._initial_state(name, init)["fields"]
     fields0 = {v: np.asarray(state0[v][-1], dtype=np.float64) for v in variables if v in state0}
     log(
         f"initial state built in {time.perf_counter() - t0:.1f}s: {len(state0)} input fields, "
@@ -158,10 +161,11 @@ for members in members_list:
     try:
         with quiet_inference(), torch.inference_mode():
             for step_index in itertools.count():
-                call, first = divmod(step_index, mso)
+                call = calls_of[step_index] if step_index < len(calls_of) else None
+                first = call is not None and (step_index == 0 or calls_of[step_index - 1] != call)
                 outputs = []
                 for member, generator in enumerate(generators):
-                    if first == 0:
+                    if first:
                         torch.manual_seed(member_seed(forecast.seed, init, member, call))
                     outputs.append(next(generator, None))
                 if any(o is None for o in outputs):
@@ -169,7 +173,7 @@ for members in members_list:
                     break
                 torch.cuda.synchronize()
                 t1 = time.perf_counter()
-                next_times.append((step_index, t1 - t0, first == 0))
+                next_times.append((step_index, t1 - t0, first))
                 step, date = outputs[0][name]["step"], outputs[0][name]["date"]
                 arrays = np.stack(
                     [
@@ -192,6 +196,7 @@ for members in members_list:
     )
     got_steps = [s for s, _, _ in steps]
     expected_steps = evaluation.forecast.lead_times(lead)
+    log(f"M={members}: runner steps {[str(s) for s in got_steps]}")
     assert got_steps == expected_steps, (got_steps, expected_steps)
     fields_by_members[members] = steps
 
