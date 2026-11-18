@@ -152,6 +152,8 @@ before validation:
 | `climatology` | `ClimatologyConfig`, `{datasets: {name: ClimatologyConfig}}` or null | null | Required by `acc`. |
 | `output` | `{path: str}` or null | null | Result file path; required by `anemoi-evaluation run`. `{shard}` and `{shards}` are filled in; `{dataset}` is required by, and only allowed for, a run that scores multiple datasets. |
 | `on_missing_target` | `"skip"` or `"raise"` | `"skip"` | What to do when the target for a valid time is absent. `skip` logs a warning and drops that frame. |
+| `on_period_mismatch` | `"warn"`, `"raise"` or `"ignore"` | `"warn"` | What to do when a scored accumulation covers another period in the targets than in the forecast. See [target checks](#target-checks). |
+| `on_made_up_dates` | `"warn"`, `"raise"` or `"ignore"` | `"warn"` | What to do when the targets make values up at some dates. See [target checks](#target-checks). |
 | `include_lead_zero` | bool | `false` | Prepend a lead-0 frame from the initial state. Raises at construction when the forecast source has `supports_lead_zero = False`. A `MissingTargetError` from `initial_frame` for one init time is caught and logged as `no lead-0 frame for init <date>`; that init time is scored without its lead-0 frame. |
 | `log_level` | str | `"INFO"` | Level passed to `logging.basicConfig` by the CLI. |
 
@@ -240,6 +242,27 @@ in float64 rounded to float32. An init time missing either bound produces no fra
 Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no `targets:` block at
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
+
+#### Target checks
+
+Run when the evaluation is built, on metadata only, so a dry run shows them. Each problem is one
+warning, or a `ValueError` with `raise`; `ignore` silences it.
+
+- **Accumulation period** (`on_period_mismatch`). For every scored variable the forecast source
+  reports as an accumulation, the period recorded in the targets' `variables_metadata` must equal
+  the forecast's. An inference source reports the periods its checkpoint records, those of its
+  training dataset; the baselines and sources built on `ForecastSourceBase` report none, so they are
+  not checked. A period unknown on either side (no `period`, no `variables_metadata`) is logged at
+  info level and not checked.
+- **Made-up dates** (`on_made_up_dates`). The opened dataset's `tree()` is searched for the
+  anemoi-datasets wrappers that compute values at some dates instead of reading them:
+  `InterpolateFrequency` (`interpolate_frequency`), `MissingDatesClosest`, `MissingDatesInterpolate`
+  and `MissingDatesFillStatistics` (`fill_missing_dates: closest`, `interpolate`, `mean`,
+  `maximum`, `minimum`) and `RollingAverage` (`rolling_average`). The warning fires when one is
+  present, whether or not it changes a scored date, and names it, the element it sits in (`Cutout[1]`)
+  and the zarrs below it. `fill_missing_dates: nan`, `set_missing_dates` and `skip_missing_dates`
+  make nothing up. For a temporal downscaler or its baseline, `interpolate_frequency` gets the
+  wording of the [temporal downscalers](user-guide.md#temporal-downscalers) section.
 
 ### Multi-dataset checkpoints
 
@@ -844,11 +867,13 @@ listed in this section is internal and may change without notice.
 ```python
 Evaluation(forecast, targets, init_times, lead_time, metrics, variables=None, weights=None,
            regions=None, bins=None, device=None, on_missing_target="skip",
-           include_lead_zero=False, climatology=None)
+           include_lead_zero=False, climatology=None, dataset=None, on_period_mismatch="warn",
+           on_made_up_dates="warn")
 ```
 
 The object behind the config. Construction validates the arguments, checks the grids for compatibility,
-resolves the variables and calls `forecast.check_init_times(init_times, lead_time)`; it loads no model.
+resolves the variables, runs the [target checks](#target-checks) and calls
+`forecast.check_init_times(init_times, lead_time)`; it loads no model.
 Weights and regions given as specs are resolved on first use.
 
 | Method | Returns |
@@ -885,7 +910,7 @@ halves of `run()`, for a driver that feeds the frames itself; `MultiEvaluation` 
 | `lead_times` | `list[timedelta]` | The scored lead times, with a leading `0` when `include_lead_zero`. |
 | `binning` | `Binning` | The bin rule. |
 | `device` | `torch.device` | The resolved device. |
-| `on_missing_target`, `include_lead_zero` | str, bool | As configured. |
+| `on_missing_target`, `on_period_mismatch`, `on_made_up_dates`, `include_lead_zero` | str, bool | As configured. |
 | `timing`, `model_calls`, `peak_memory_bytes`, `climatology_nonfinite` | dict, int, int or `None`, dict | Set by `run()`. |
 
 #### `MultiEvaluation`
@@ -939,7 +964,7 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 | `weights` | The weight spec, or `"array"` when given as an array. |
 | `regions` | Name to spec, or `"array"`. |
 | `bins` | `{time, by, count}`. |
-| `on_missing_target` | The setting. |
+| `on_missing_target`, `on_period_mismatch`, `on_made_up_dates` | The settings. |
 | `climatology` | The climatology's `describe()`; present only with one. |
 | `frames` | `{total, with_targets, distinct_valid_times}`. |
 | `bytes` | `{target_to_device, target_rows_read, cache_for_all_rows, frame, aggregator_weights, statistics_temporaries}`, plus `checkpoint_bytes`, `per_member_state_bytes` and `member_states` (the lockstep members of this process times the per-member state) from an inference source, `ensemble_temporaries` with more than one member (four `(M, N)` float64 arrays, the peak of scoring one variable: the members, centred, and the sort's values and indices), `swap_peak` in a member group (the rank's frame of every variable and the copies it sends; `frame` is what it receives) and `climatology` when one is configured. In a member group the frame and the target rows are the rank's variable block. `peak` adds up what is on the device at once: `checkpoint_bytes`, `member_states` (and the predicted-only states), `frame`, one target row, `aggregator_weights` and `climatology` throughout, plus the larger of `swap_peak`, held during the exchange only, and `statistics_temporaries + ensemble_temporaries`, held while a frame is scored. The model's forward activations are not counted. |
@@ -1023,7 +1048,8 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
   `multi_step_input`, `multi_step_output`, `input_offsets`, `output_offsets` (the checkpoint's offsets as
   `timedelta`s, `-k * timestep` and `k * timestep` for a forecaster), `output_horizon` (the rollout
   shift, `timestep * multi_step_output` for a forecaster), `checkpoint`, `checkpoint_uuid`,
-  `checkpoint_run_id`, `dataset_name`, `task`, and for a temporal downscaler `window` and `window_leads`
+  `checkpoint_run_id`, `dataset_name`, `task`, `accumulation_periods()`, and for a temporal downscaler
+  `window` and `window_leads`
   (see [lead times](#lead-times)). `initial_frame` returns the init-time slice of the prognostic
   variables and NaN for the others, identical for every member. `split_members(group)` makes it run the
   rank's block of the members and yield every member of the rank's block of the variables; it refuses one
@@ -1036,7 +1062,8 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
   then the only thread touching the dataset, with an optional host LRU of decoded rows. Classmethods
   `from_dataset(dataset, args=(), kwargs=None, grid_indices=None, prefetch=None, cache_bytes=0)` and
   `from_forecast(forecast, prefetch=None, cache_bytes=0)`. `grid_indices` reduces the grid as the
-  checkpoint does.
+  checkpoint does. `accumulation_periods()`, `made_up_dates()` and `interpolate_frequency` (the
+  frequencies of its `InterpolateFrequency` wrappers) feed the [target checks](#target-checks).
 - `ArrayClimatology(grid, variables, fields, key="hour_of_day", counts=None, attrs=None, path=None)`: one
   `(V, N)` float32 field per key, `key` one of `hour_of_day`, `month`, `day_of_year`, `constant`.
   `key_of(valid_time)`, `nonfinite_nodes(variables)`,
@@ -1107,10 +1134,12 @@ close() -> None
 `ForecastSourceBase`, `TargetSourceBase` and `ClimatologySourceBase` implement the optional capabilities
 with defaults: no device preference, no graph, no date check, no sub-grids, no lead-0 frame,
 `frames_per_pass = 1`, `model_calls` counting `frames_per_pass` evenly spaced lead times per call, empty
-`stats` and `provenance`, unknown `variable_info`, and `to_config()` raising.
+`stats` and `provenance`, unknown `variable_info`, no accumulations known (`accumulation_periods()`
+empty), no made-up dates (`made_up_dates()` empty, targets), and `to_config()` raising. The target
+checks read these two with the same defaults from a source that does not define them.
 Their `describe()` reports the class name, the node count and the variable count, and the forecast base
 adds `members`. Helpers: `lead_time_steps(lead_time, timestep)`, `variable_info(variable)`,
-`select_variables(requested, available)`.
+`accumulation_periods(typed_variables)`, `select_variables(requested, available)`.
 
 ### Internals (no compatibility promise)
 
@@ -1130,6 +1159,8 @@ Useful when reading the code or writing a tool against it, but not part of the p
   `GridSpec`: one per weight and region spec.
 - `output.write(dataset, path)`: netcdf4 writer used by the CLI, creating parent directories.
 - `evaluate.package_versions(packages=PACKAGES)`: the versions recorded in a result.
+- `checks.check_targets(forecast, targets, variables, on_period_mismatch="warn", on_made_up_dates="warn")`:
+  the [target checks](#target-checks); `sources.anemoi_dataset.made_up_dates(node)` walks a `tree()`.
 - `evaluate.PhaseTimer(device=None)`: per-phase wall time with a CUDA synchronisation at each `mark`.
 - `evaluate.PHASES`, `evaluate.PACKAGES`: the phase and package name tuples.
 - `evaluate.STARTUP_SECONDS`: 105.0, the per-shard process startup added to every `--step-time` estimate.

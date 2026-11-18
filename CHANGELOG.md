@@ -13,6 +13,10 @@
   merges like any other.
 * The dry-run plan sizes the lockstep members and the ensemble scoring temporaries, and with
   `--member-group --ranks R` a rank's share of the model time and the member exchange.
+* A run warns when a scored accumulation covers another period in the targets than in the checkpoint,
+  and when the targets make values up at some dates (`interpolate_frequency`, `fill_missing_dates`,
+  `rolling_average`). The new keys `on_period_mismatch` and `on_made_up_dates` (`warn`, `raise` or
+  `ignore`) set what happens; the downscaler warning about `interpolate_frequency` is one case of the latter.
 
 ### Changes
 
