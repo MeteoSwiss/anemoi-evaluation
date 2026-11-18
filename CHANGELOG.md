@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-18
+
+Offset forecasters and, for now between analysis bounds, temporal downscalers are scored, and the
+score catalogue gains SEDI, ROC, relative economic value and other derived scores. Results of
+existing configs are unchanged.
 
 ### Breaking
 
+* anemoi-inference 0.12 or later is required.
 * The `ForecastSource` protocol gains `model_calls(lead_time)`; sources built on `ForecastSourceBase`
   inherit a default.
 
@@ -21,15 +26,13 @@
 * Offset forecasters are scored at the lead times of their own output offsets and rollout shift, and
   the init-time check reads the dates of their input offsets. The dry-run plan lists the offsets.
 * Temporal downscalers are scored, for now between analysis bounds: an init time is the window's left bound
-  and `lead_time` the window. Forecast bounds, a downscaler after a forecaster, are planned.
+  and `lead_time` the window. Forecast bounds, a downscaler after a forecaster, are planned. Needs anemoi-inference 0.13 or later.
 * New `linear_interpolation` forecast source, the downscaler baseline. A run warns when a downscaler's
   targets are opened with `interpolate_frequency`.
 
 ### Fixes
 
-* Runs on anemoi-inference >= 0.13 as well as on older releases: the initial state was built with
-  `create_input_state(date=...)`, which fails on 0.13 with `missing 1 required keyword-only argument: 'dates'`;
-  the input's signature now decides between `dates=` and `date=`.
+* Runs on anemoi-inference 0.13 and later, where `create_input_state` takes `dates=`, as well as on 0.12.
 * A checkpoint saved without its training graph (anemoi-core's trimmed inference checkpoints) no longer fails
   with `'NoneType' object is not subscriptable`: the default weights fall back from `area_weight` to
   `spherical_voronoi` with a warning, and an explicit `graph_attribute` raises `MissingGraphError` naming it.
