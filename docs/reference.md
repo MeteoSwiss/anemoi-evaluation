@@ -319,7 +319,7 @@ Bin coordinates per `time` value:
 |---|---|
 | `season` | `DJF`, `MAM`, `JJA`, `SON` (DJF is months 12, 1, 2). |
 | `month` | `01` .. `12`. |
-| `hour` | `00` .. `23`, always all 24; a sub-hourly time falls in its hour. |
+| `hour` | `00` .. `23`, the UTC hour, always all 24; a sub-hourly time falls in its hour. |
 | `init_time` | The sorted distinct dates, ISO formatted: the init times when `by: init_time`, every `init + lead` when `by: valid_time`. A frame whose date is not one of them raises. |
 | `none` | A single bin `all`. |
 
