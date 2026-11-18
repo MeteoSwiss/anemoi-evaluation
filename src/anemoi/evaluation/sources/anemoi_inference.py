@@ -228,6 +228,11 @@ class SharedForcings:
 
 
 SUPPORTED_TASKS = ("forecaster", "offset-forecaster")
+# Tasks the evaluation cannot support until anemoi-inference does, with the reason the refusal names.
+INFERENCE_BLOCKERS = {
+    "autoencoder": "anemoi-inference has no runner for it",
+    "temporal-downscaler": "anemoi-inference runs it only through `execute()`, not step by step",
+}
 # Task classes (`config.task._target_`) and, before them, lightning modules (`config.training.model_task`) by class
 # name; ensemble and diffusion are training methods, so their modules are forecasters.
 TASK_CLASSES = {
@@ -299,15 +304,16 @@ def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
 
 
 def check_task(metadata: Mapping) -> None:
-    """Refuse a checkpoint whose task is not a forecaster, from its metadata. A class path the evaluation does not know
+    """Refuse a checkpoint whose task is not supported yet (anything but a forecaster), from its metadata. A class path the evaluation does not know
     is let through with a warning, since anemoi-inference runs such a checkpoint as a forecaster."""
     task, origin = checkpoint_task(metadata)
     if task not in SUPPORTED_TASKS and "." in task:
         LOG.warning("unknown task class (%s), the checkpoint is evaluated as a forecaster", origin)
     elif task not in SUPPORTED_TASKS:
         raise ValueError(
-            f"the checkpoint's task is {task!r} ({origin}): only forecasters ({', '.join(SUPPORTED_TASKS)}) can be "
-            "evaluated, see MeteoSwiss/anemoi-evaluation#5"
+            f"the checkpoint's task is {task!r} ({origin}): this task is not supported yet"
+            + (f" ({INFERENCE_BLOCKERS[task]})" if task in INFERENCE_BLOCKERS else "")
+            + f", only {', '.join(SUPPORTED_TASKS)} so far, see MeteoSwiss/anemoi-evaluation#5"
         )
 
 
@@ -330,8 +336,8 @@ def check_output_offsets(metadata: Mapping) -> None:
             step = frequency_to_string(timestep)
             raise ValueError(
                 f"the output offsets {stored} with rollout shift {stored_shift} of dataset {name!r} do not fit the "
-                f"lead times: only offsets {step}, 2 * {step}, ..., n * {step} with a rollout shift of n * {step} can "
-                "be evaluated, see MeteoSwiss/anemoi-evaluation#5"
+                f"lead times: other offsets than {step}, 2 * {step}, ..., n * {step} with a rollout shift of n * {step} "
+                "are not supported yet, see MeteoSwiss/anemoi-evaluation#5"
             )
 
 

@@ -1096,8 +1096,10 @@ Constraints the code enforces, with the message or behaviour:
   other fields are read by the evaluation alone. Class paths count by their class name, so the ensemble
   and diffusion forecasters are forecasters. Any task but `forecaster` and `offset-forecaster` (a
   temporal downscaler, an autoencoder, a task name the package does not know) is refused at
-  construction with `the checkpoint's task is '<task>' (<field>: <value>): only forecasters ... can be
-  evaluated`, before the runner is built. A class path the package does not know is evaluated as a
+  construction with `the checkpoint's task is '<task>' (<field>: <value>): this task is not supported
+  yet, ...`, before the runner is built. Where anemoi-inference is what blocks a task the message says
+  so: it has no runner for an autoencoder, and runs a temporal downscaler only through `execute()`.
+  Supporting every anemoi task is the goal, tracked in MeteoSwiss/anemoi-evaluation#5. A class path the package does not know is evaluated as a
   forecaster, as anemoi-inference runs it, with a warning naming it.
 - **`patch_metadata` is the override.** The task is read after the run configuration's
   `patch_metadata` is applied, as anemoi-inference applies it, so `patch_metadata: {metadata_inference:

@@ -236,8 +236,15 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted(caplog):
         ({"model_task": "anemoi.training.train.tasks.GraphAutoEncoder"}, "'autoencoder' \\(config.training"),
         ({"task": "spatial-downscaler"}, "'spatial-downscaler'"),
     ):
-        with pytest.raises(ValueError, match=f"task is {named}.*only forecasters"):
+        with pytest.raises(ValueError, match=f"task is {named}.*not supported yet"):
             check_task(metadata(**task))
+    # a task blocked upstream says so; one that is not blocked there does not blame anemoi-inference
+    with pytest.raises(ValueError, match=r"not supported yet \(anemoi-inference has no runner for it\)"):
+        check_task(metadata(task="autoencoder"))
+    with pytest.raises(ValueError, match=r"not supported yet \(anemoi-inference runs it only through"):
+        check_task(metadata(task="temporal-downscaler"))
+    with pytest.raises(ValueError, match=r"not supported yet, only forecaster"):
+        check_task(metadata(task="spatial-downscaler"))
     with pytest.raises(ValueError, match=r"offsets \['6h', '12h', '24h'\] with rollout shift 24h of dataset 'ds'"):
         check_output_offsets(metadata(task="offset-forecaster", output_offsets=["6h", "12h", "24h"]))
     with pytest.raises(ValueError, match=r"offsets \['12h'\] with rollout shift 12h"):
