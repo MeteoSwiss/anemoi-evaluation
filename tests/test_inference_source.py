@@ -229,7 +229,6 @@ def test_only_forecasters_are_accepted(caplog):
     check_task(metadata(target="my.package.DAForecaster"))
     assert "config.task._target_: my.package.DAForecaster" in caplog.text
     for task, named in (
-        ({"task": "temporal-downscaler"}, "'temporal-downscaler' \\(metadata_inference.task"),
         ({"top": "da_forecaster"}, "'da-forecaster' \\(task: da_forecaster"),
         ({"target": "anemoi.training.tasks.Autoencoder"}, "'autoencoder' \\(config.task._target_"),
         ({"model_task": "anemoi.training.train.tasks.GraphAutoEncoder"}, "'autoencoder' \\(config.training"),
@@ -240,8 +239,6 @@ def test_only_forecasters_are_accepted(caplog):
     # the anemoi-inference blocker is named only where there is one
     with pytest.raises(ValueError, match=r"not supported yet \(anemoi-inference has no runner for it\)"):
         check_task(metadata(task="autoencoder"))
-    with pytest.raises(ValueError, match=r"not supported yet \(anemoi-inference runs it only through"):
-        check_task(metadata(task="temporal-downscaler"))
     with pytest.raises(ValueError, match=r"not supported yet, only forecaster"):
         check_task(metadata(task="spatial-downscaler"))
 
@@ -279,6 +276,27 @@ def test_lead_times_follow_the_offsets_and_refuse_an_invalid_timing(caplog):
     ):
         with pytest.raises(ValueError, match="invalid checkpoint timing"):
             check_rollout_timing(inputs, outputs, shift)
+
+
+def test_temporal_downscalers_between_analysis_bounds_are_accepted(caplog):
+    for downscaler in (  # under each name anemoi-core has stored
+        metadata(task="temporal-downscaler"),
+        metadata(task="time-interpolator"),
+        metadata(target="anemoi.training.tasks.TemporalDownscaler"),
+        metadata(model_task="anemoi.training.train.tasks.GraphMultiOutInterpolator"),
+    ):
+        assert check_task(downscaler) == "temporal-downscaler"
+    assert not caplog.records
+    # a downscaler trained on forecast trajectories, as anemoi-training's TrajectoryDataset configures it
+    for entry in ({"trajectory": {"sampling": {"stride": 6}}}, {"dataset_config": {"dataset": "x", "trajectory": {}}}):
+        trained = metadata(task="temporal-downscaler")
+        trained["config"]["dataloader"] = {"training": {"datasets": {"ds": entry}}}
+        with pytest.raises(ValueError, match=r"trained on forecast trajectories: not supported yet.*#4"):
+            check_task(trained)
+    for datasets in ({"ds": {"dataset_config": "x", "trajectory": None}}, ["ds"], {"ds": "x"}):
+        analysis = metadata(task="temporal-downscaler")
+        analysis["config"]["dataloader"] = {"training": {"datasets": datasets}, "num_workers": 4}
+        assert check_task(analysis) == "temporal-downscaler"
 
 
 def test_patch_metadata_overrides_the_task():

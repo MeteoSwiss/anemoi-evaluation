@@ -83,6 +83,7 @@ makes importable.
 | `test_config.py` | config forms and validation errors, the round trip, `base:` merging and cycles, `from_checkpoint` |
 | `test_inference_source.py` | the inference-source pieces that need no checkpoint: chunk defaults, the forcings cache, the chunk report, graph attributes, the task and timing refusals, the rollout schedule |
 | `test_real_sources.py` | `DatasetTargets` reads and member seeding against a stand-in anemoi dataset |
+| `test_temporal_downscaler.py` | temporal downscalers on anemoi-inference's real downscaler runner over the fixture checkpoint with a fake model, and the linear-interpolation baseline against a hand computation |
 | `test_multi_dataset.py` | the two-dataset fixture runner (`tests/_multi_dataset.py`, `tests/fixtures/multi-dataset/`), the per-dataset views, the refusals, the per-dataset config forms, and the end-to-end equality of a two-dataset run with the two single-dataset runs of the same fake |
 | `test_offset_forecaster.py` | an offset forecaster on the fixture runner: lead times and model calls from its offsets, the init-time check on its input offsets, the per-call reseeding, and the dry run, sharding and `merge` on the irregular lead-time axis |
 

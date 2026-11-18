@@ -123,10 +123,10 @@ before validation:
 | Key | Type | Default | Semantics |
 |---|---|---|---|
 | `base` | path | absent | Not a model field: it is consumed and removed before validation. See [Loading](#loading). |
-| `forecast` | `ForecastConfig` | required | Forecast source; exactly one of `anemoi_inference`, `persistence`. |
+| `forecast` | `ForecastConfig` | required | Forecast source; exactly one of `anemoi_inference`, `persistence`, `linear_interpolation`. |
 | `targets` | `TargetsConfig`, `{datasets: {name: TargetsConfig}}` or null | null | Target source. Null (or a block with no `open_dataset` keys) means the forecast source's own dataset. See [Multi-dataset checkpoints](#multi-dataset-checkpoints). |
 | `datasets` | list of str or null | null | The datasets of a multi-dataset checkpoint to score; null means every one of them. An unknown name, an empty list, or a per-dataset `datasets:` mapping that names a dataset the run does not score raises at build time. See [Multi-dataset checkpoints](#multi-dataset-checkpoints). |
-| `lead_time` | duration | required | Longest lead time to score. Must be positive; strings such as `24h`, `1d`, `6h` are accepted. Must be a multiple of the forecast timestep. Serialised back as a frequency string. |
+| `lead_time` | duration | required | Longest lead time to score. Must be positive; strings such as `24h`, `1d`, `6h` are accepted. Must be a multiple of the forecast timestep; for a temporal downscaler and the linear-interpolation baseline it is the window. Serialised back as a frequency string. |
 | `init_times` | `InitTimesRange` or `InitTimesList` | required | See below. |
 | `variables` | list of str, `{datasets: {name: list of str}}` or null | null | Variables to score. Null means the variables shared by the two sources, in the forecast source's order (`[name for name in forecast.variables if name in targets.variables]`). A requested name that either source cannot deliver raises; an empty result raises `no variables to evaluate`. |
 | `metrics` | list of str or `{name: kwargs}` | `["rmse", "mae", "bias"]` | See [metrics](#metrics). Validated at config load. |
@@ -169,6 +169,11 @@ forecaster with outputs `[6h, 12h, 24h]` and a shift of `24h`, `lead_time: 48h` 
 outputs are computed and discarded, with a warning; a `lead_time` shorter than the first output offset
 raises. With `include_lead_zero: true` a lead of `0` is prepended.
 
+A temporal downscaler is scored one window per init time: `lead_time` must be its window `T`
+(`the lead time must be its window ...` otherwise), and the lead times are the offsets of its target
+times inside it, from one model call. The bounds are not scored unless the checkpoint outputs the right
+one. `linear_interpolation` yields `k * timestep` for `0 < k * timestep < lead_time`.
+
 ### Forecast sources
 
 `forecast:` takes exactly one key.
@@ -186,8 +191,9 @@ Every other key goes to `anemoi.inference.config.run.RunConfiguration` (`checkpo
 `env`, ...). The block is loaded as `{"verbosity": 0, **block, "output": "none"}`: `verbosity: 0` is only
 a default and the block can override it, while `output` is forced. Constraints: `date` must not be set
 (init times come from the evaluation), `output` must be absent or `none`, the checkpoint must be a
-forecaster whose outputs fall on the lead times (see [limitations](#limitations-and-undefined-behaviour)),
-and the checkpoint's datasets must agree on the timing and all be decoded (see Multi-dataset checkpoints).
+forecaster whose outputs fall on the lead times or a temporal downscaler trained between analysis bounds
+(see [limitations](#limitations-and-undefined-behaviour)), and the checkpoint's datasets must agree on the
+timing and all be decoded (see Multi-dataset checkpoints).
 
 #### `persistence` (`PersistenceConfig`)
 
@@ -199,6 +205,12 @@ and the checkpoint's datasets must agree on the timing and all be decoded (see M
 Persistence needs an explicit `targets:` block; it persists the target at init time at every lead. An
 init time whose target is missing produces no frames (warning), and `check_init_times` warns about such
 init times up front.
+
+#### `linear_interpolation` (`LinearInterpolationConfig`)
+
+The same keys as `persistence`, with an explicit `targets:` block. An init time `t` is the left bound of a
+window of `lead_time`; the frame at lead `L` is `(1 - a) x(t) + a x(t + lead_time)`, `a = L / lead_time`,
+in float64 rounded to float32. An init time missing either bound produces no frames (warning).
 
 ### Target source
 
@@ -250,7 +262,7 @@ result plus a `dataset` attribute. Merging is per dataset: `merge` refuses input
 differ, so a sharded multi-dataset run is merged once per dataset.
 
 Refused at construction: a checkpoint whose datasets disagree on the timestep, the input and output steps
-or offsets or the rollout shift, and a downscaling checkpoint whose model does not decode every dataset
+or offsets or the rollout shift, and a spatial downscaler (a model that does not decode every dataset)
 (not supported yet).
 
 The default weights (`{graph_attribute: area_weight}`) are read from each dataset's own node set of the
@@ -730,7 +742,7 @@ Provenance:
 |---|---|
 | `checkpoint`, `checkpoint_uuid`, `checkpoint_run_id` | Checkpoint identity, from the inference source. |
 | `gpu`, `inference_chunks_processor`, `inference_chunks_mapper` | Recorded once the model is loaded; part of a run's numerical identity. |
-| `forecast` | `persistence`, from the persistence source. |
+| `forecast` | `persistence` or `linear_interpolation`, from the baseline sources. |
 | `config` | The run's config as YAML; omitted when the objects cannot be serialised. |
 | `package_versions` | JSON of the installed `anemoi-evaluation`, `anemoi-inference`, `anemoi-models`, `anemoi-graphs`, `anemoi-datasets` and `torch` versions (null when absent). |
 | `climatology`, `climatology_nonfinite_nodes` | JSON of `climatology.describe()` and of the non-finite node count per variable. |
@@ -986,10 +998,12 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
   `multi_step_input`, `multi_step_output`, `input_offsets`, `output_offsets` (the checkpoint's offsets as
   `timedelta`s, `-k * timestep` and `k * timestep` for a forecaster), `output_horizon` (the rollout
   shift, `timestep * multi_step_output` for a forecaster), `checkpoint`, `checkpoint_uuid`,
-  `checkpoint_run_id`, `dataset_name`. `initial_frame` returns the init-time slice of the prognostic
+  `checkpoint_run_id`, `dataset_name`, `task`, and for a temporal downscaler `window` and `window_leads`
+  (see [lead times](#lead-times)). `initial_frame` returns the init-time slice of the prognostic
   variables and NaN for the others, identical for every member.
 - `PersistenceForecastSource(targets, timestep, members=1)`: the target at init time at every lead;
   `supports_lead_zero = True`.
+- `LinearInterpolationForecastSource(targets, timestep, members=1)`: the `linear_interpolation` baseline.
 - `DatasetTargets(*args, prefetch=None, cache_bytes=0, **kwargs)`: targets from
   `anemoi.datasets.open_dataset`, one row per valid time, read ahead on a single worker thread that is
   then the only thread touching the dataset, with an optional host LRU of decoded rows. Classmethods
@@ -1076,7 +1090,8 @@ adds `members`. Helpers: `lead_time_steps(lead_time, timestep)`, `variable_info(
 Useful when reading the code or writing a tool against it, but not part of the public surface.
 
 - `config.load_config(source) -> EvaluationConfig` and the pydantic models `EvaluationConfig`,
-  `ForecastConfig`, `AnemoiInferenceConfig`, `PersistenceConfig`, `TargetsConfig`, `AnemoiDatasetConfig`,
+  `ForecastConfig`, `AnemoiInferenceConfig`, `PersistenceConfig`, `LinearInterpolationConfig`, `TargetsConfig`,
+  `AnemoiDatasetConfig`,
   `InitTimesRange`, `InitTimesList`, `BinsConfig`, `ClimatologyConfig`, `OutputConfig`, `Bbox`: the
   validated form of the [configuration](#configuration), with the aliases `InitTimesConfig`,
   `WeightsConfig`, `RegionConfig`.
@@ -1097,12 +1112,15 @@ Useful when reading the code or writing a tool against it, but not part of the p
   processor-chunk default added.
 - `sources.anemoi_inference.ForcingsCache(cache_bytes)` and `SharedForcings(provider, cache)`: the
   forcings cache and the provider wrapper that reads through it.
-- `sources.anemoi_inference.checkpoint_task(metadata) -> (task, origin)`, `check_task(metadata)` and
-  `check_rollout_timing(input_offsets, output_offsets, rollout_shift)`: the task lookup and the two
-  refusals above; `patched_metadata(metadata, patch)` applies a `patch_metadata` block.
+- `sources.anemoi_inference.checkpoint_task(metadata) -> (task, origin)`, `check_task(metadata) -> task`,
+  `check_runner(task, runner, configured, stored)` and
+  `check_rollout_timing(input_offsets, output_offsets, rollout_shift)`: the task lookup and the refusals
+  above; `patched_metadata(metadata, patch)` applies a `patch_metadata` block.
 - `sources.anemoi_inference.required_dates(init_time, input_offsets, output_offsets, rollout_shift,
   lead_time=None)` and `missing_dates(required, available, missing)`: the dates an input reads (the
   inputs only without `lead_time`) and the ones it lacks, behind `check_init_times()`.
+- `sources.temporal_downscaler`: `downscaler_window(checkpoint) -> (window, leads)`, `trajectory_trained(metadata)`
+  and `window_input_state`, a downscaler's window input state (a private coupling to anemoi-inference).
 
 ## Sharding
 
@@ -1158,32 +1176,40 @@ Consequences:
 - Shared forcings are a pure cache: the cached array is what the provider would have computed for the
   same dates on the same grid, so caching changes no number. A request on a different grid bypasses the
   cache.
+- A temporal downscaler makes one model call per init time, so its members are seeded with `step=0`.
 
 ## Limitations and undefined behaviour
 
 Constraints the code enforces, with the message or behaviour:
 
-- **Only forecasters are scored.** The task is read from `metadata_inference.task`, then the top-level
-  `task`, then `config.task._target_`, then `config.training.model_task`, and defaults to `forecaster`.
-  Class paths count by class name, so ensemble and diffusion forecasters are forecasters. Any task but
-  `forecaster` and `offset-forecaster` is refused at construction with `the checkpoint's task is
+- **Forecasters and temporal downscalers are scored.** The task is read from `metadata_inference.task`,
+  then the top-level `task`, then `config.task._target_`, then `config.training.model_task`, and defaults
+  to `forecaster`. Class paths count by class name, so ensemble and diffusion forecasters are forecasters
+  and `GraphInterpolator`/`GraphMultiOutInterpolator` temporal downscalers. Any task but `forecaster`,
+  `offset-forecaster` and `temporal-downscaler` is refused at construction with `the checkpoint's task is
   '<task>' (<field>: <value>): not supported yet, ...`; the message names the anemoi-inference blocker
-  where there is one (no runner for an autoencoder, a temporal downscaler runs only through
-  `execute()`). An unknown class path is evaluated as a forecaster, with a warning. Other tasks are
-  tracked in MeteoSwiss/anemoi-evaluation#5.
+  where there is one (no runner for an autoencoder). An unknown class path is evaluated as a forecaster,
+  with a warning. Other tasks are tracked in MeteoSwiss/anemoi-evaluation#5.
+- **Temporal downscalers between analysis bounds, for now.** Forecast bounds, a downscaler after a
+  forecaster, are planned (MeteoSwiss/anemoi-evaluation#5). Not supported yet: a downscaler trained on
+  forecast trajectories (`... trained on forecast trajectories: not supported yet`, needs
+  MeteoSwiss/anemoi-evaluation#4), and target times that do not start one step after the left bound,
+  which anemoi-inference labels wrongly. Needs anemoi-inference 0.13 or later.
 - **`patch_metadata` overrides the task.** It is applied before the task is read, so `patch_metadata:
   {metadata_inference: {task: forecaster}}` repairs a checkpoint with a wrong stored task. An explicit
-  `runner:` does not bypass the check, and the runner itself is not checked: a non-forecaster `runner:`
-  on a forecaster checkpoint is not caught. The routing is read unpatched; the offsets come from
+  `runner:` does not bypass the check, and the runner anemoi-inference builds must fit the task
+  (`... but anemoi-inference built a <class>: set runner: ...`), which also catches a downscaler whose task
+  `runner: auto` does not read. The routing is read unpatched; the offsets come from
   anemoi-inference, which applies the patch.
 - **The checkpoint's timing must be one anemoi-core produces.** The last input offset `0h`, the output
   offsets positive and increasing, and a rollout shift that is one of them and longer than their span,
   as anemoi-core's `OffsetForecaster` requires; anything else (a hand-edited or patched timing) raises
   `invalid checkpoint timing: ...` at construction. The rollout's steps are checked against
-  `rollout_schedule()` as they come, and a mismatch raises.
+  `rollout_schedule()` as they come, and a mismatch raises. A temporal downscaler's init-time check reads the window's two
+  bounds.
 - **Multi-dataset checkpoints must share the timing and decode every dataset.** A checkpoint whose
-  datasets disagree on the timestep or the input and output steps or offsets, and a downscaling checkpoint whose
-  model does not decode every dataset, are refused at construction.
+  datasets disagree on the timestep or the input and output steps or offsets, and a spatial downscaler (a
+  model that does not decode every dataset), are refused at construction.
 - **The `tools/` scripts take a single-dataset checkpoint.** `validate.py`, `make_climatology.py` and
   `ab_prefetch.py` read `forecast.dataset_name`, the `forecast.anemoi_inference.input.dataset` block and
   a plain `regions` block, all of which are per dataset on a multi-dataset checkpoint; they raise on one.

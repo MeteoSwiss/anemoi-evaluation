@@ -132,11 +132,17 @@ anemoi-inference silently forwards the first dataset's timing as the checkpoint'
 config and refuses a downscaler: anemoi-inference runs input-only datasets since
 ecmwf/anemoi-inference#605, but the evaluation does not score one yet. A checkpoint that does not
 carry the routing is let through. Before the runner is built, `check_task()` refuses a checkpoint
-whose task is not a forecaster, reading the metadata with `patch_metadata` applied; an unknown
+whose task is neither a forecaster nor a temporal downscaler, and a temporal downscaler trained on
+forecast trajectories, reading the metadata with `patch_metadata` applied; an unknown
 class path passes with a warning. After the timing check, `check_rollout_timing()` refuses a timing
 anemoi-core's `OffsetForecaster` does not produce (hand-edited or patched): the lead times rely on
 the rollout starting at the init time (last input offset `0h`) and on every lead time coming from
 one call, in order (increasing outputs spanning less than the shift, which is one of them).
+
+**Temporal downscalers.** For now scored between analysis bounds (FR-40): one window per init time,
+one model call each, through `sources/temporal_downscaler.py`; `check_runner()` requires
+anemoi-inference's downscaler runner. Members are reseeded before every `next()` until their first
+output, since the runner may yield the left bound first.
 
 **Lockstep members.** For one init time the source builds the initial state once, then advances
 `members` `run()` generators one step at a time, reseeding the global RNG with
@@ -197,7 +203,9 @@ them and cache hits (NFR-24).
 
 ### 3.5 The other sources
 
-`PersistenceForecastSource` repeats the init-time target at every lead (FR-6). `ArrayClimatology`
+`PersistenceForecastSource` repeats the init-time target at every lead (FR-6).
+`LinearInterpolationForecastSource` reads the targets at the bounds of a window and interpolates
+them in float64 at every lead inside it, the baseline of a temporal downscaler (FR-40). `ArrayClimatology`
 is an in-memory mapping from a key to a `(V, N)` float32 field, built from a target source as a
 float64 mean per key and round-tripped through netcdf with the grid, the counts and the build
 provenance (FR-16); its `frame()` hands out a cached, shared device tensor, the one documented
@@ -549,9 +557,11 @@ listed here because they are what to re-check when a pin moves.
   anemoi-training's kernel CRPS uses the same `alpha` parametrisation and its naive backend is the
   unit tests' reference.
 
-Two private couplings remain, both isolated in one named helper each (NFR-17): combining the
-initial input states (`Runner._combine_states`), and wrapping the tensor handler's forcings
-provider lists.
+Three private couplings remain, each isolated in one named helper (NFR-17): combining the
+initial input states (`Runner._combine_states`), wrapping the tensor handler's forcings
+provider lists, and building a temporal downscaler's window input state
+(`temporal_downscaler.window_input_state`), which anemoi-inference builds only inside
+`TemporalDownscalerMultiOutRunner.execute()`.
 
 ## 9. Deferred designs
 

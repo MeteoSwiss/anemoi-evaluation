@@ -187,7 +187,9 @@ def _fixture_input_class() -> type:
         recorded `open_dataset` arguments.
         """
 
-        def __init__(self, context: Any, dataset: FixtureDataset, metadata: Any) -> None:
+        def __init__(
+            self, context: Any, dataset: FixtureDataset, metadata: Any, variables: list[str] | None = None
+        ) -> None:
             super().__init__(
                 context,
                 metadata,
@@ -195,6 +197,7 @@ def _fixture_input_class() -> type:
                 open_dataset_kwargs={},
             )
             self.dataset = dataset
+            self.only = variables
 
         @property
         def ds(self) -> FixtureDataset:  # overrides DatasetInput's cached_property
@@ -204,14 +207,16 @@ def _fixture_input_class() -> type:
         def __repr__(self) -> str:
             return f"FixtureInput({self.dataset.name})"
 
-        def create_input_state(self, *, dates: list[datetime.datetime], **kwargs: Any) -> dict:
-            """The multi-step input state over `dates`, dated by the last one as anemoi-inference's DatasetInput
-            does: every input variable the runner does not compute."""
+        def create_input_state(
+            self, *, dates: list[datetime.datetime], ref_date_index: int = -1, **kwargs: Any
+        ) -> dict:
+            """The multi-step input state over `dates`, dated by `dates[ref_date_index]` as anemoi-inference's
+            DatasetInput does: every input variable the runner does not compute, or the `variables` given."""
             typed = self.metadata.typed_variables
             variables = [
                 variable
                 for variable in self.metadata.variable_to_input_tensor_index
-                if not typed[variable].is_computed_forcing
+                if not typed[variable].is_computed_forcing and (self.only is None or variable in self.only)
             ]
             rows = [self.dataset.row(self.dataset.index(date)) for date in dates]
             index = self.dataset.name_to_index
@@ -219,7 +224,7 @@ def _fixture_input_class() -> type:
                 variable: np.stack([row[index[variable]] for row in rows]).astype(np.float32) for variable in variables
             }
             return {
-                "date": dates[-1],
+                "date": dates[ref_date_index],
                 "latitudes": self.dataset.latitudes,
                 "longitudes": self.dataset.longitudes,
                 "fields": fields,

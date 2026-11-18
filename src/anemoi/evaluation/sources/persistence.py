@@ -19,10 +19,11 @@ from anemoi.evaluation.sources.base import lead_time_steps
 LOG = logging.getLogger(__name__)
 
 
-class PersistenceForecastSource(ForecastSourceBase):
-    """Persists the target at init time: the baseline a model must beat, and an end-to-end check that needs no model."""
+class TargetBaseline(ForecastSourceBase):
+    """A baseline made from the targets themselves: their grid and variables, a `timestep` for the lead times and
+    `members` identical copies; `key` is its `forecast:` key and provenance."""
 
-    supports_lead_zero = True
+    key = ""
 
     def __init__(self, targets: TargetSource, timestep: datetime.timedelta | str, members: int = 1) -> None:
         if members < 1:
@@ -32,6 +33,29 @@ class PersistenceForecastSource(ForecastSourceBase):
         self.variables = list(targets.variables)
         self.timestep = frequency_to_timedelta(timestep)
         self.members = members
+
+    def variable_info(self, name: str) -> dict:
+        """The targets' `param` and `level`."""
+        return self.targets.variable_info(name)
+
+    def provenance(self) -> dict:
+        """Names the baseline."""
+        return {"forecast": self.key}
+
+    def describe(self) -> dict:
+        """Timestep on top of the base facts."""
+        return {**super().describe(), "source": self.key, "timestep": frequency_to_string(self.timestep)}
+
+    def to_config(self) -> dict:
+        """The `forecast:` block that rebuilds this source (with an explicit `targets:` block)."""
+        return {self.key: {"timestep": frequency_to_string(self.timestep), "members": self.members}}
+
+
+class PersistenceForecastSource(TargetBaseline):
+    """Persists the target at init time: the baseline a model must beat, and an end-to-end check that needs no model."""
+
+    key = "persistence"
+    supports_lead_zero = True
 
     def lead_times(self, lead_time: datetime.timedelta) -> list[datetime.timedelta]:
         """Lead times k * timestep up to `lead_time`."""
@@ -63,19 +87,3 @@ class PersistenceForecastSource(ForecastSourceBase):
         absent = [init for init in init_times if not self.targets.available(init)]
         if absent:
             LOG.warning("%d init times have no target to persist and will be skipped, e.g. %s", len(absent), absent[0])
-
-    def variable_info(self, name: str) -> dict:
-        """The targets' `param` and `level`."""
-        return self.targets.variable_info(name)
-
-    def provenance(self) -> dict:
-        """Names the baseline."""
-        return {"forecast": "persistence"}
-
-    def describe(self) -> dict:
-        """Timestep on top of the base facts."""
-        return {**super().describe(), "source": "persistence", "timestep": frequency_to_string(self.timestep)}
-
-    def to_config(self) -> dict:
-        """The `forecast:` block that rebuilds this source (with an explicit `targets:` block)."""
-        return {"persistence": {"timestep": frequency_to_string(self.timestep), "members": self.members}}

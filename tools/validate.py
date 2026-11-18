@@ -6,6 +6,11 @@
 Needs a GPU: it loads the checkpoint of the config's `forecast.anemoi_inference` block and runs it.
 Single-dataset checkpoints only: it reads `forecast.dataset_name` and a plain `regions` block.
 
+A temporal downscaler is scored over the one window starting at --init (the lead is its window, --steps is ignored
+and --lead-zero refused), and its direct loop is anemoi-inference's own `execute()`, one call per member with the
+member's seed before it and the written states captured in memory, so the window input state the framework builds
+itself is checked against the one the runner builds.
+
 One process: the framework `Evaluation` (config members) and the direct loop share the loaded model and the seeding
 (`member_seed(seed, init, member, call)` before every member's model call), so the member draws are identical. For every
 --members value the direct loop times every `next()` (model calls flagged: the first `next()` of each model call, from
@@ -29,6 +34,7 @@ running out of GPU memory in the mapper).
 """
 
 import argparse
+import datetime
 import itertools
 import logging
 import os
@@ -75,17 +81,30 @@ block = config.forecast.anemoi_inference.model_dump()
 init = as_datetime(args.init)
 forecast = ae.InferenceForecastSource(**block)
 targets = ae.DatasetTargets.from_forecast(forecast)
-lead = frequency_to_timedelta(args.lead) if args.lead else (args.steps or 2) * forecast.timestep
+downscaler = forecast.temporal_downscaling
+if downscaler:
+    if args.lead_zero:
+        parser.error("a temporal downscaler has no lead 0: it is the window's left bound")
+    if args.lead and frequency_to_timedelta(args.lead) != forecast.window:
+        parser.error(f"a temporal downscaler's lead is its window {forecast.window}, got --lead {args.lead}")
+    lead = forecast.window
+else:
+    lead = frequency_to_timedelta(args.lead) if args.lead else (args.steps or 2) * forecast.timestep
 members_list = args.members or [forecast.members]
 name = forecast.dataset_name
 runner = forecast.runner
 device = forecast.device
-calls_of = [call for call, _ in forecast.rollout_schedule(lead)]
+calls_of = [] if downscaler else [call for call, _ in forecast.rollout_schedule(lead)]
 log(
     f"checkpoint {forecast.checkpoint}: timestep {forecast.timestep}, multi_step_input {forecast.multi_step_input}, "
-    f"multi_step_output {forecast.multi_step_output}, input offsets {[str(t) for t in forecast.input_offsets]}, "
-    f"output offsets {[str(t) for t in forecast.output_offsets]}, rollout shift {forecast.output_horizon}, lead {lead}, "
-    f"targets prefetch {targets.lookahead}"
+    f"multi_step_output {forecast.multi_step_output}, "
+    + (
+        f"temporal downscaler with window {forecast.window}"
+        if downscaler
+        else f"input offsets {[str(t) for t in forecast.input_offsets]}, "
+        f"output offsets {[str(t) for t in forecast.output_offsets]}, rollout shift {forecast.output_horizon}"
+    )
+    + f", lead {lead}, targets prefetch {targets.lookahead}"
 )
 
 climatology = None
@@ -146,7 +165,74 @@ gi = slice(None) if forecast.grid_indices is None else forecast.grid_indices
 weights = evaluation.weights
 masks = evaluation.regions
 fields_by_members = {}
+
+
+class CapturedOutput:
+    """An anemoi-inference output keeping the evaluated variables of every written state in memory."""
+
+    def __init__(self):
+        self.states = []
+
+    def open(self, state):
+        pass
+
+    def write_initial_state(self, state):
+        pass
+
+    def write_state(self, state):
+        fields = state["fields"]
+        if all(v in fields for v in variables):
+            self.states.append(
+                (
+                    state["step"],
+                    state["date"],
+                    np.stack([np.asarray(fields[v], dtype=np.float64)[gi] for v in variables]),
+                )
+            )
+
+    def close(self):
+        pass
+
+
+def execute_window(members):
+    """The downscaler's window from `init` through `runner.execute()`, member by member: (step, date, arrays)."""
+    saved = dict(runner.outputs)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    per_member, times = [], []
+    try:
+        for member in range(members):
+            capture = CapturedOutput()
+            runner.outputs[name] = capture
+            runner.reference_date, runner.lead_time = init, forecast.window
+            torch.manual_seed(member_seed(forecast.seed, init, member, 0))
+            t0 = time.perf_counter()
+            with quiet_inference():
+                runner.execute()
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+            per_member.append([state for state in capture.states if state[0] > datetime.timedelta(0)])
+    finally:
+        runner.outputs.clear()
+        runner.outputs.update(saved)
+    peak = torch.cuda.max_memory_allocated() / 2**30
+    log(
+        f"M={members}: execute() per member {[f'{t:.2f}' for t in times]} s (input reading included), "
+        f"peak GPU {peak:.2f} GiB"
+    )
+    first = per_member[0]
+    assert all([s for s, _, _ in states] == [s for s, _, _ in first] for states in per_member), "members out of step"
+    return [(step, date, np.stack([states[i][2] for states in per_member])) for i, (step, date, _) in enumerate(first)]
+
+
 for members in members_list:
+    if downscaler:
+        steps = execute_window(members)
+        got_steps = [s for s, _, _ in steps]
+        expected_steps = evaluation.forecast.lead_times(lead)
+        assert got_steps == expected_steps, (got_steps, expected_steps)
+        fields_by_members[members] = steps
+        continue
     lagged = runner.checkpoint.multi_dataset_metadata[name].lagged
     prognostic = create_input_state(runner.prognostics_inputs[name], init, lagged)
     constant = create_input_state(runner.constant_forcings_inputs[name], init, lagged)
