@@ -333,6 +333,30 @@ def test_downscaler_checkpoints_are_refused(tmp_path, monkeypatch):
         InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
 
 
+def test_other_tasks_and_offsets_are_refused(tmp_path, monkeypatch):
+    """A task other than a forecaster is refused from the metadata, before anemoi-inference's `auto` runner would
+    raise on a task it has no runner for, or pick one whose output the evaluation cannot read."""
+
+    def patch(metadata):
+        metadata["metadata_inference"]["task"] = "temporal-downscaler"
+
+    checkpoint = fixture.save_checkpoint(tmp_path / "downscaler.ckpt", patch=patch)
+    configs = fixture.patch_create_runner(monkeypatch, checkpoint)
+    with pytest.raises(ValueError, match="task is 'temporal-downscaler'"):
+        InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
+    assert configs == []
+
+    def skip_a_step(metadata):
+        metadata["metadata_inference"]["task"] = "offset-forecaster"
+        for name in fixture.DATASET_NAMES:
+            metadata["metadata_inference"][name]["timesteps"].update(output_offsets=["12h"], rollout_shift="12h")
+
+    checkpoint = fixture.save_checkpoint(tmp_path / "offsets.ckpt", patch=skip_a_step)
+    fixture.patch_create_runner(monkeypatch, checkpoint)
+    with pytest.raises(ValueError, match=r"output offsets \['12h'\]"):
+        InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
+
+
 def test_datasets_must_share_the_timing(tmp_path, monkeypatch):
     """`Checkpoint.timestep` silently reports the first dataset's, so the evaluation asserts equality
     across `multi_dataset_metadata` and refuses a checkpoint whose datasets disagree."""

@@ -1,4 +1,5 @@
-"""The inference source's pieces that need no checkpoint: the chunk defaults, the forcings cache and the chunk report."""
+"""The inference source's pieces that need no checkpoint: the chunk defaults, the forcings cache, the chunk report and
+the checkpoint refusals."""
 
 import datetime
 from types import SimpleNamespace
@@ -10,6 +11,9 @@ from anemoi.evaluation.sources.anemoi_inference import CHUNKS_ENV
 from anemoi.evaluation.sources.anemoi_inference import PROCESSOR_CHUNKS_ENV
 from anemoi.evaluation.sources.anemoi_inference import ForcingsCache
 from anemoi.evaluation.sources.anemoi_inference import SharedForcings
+from anemoi.evaluation.sources.anemoi_inference import check_output_offsets
+from anemoi.evaluation.sources.anemoi_inference import check_task
+from anemoi.evaluation.sources.anemoi_inference import checkpoint_task
 from anemoi.evaluation.sources.anemoi_inference import create_input_state
 from anemoi.evaluation.sources.anemoi_inference import inference_chunks
 from anemoi.evaluation.sources.anemoi_inference import inference_env
@@ -161,3 +165,66 @@ def test_create_input_state_speaks_both_anemoi_inference_signatures():
 
     assert create_input_state(Before013(), init_time, lagged) == {"date": init_time}
     assert create_input_state(From013(), init_time, lagged) == {"dates": [datetime.datetime(2022, 1, 1, 18), init_time]}
+
+
+def metadata(task=None, target=None, model_task=None, **timesteps) -> dict:
+    """Checkpoint metadata carrying a task at each level anemoi-core has stored one, and one dataset's timesteps."""
+    return {
+        "metadata_inference": {
+            "task": task,
+            "dataset_names": ["ds"],
+            "ds": {"timesteps": {"timestep": "6h", **timesteps}},
+        },
+        "config": {"task": {"_target_": target} if target else None, "training": {"model_task": model_task}},
+    }
+
+
+def test_checkpoint_task_reads_each_level_anemoi_core_has_stored():
+    # legacy checkpoints carry no task at all: a forecaster, as anemoi-inference assumes
+    assert checkpoint_task({}) == ("forecaster", None)
+    assert checkpoint_task(metadata()) == ("forecaster", None)
+    # before anemoi-core #896: the lightning module; ensemble and diffusion forecasters are forecasters
+    for module in ("forecaster.GraphForecaster", "tasks.GraphEnsForecaster", "tasks.GraphDiffusionTendForecaster"):
+        assert checkpoint_task(metadata(model_task=f"anemoi.training.train.{module}"))[0] == "forecaster"
+    assert checkpoint_task(metadata(model_task="anemoi.training.train.tasks.GraphMultiOutInterpolator")) == (
+        "temporal-downscaler",
+        "config.training.model_task: anemoi.training.train.tasks.GraphMultiOutInterpolator",
+    )
+    # the task config wins over the training method's module, `metadata_inference.task` over both
+    both = {
+        "target": "anemoi.training.tasks.OffsetForecaster",
+        "model_task": "anemoi.training.train.tasks.GraphForecaster",
+    }
+    assert checkpoint_task(metadata(**both))[0] == "offset-forecaster"
+    assert checkpoint_task(metadata(task="autoencoder", **both))[0] == "autoencoder"
+    # the names written over time, normalised as anemoi-inference's runner registry does
+    assert checkpoint_task(metadata(task="time-interpolator"))[0] == "temporal-downscaler"
+    assert checkpoint_task(metadata(task="temporal_downscaler"))[0] == "temporal-downscaler"
+    assert checkpoint_task(metadata(task="my.package.Task")) == (
+        "my.package.Task",
+        "metadata_inference.task: my.package.Task",
+    )
+
+
+def test_only_forecasters_on_the_lead_time_grid_are_accepted():
+    for accepted in (
+        {},
+        metadata(model_task="anemoi.training.train.tasks.GraphEnsForecaster"),
+        metadata(task="forecaster"),
+        metadata(task="offset-forecaster", output_offsets=["6h", "12h"], rollout_shift="12h"),
+        metadata(task="offset-forecaster", output_offsets=["6h"]),  # the shift defaults to the last offset
+    ):
+        check_task(accepted)
+        check_output_offsets(accepted)
+    for task, named in (
+        ({"task": "temporal-downscaler"}, "'temporal-downscaler' \\(metadata_inference.task"),
+        ({"target": "anemoi.training.tasks.Autoencoder"}, "'autoencoder' \\(config.task._target_"),
+        ({"model_task": "anemoi.training.train.tasks.GraphAutoEncoder"}, "'autoencoder' \\(config.training"),
+        ({"task": "spatial-downscaler"}, "'spatial-downscaler'"),
+    ):
+        with pytest.raises(ValueError, match=f"task is {named}.*only forecasters"):
+            check_task(metadata(**task))
+    with pytest.raises(ValueError, match=r"offsets \['6h', '12h', '24h'\] with rollout shift 1d of dataset 'ds'"):
+        check_output_offsets(metadata(task="offset-forecaster", output_offsets=["6h", "12h", "24h"]))
+    with pytest.raises(ValueError, match=r"offsets \['12h'\] with rollout shift 12h"):
+        check_output_offsets(metadata(task="offset-forecaster", output_offsets=["12h"], rollout_shift="12h"))

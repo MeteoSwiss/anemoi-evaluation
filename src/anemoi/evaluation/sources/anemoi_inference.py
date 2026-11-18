@@ -18,6 +18,7 @@ from collections.abc import Mapping
 import numpy as np
 import torch
 from anemoi.utils.dates import frequency_to_string
+from anemoi.utils.dates import frequency_to_timedelta
 
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
@@ -225,6 +226,87 @@ class SharedForcings:
         return getattr(self.provider, name)
 
 
+SUPPORTED_TASKS = ("forecaster", "offset-forecaster")
+# Task classes (`config.task._target_`) and, before them, lightning modules (`config.training.model_task`) by class
+# name; ensemble and diffusion are training methods, so their modules are forecasters.
+TASK_CLASSES = {
+    "Forecaster": "forecaster",
+    "OffsetForecaster": "offset-forecaster",
+    "TemporalDownscaler": "temporal-downscaler",
+    "Autoencoder": "autoencoder",
+    "GraphForecaster": "forecaster",
+    "GraphEnsForecaster": "forecaster",
+    "GraphDiffusionForecaster": "forecaster",
+    "GraphDiffusionTendForecaster": "forecaster",
+    "GraphInterpolator": "temporal-downscaler",
+    "GraphMultiOutInterpolator": "temporal-downscaler",
+    "GraphAutoEncoder": "autoencoder",
+}
+# `metadata_inference.task` held the lightning module's `task_type` before the task classes.
+TASK_ALIASES = {"time-interpolator": "temporal-downscaler"}
+
+
+def task_name(value: str) -> str:
+    """The task name of a stored task: a class path by its class name, a name with `_` as `-`, as anemoi-inference's
+    runner registry does; an unknown class path is returned as is."""
+    cls = value.rsplit(".", 1)[-1]
+    if cls in TASK_CLASSES:
+        return TASK_CLASSES[cls]
+    if "." in value:
+        return value
+    name = value.replace("_", "-")
+    return TASK_ALIASES.get(name, name)
+
+
+def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
+    """The checkpoint's task and where it was read (`None` for the default): `metadata_inference.task`, then
+    `config.task._target_`, then `config.training.model_task`, else `forecaster` as anemoi-inference assumes."""
+    config = metadata.get("config") or {}
+    task = config.get("task")
+    candidates = (
+        ("metadata_inference.task", (metadata.get("metadata_inference") or {}).get("task")),
+        ("config.task._target_", task.get("_target_") if isinstance(task, Mapping) else None),
+        ("config.training.model_task", (config.get("training") or {}).get("model_task")),
+    )
+    for origin, value in candidates:
+        if value:
+            return task_name(str(value)), f"{origin}: {value}"
+    return "forecaster", None
+
+
+def check_task(metadata: Mapping) -> None:
+    """Refuse a checkpoint whose task is not a forecaster, from its metadata."""
+    task, origin = checkpoint_task(metadata)
+    if task not in SUPPORTED_TASKS:
+        raise ValueError(
+            f"the checkpoint's task is {task!r} ({origin}): only forecasters ({', '.join(SUPPORTED_TASKS)}) can be "
+            "evaluated, see MeteoSwiss/anemoi-evaluation#5"
+        )
+
+
+def check_output_offsets(metadata: Mapping) -> None:
+    """Refuse output offsets the lead times `k * timestep` cannot represent, from the checkpoint metadata: only
+    `timestep, 2 timestep, ..., n timestep` with a rollout shift of `n timestep`, which a checkpoint without
+    `output_offsets` has."""
+    inference = metadata.get("metadata_inference") or {}
+    for name in inference.get("dataset_names") or ():
+        timesteps = (inference.get(name) or {}).get("timesteps") or {}
+        if not timesteps.get("output_offsets"):
+            continue
+        timestep = frequency_to_timedelta(timesteps["timestep"])
+        offsets = [frequency_to_timedelta(offset) for offset in timesteps["output_offsets"]]
+        shift = frequency_to_timedelta(timesteps["rollout_shift"]) if timesteps.get("rollout_shift") else offsets[-1]
+        n = len(offsets)
+        if offsets != [(i + 1) * timestep for i in range(n)] or shift != n * timestep:
+            step = frequency_to_string(timestep)
+            raise ValueError(
+                f"the output offsets {list(timesteps['output_offsets'])} with rollout shift "
+                f"{frequency_to_string(shift)} of dataset {name!r} do not fit the lead times: only offsets {step}, "
+                f"2 * {step}, ..., n * {step} with a rollout shift of n * {step} can be evaluated, see "
+                "MeteoSwiss/anemoi-evaluation#5"
+            )
+
+
 def routed_datasets(metadata: Mapping) -> tuple[set[str], set[str]] | None:
     """The datasets a checkpoint's model encodes and decodes, from the training config it stores, or None when the
     config does not say (legacy single-dataset checkpoints have no `encoders`/`decoders` routing)."""
@@ -349,6 +431,7 @@ class InferenceForecastSource(ForecastSourceBase):
         forcings_cache_bytes: int = DEFAULT_FORCINGS_CACHE_BYTES,
         **run_config: object,
     ) -> None:
+        from anemoi.inference.checkpoint import Checkpoint
         from anemoi.inference.config.run import RunConfiguration
         from anemoi.inference.runners import create_runner
         from anemoi.utils.checkpoints import load_metadata
@@ -367,7 +450,11 @@ class InferenceForecastSource(ForecastSourceBase):
         self.forcings_cache_bytes = forcings_cache_bytes
         self._initial: dict[str, tuple[datetime.datetime, dict]] = {}
         with self._quiet():
-            self.runner = create_runner(RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"}))
+            config = RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"})
+            # before the runner: anemoi-inference's `auto` runner raises on a task it has no runner for
+            metadata = load_metadata(Checkpoint(config.checkpoint).path)
+            check_task(metadata)
+            self.runner = create_runner(config)
         self.dataset_names = list(self.runner.dataset_names)
         # One cache per dataset: the arrays depend on the state's latitudes and longitudes, so a single cache
         # would serve the first grid and bypass every other one for ever. `forcings_cache_bytes` is the budget
@@ -390,7 +477,7 @@ class InferenceForecastSource(ForecastSourceBase):
         self.output_horizon = self.timestep * self.multi_step_output
         self.frames_per_pass = self.multi_step_output
         self._check_shared_timing()
-        metadata = load_metadata(self.checkpoint)
+        check_output_offsets(metadata)
         self._check_every_dataset_is_decoded(metadata)
         # Which datasets the run scores; every one of them until an evaluation narrows it (the `datasets:` config
         # key). The model predicts them all whatever this says: the runner needs an input state for each one.
