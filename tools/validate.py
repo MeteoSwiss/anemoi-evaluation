@@ -10,8 +10,8 @@ One process: the framework `Evaluation` (config members) and the direct loop sha
 (`member_seed(seed, init, member, call)` before every member's model call), so the member draws are identical. For every
 --members value the direct loop times every `next()` (model calls flagged: the first `next()` of each block of
 `frames_per_pass` frames) and records its peak GPU memory; the numpy statistics (rmse, mae, bias, crps, fair_crps, spread,
-spread_skill, member_rmse, member_mae, acc when the config has a climatology, and the threshold metrics, the rank
-histogram and the reliability levels the config asks for) are compared for the config's member count; a metric carrying an extra axis, such as
+spread_skill, member_rmse, member_mae, error_std, acc and activity_ratio when the config has a climatology, and the
+threshold metrics, the rank histogram and the reliability-level metrics (ROC and rev included) the config asks for) are compared for the config's member count; a metric carrying an extra axis, such as
 `rank_histogram`, is compared element by element and reported by its worst element; a threshold metric must be NaN for
 a variable its map omits, and a framework NaN against a finite reference, or the reverse, is a mismatch rather than a
 skipped comparison.
@@ -219,6 +219,7 @@ for step, date, arrays in steps:
                 "mae": (w * np.abs(e)).sum() / w.sum(),
                 "bias": (w * e).sum() / w.sum(),
             }
+            ref["error_std"] = np.sqrt((w * (e - ref["bias"]) ** 2).sum() / w.sum())
             m = arrays[:, j][:, ok]
             skill = np.abs(m - y[j][ok]).mean(0)
             ref["member_mae"] = (w * skill).sum() / w.sum()
@@ -236,6 +237,7 @@ for step, date, arrays in steps:
                 wc = weights[okc]
                 fa, ta = mean[j][okc] - c[j][okc], y[j][okc] - c[j][okc]
                 ref["acc"] = (wc * fa * ta).sum() / np.sqrt((wc * fa * fa).sum() * (wc * ta * ta).sum())
+                ref["activity_ratio"] = np.sqrt((wc * fa * fa).sum() / (wc * ta * ta).sum())
             for metric in evaluation.metrics:
                 thresholds = getattr(metric, "thresholds", None)
                 if thresholds is None:
@@ -255,6 +257,8 @@ for step, date, arrays in steps:
                 obar = (w * o).sum() / w.sum()
                 random_hits = (hits + alarms) * (hits + misses)
                 with np.errstate(divide="ignore", invalid="ignore"):  # a degenerate cell is legitimately 0/0
+                    hit_rate, false_rate = hits / (hits + misses), alarms / (alarms + negatives)
+                    logs = np.log([false_rate, hit_rate, 1 - false_rate, 1 - hit_rate])
                     formulas = {
                         "pod": hits / (hits + misses),
                         "far": alarms / (hits + alarms),
@@ -265,6 +269,11 @@ for step, date, arrays in steps:
                         * (hits * negatives - misses * alarms)
                         / ((hits + misses) * (misses + negatives) + (hits + alarms) * (alarms + negatives)),
                         "pss": hits / (hits + misses) - alarms / (alarms + negatives),
+                        "pofd": false_rate,
+                        "sedi": (logs[0] - logs[1] - logs[2] + logs[3]) / logs.sum(),
+                        "odds_ratio": hits * negatives / (misses * alarms),
+                        "orss": (hits * negatives - misses * alarms) / (hits * negatives + misses * alarms),
+                        "f1": 2 * hits / (2 * hits + misses + alarms),
                         "brier": brier,
                         "bss": 1 - brier / (obar * (1 - obar)),
                         "event_frequency": obar,
@@ -299,14 +308,31 @@ for step, date, arrays in steps:
                 total, p_k = n.sum(), np.arange(M + 1) / M  # named _k so as not to shadow the per-node p and o above
                 o_k = np.divide(h, n, out=np.full_like(h, np.nan), where=n > 0)
                 obar_k = h.sum() / total
+                # the ROC decisions "count >= k", from the nodes rather than from the level sums
+                decisions = [(count >= k).astype(np.float64) for k in range(M + 1)]
+                with np.errstate(divide="ignore", invalid="ignore"):  # no event or no non-event is 0/0
+                    roc_h = np.array([(w * d * observed).sum() / (w * observed).sum() for d in decisions])
+                    roc_f = np.array([(w * d * (1 - observed)).sum() / (w * (1 - observed)).sum() for d in decisions])
                 levels = {
                     "reliability": o_k,
                     "forecast_frequency": n / total,
                     "brier_reliability": np.nansum(np.where(n > 0, n * (p_k - o_k) ** 2, 0.0)) / total,
                     "brier_resolution": np.nansum(np.where(n > 0, n * (o_k - obar_k) ** 2, 0.0)) / total,
+                    "roc_hit_rate": roc_h,
+                    "roc_false_alarm_rate": roc_f,
+                    "roc_area": np.trapezoid(np.r_[0.0, roc_h[::-1]], np.r_[0.0, roc_f[::-1]]),
                 }
                 for metric in level_metrics:
-                    if metric.label == label:
+                    if metric.label != label:
+                        continue
+                    if metric.kind == "rev":  # the expenses of the M decisions k >= 1 against climate and perfect
+                        s, value = (w * observed).sum() / w.sum(), []
+                        for a in metric.cost_loss:
+                            expenses = [(w * (a * d + (1 - d) * observed)).sum() / w.sum() for d in decisions[1:]]
+                            with np.errstate(divide="ignore", invalid="ignore"):
+                                value.append(max((min(a, s) - x) / (min(a, s) - s * a) for x in expenses))
+                        ref[metric.name] = np.array(value)
+                    else:
                         ref[metric.name] = levels[metric.kind]
             for key, value in ref.items():
                 if key not in framework:
