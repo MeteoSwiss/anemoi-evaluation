@@ -28,9 +28,10 @@ in the [reference](reference.md); the reasons behind the design are in the
 ## Concepts
 
 - An **init time** is the date a forecast starts from; a run scores a list of them, given as a
-  range (`start`, `end`, `frequency`) or as explicit dates. The **lead times** are `k * timestep`
-  up to `lead_time`, where `timestep` comes from the forecast source (the checkpoint, or the
-  `timestep` of a persistence baseline), so `lead_time` must be a positive multiple of it.
+  range (`start`, `end`, `frequency`) or as explicit dates. The **lead times** are those the
+  forecast source yields up to `lead_time`: `k * timestep` for a forecaster or a persistence baseline
+  (so `lead_time` must be a positive multiple of the timestep), the outputs of each model call for an
+  offset forecaster ([lead times](reference.md#lead-times)).
 - A **frame** is one forecast step: float32 `(members, variables, nodes)` at one valid time.
   Every frame is paired with the target field at the same valid time.
 - A **statistic** is computed per element (variable, node) of a frame and accumulated as a
@@ -317,14 +318,12 @@ is that `lead_time` should be a multiple of the model's **output horizon**
 `lead_time: 9h` makes two calls, computes 12 h and discards the last three frames. That is legal,
 logs a warning, and the dry-run plan says so in its `note` and in `computed_lead_time`.
 
-An **offset forecaster** is scored on its own input and output offsets. Its lead times are
-`k * rollout_shift + offset` for every output offset, so a checkpoint with inputs `[-12h, 0h]`,
-outputs `[6h, 12h, 24h]` and a rollout shift of `24h` asked for `lead_time: 48h` is scored at 6h,
-12h, 1d, 30h, 36h and 2d, from two model calls; the result file's `lead_time` axis is then not
-evenly spaced. The output horizon is the rollout shift, so `lead_time: 36h` computes 2d and
-discards the last output, with the same warning. The init-time check reads the dates the model
-reads: here `init - 12h` and `init`, not `init - 6h`. The dry-run plan lists the offsets under
-`forecast`. A persistence baseline keeps its `k * timestep` lead times and shares only some of them.
+An **offset forecaster** is scored at the lead times of its own output offsets and rollout shift
+(the rule and an example are under [lead times](reference.md#lead-times)), so the result file's
+`lead_time` axis need not be evenly spaced; its output horizon is the rollout shift. The init-time
+check reads the dates the model reads: for inputs `[-12h, 0h]`, `init - 12h` and `init`, not
+`init - 6h`. The dry-run plan lists the offsets under `forecast`. A persistence baseline keeps its
+`k * timestep` lead times and shares only some of them.
 
 `include_lead_zero: true` adds a lead-0 frame from the initial state, before any model call. It
 works for sources that declare `supports_lead_zero` (the inference and persistence sources do;
@@ -717,10 +716,9 @@ for name, state in evaluation.run().items():
 ```
 
 Two checkpoints are refused at construction: one whose datasets disagree on the timestep or the
-input and output steps, and a downscaling checkpoint whose model does not decode every dataset
+input and output steps or offsets, and a downscaling checkpoint whose model does not decode every dataset
 (not supported yet). Only forecasters are scored: any other task (temporal downscaler,
-autoencoder, ...) is refused at construction, and so is an offset forecaster whose model calls
-would repeat or reorder lead times (see the
+autoencoder, ...) is refused at construction (see the
 [reference](reference.md#limitations-and-undefined-behaviour)). A wrong stored
 task can be fixed with `patch_metadata: {metadata_inference: {task: forecaster}}` in the
 `anemoi_inference` block.
@@ -968,7 +966,9 @@ Config and sources:
 | `from_checkpoint at <key> is only resolved in ...` | it was used in a nested block; move it to the top of the dataset block |
 | `checkpoint ... only a single mapping can be reused` | the recorded `open_dataset` arguments are not one mapping; spell the dataset out |
 | `target datasets must have one member` | the target zarr has an ensemble dimension; select a member in the `open_dataset` arguments |
-| `the checkpoint's task is '...'`, `the input offsets [...] do not end at 0h`, `the output offsets [...] ... are not positive, increasing and within one rollout shift` | the checkpoint is not a forecaster, or its model calls would repeat or reorder lead times: not supported yet (MeteoSwiss/anemoi-evaluation#5). A wrong stored task can be fixed with `patch_metadata` |
+| `the checkpoint's task is '...'` | the checkpoint is not a forecaster: not supported yet (MeteoSwiss/anemoi-evaluation#5). A wrong stored task can be fixed with `patch_metadata` |
+| `invalid checkpoint timing: ...` | the input or output offsets or the rollout shift are not ones anemoi-core produces; check a hand-edited checkpoint or a `patch_metadata` block |
+| `lead time ... is shorter than the model's first output offset` | raise `lead_time` to at least the first output offset |
 
 Dates, grids, variables and merging:
 

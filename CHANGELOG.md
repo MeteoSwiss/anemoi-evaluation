@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Breaking
+
+* The `ForecastSource` protocol gains `model_calls(lead_time)`; sources built on `ForecastSourceBase`
+  inherit a default.
+
 ### Features
 
 * New metrics `error_std` (the error standard deviation) and `activity_ratio` (the forecast against the
@@ -26,7 +31,8 @@
   `spherical_voronoi` with a warning, and an explicit `graph_attribute` raises `MissingGraphError` naming it.
 * Checkpoints of a task not supported yet (temporal downscaler, autoencoder, ...) are refused at construction
   with a message naming the task, instead of failing mid-run. `patch_metadata` can override the task.
-* Offset forecasters whose model calls would repeat or reorder lead times are refused at construction.
+* A checkpoint whose timing anemoi-core cannot produce (hand-edited or patched offsets) is refused at
+  construction.
 * The refusal of downscaling checkpoints no longer claims that anemoi-inference cannot run them.
 
 ## 0.3.0 — 2026-09-17

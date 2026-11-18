@@ -110,10 +110,8 @@ must not be set, the datasets must share the timing, the model must decode every
 `verbosity` defaults to 0. From the checkpoint it takes the timestep, the two multi-step counts,
 the input and output offsets and the rollout shift (`output_horizon`; `frames_per_pass` is the
 number of output offsets), through anemoi-inference's public `Checkpoint` properties, and the uuid
-and run id for provenance (NFR-5). The lead times are `rollout_schedule()`: anemoi-inference makes
-`ceil(lead_time / rollout_shift)` calls and yields call `s`'s output at `s * rollout_shift + offset`
-when it is within `lead_time`, which is `k * timestep` for a forecaster and the irregular lead times
-of an offset forecaster otherwise.
+and run id for provenance (NFR-5). The lead times are `rollout_schedule()`, which follows the
+runner's calls ([lead times](../reference.md#lead-times)).
 With `quiet`, the anemoi-inference loggers and the per-step timer are raised to WARNING while the
 source runs.
 
@@ -135,10 +133,10 @@ config and refuses a downscaler: anemoi-inference runs input-only datasets since
 ecmwf/anemoi-inference#605, but the evaluation does not score one yet. A checkpoint that does not
 carry the routing is let through. Before the runner is built, `check_task()` refuses a checkpoint
 whose task is not a forecaster, reading the metadata with `patch_metadata` applied; an unknown
-class path passes with a warning. After the timing check, `check_rollout_timing()` refuses what
-cannot be scored yet: a last input offset other than `0h` (the runner starts the rollout at the
-last input date), and output offsets that are not positive, increasing and within one rollout
-shift (two calls would yield the same lead time, or yield them out of order).
+class path passes with a warning. After the timing check, `check_rollout_timing()` refuses a timing
+anemoi-core's `OffsetForecaster` does not produce (hand-edited or patched): the lead times rely on
+the rollout starting at the init time (last input offset `0h`) and on every lead time coming from
+one call, in order (increasing outputs spanning less than the shift, which is one of them).
 
 **Lockstep members.** For one init time the source builds the initial state once, then advances
 `members` `run()` generators one step at a time, reseeding the global RNG with

@@ -22,8 +22,8 @@ contents of the result file may still change between releases.
   reliability diagram of a threshold with the Brier decomposition `BS = REL - RES + UNC`, the
   ROC curve with its area, and the relative economic value over cost/loss ratios.
 * **Ensembles** as lockstep rollouts of the same runner, reseeded per member and per model call.
-* **Multi-step-output models** (several lead times per forward pass) are scored per output time;
-  lead 0 can be scored from the initial state.
+* **Multi-step-output models and offset forecasters** (several lead times per forward pass, at the
+  checkpoint's own offsets) are scored per output time; lead 0 can be scored from the initial state.
 * **Weights, regions and time bins**: node weights from the model graph, a file, spherical
   Voronoi areas or uniform; regions from a graph attribute, a bounding box, a sub-grid of a
   cutout or a file; bins per season, month or init time, of the init or the valid time.
