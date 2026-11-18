@@ -9,7 +9,7 @@ Every path they touch is an argument; each script's module docstring says what i
 | `validate.py` | Scores one init time both through the framework and through a direct `runner.run()` loop reduced in numpy float64, and reports the relative difference per metric, threshold metrics, the rank histogram and the reliability levels included. The reference for exactness. | yes |
 | `ab_prefetch.py` | Runs the same config several times with different target prefetch depths, cache sizes and blosc settings, and reports the timing of each and whether the results are bit-identical. | yes |
 | `make_climatology.py` | Builds an hour-of-day (or month / day-of-year / constant) climatology netcdf from a config's target dataset, for the `acc` metric. | no |
-| `inspect_results.py` | Checks the mechanics of a results file (weights, exclusions, metric inequalities, lead 0, the threshold labels and their contingency identities, the rank histogram and its sum-to-one identity, the reliability diagram and the Brier decomposition identity) and prints its headline numbers. | no |
+| `inspect_results.py` | Checks the mechanics of a results file (weights, exclusions, metric inequalities, lead 0, the threshold labels and their contingency identities, the rank histogram and its sum-to-one identity, the reliability diagram and the Brier decomposition identity, the ROC curve and the economic value) and prints its headline numbers. | no |
 | `compare_results.py` | Compares two results files element by element, reporting each raw sum and metric as bit-exact or by its maximum relative difference. | no |
 
 `validate.py`, `make_climatology.py` and `ab_prefetch.py` take a single-dataset checkpoint only:

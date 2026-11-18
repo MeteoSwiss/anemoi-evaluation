@@ -11,10 +11,10 @@ One process: the framework `Evaluation` (config members) and the direct loop sha
 --members value the direct loop times every `next()` (model calls flagged: the first `next()` of each block of
 `frames_per_pass` frames) and records its peak GPU memory; the numpy statistics (rmse, mae, bias, crps, fair_crps, spread,
 spread_skill, member_rmse, member_mae, error_std, acc and activity_ratio when the config has a climatology, and the
-threshold metrics, the rank histogram and the reliability-level metrics (ROC and rev included) the config asks for) are compared for the config's member count; a metric carrying an extra axis, such as
-`rank_histogram`, is compared element by element and reported by its worst element; a threshold metric must be NaN for
-a variable its map omits, and a framework NaN against a finite reference, or the reverse, is a mismatch rather than a
-skipped comparison.
+threshold metrics, the rank histogram and the reliability-level metrics, ROC and rev included, the config asks for)
+are compared for the config's member count; a metric carrying an extra axis, such as `rank_histogram`, is compared
+element by element and reported by its worst element; a threshold metric must be NaN for a variable its map omits, and
+a framework NaN against a finite reference, or the reverse, is a mismatch rather than a skipped comparison.
 With --lead-zero the framework's lead-0 rmse/mae/bias must be exactly 0.0 for the variables present in the input
 state and NaN for the others.
 
@@ -195,6 +195,12 @@ for members in members_list:
     assert got_steps == expected_steps, (got_steps, expected_steps)
     fields_by_members[members] = steps
 
+
+def trapezoid(y, x):
+    """Trapezoid area under `y(x)`, spelled out because `np.trapezoid` needs numpy 2."""
+    return float(((x[1:] - x[:-1]) * (y[1:] + y[:-1]) / 2.0).sum())
+
+
 # 3. numpy float64 statistics for the framework's member count
 steps = fields_by_members[forecast.members]
 M = forecast.members
@@ -318,9 +324,9 @@ for step, date, arrays in steps:
                     "forecast_frequency": n / total,
                     "brier_reliability": np.nansum(np.where(n > 0, n * (p_k - o_k) ** 2, 0.0)) / total,
                     "brier_resolution": np.nansum(np.where(n > 0, n * (o_k - obar_k) ** 2, 0.0)) / total,
-                    "roc_hit_rate": roc_h,
-                    "roc_false_alarm_rate": roc_f,
-                    "roc_area": np.trapezoid(np.r_[0.0, roc_h[::-1]], np.r_[0.0, roc_f[::-1]]),
+                    "roc_pod": roc_h,
+                    "roc_pofd": roc_f,
+                    "roc_area": trapezoid(np.r_[0.0, roc_h[::-1]], np.r_[0.0, roc_f[::-1]]),
                 }
                 for metric in level_metrics:
                     if metric.label != label:
