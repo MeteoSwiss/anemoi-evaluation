@@ -5,6 +5,7 @@
 
 Needs a GPU: it loads the checkpoint of the config's `forecast.anemoi_inference` block and runs it.
 Single-dataset checkpoints only: it reads `forecast.dataset_name` and a plain `regions` block.
+The lead defaults to the config's `lead_time`; --steps (model timesteps) or --lead override it.
 
 A temporal downscaler is scored over the one window starting at --init (the lead is its window, --steps is ignored
 and --lead-zero refused), and its direct loop is anemoi-inference's own `execute()`, one call per member with the
@@ -88,8 +89,12 @@ if downscaler:
     if args.lead and frequency_to_timedelta(args.lead) != forecast.window:
         parser.error(f"a temporal downscaler's lead is its window {forecast.window}, got --lead {args.lead}")
     lead = forecast.window
+elif args.lead:
+    lead = frequency_to_timedelta(args.lead)
+elif args.steps:
+    lead = args.steps * forecast.timestep
 else:
-    lead = frequency_to_timedelta(args.lead) if args.lead else (args.steps or 2) * forecast.timestep
+    lead = config.lead_time
 members_list = args.members or [forecast.members]
 name = forecast.dataset_name
 runner = forecast.runner
