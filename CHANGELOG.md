@@ -10,6 +10,11 @@
 * A checkpoint saved without its training graph (anemoi-core's trimmed inference checkpoints) no longer fails
   with `'NoneType' object is not subscriptable`: the default weights fall back from `area_weight` to
   `spherical_voronoi` with a warning, and an explicit `graph_attribute` raises `MissingGraphError` naming it.
+* Checkpoints of a task other than a forecaster (a temporal downscaler, an autoencoder, ...) are refused at
+  construction with a message naming the task, instead of failing mid-run.
+* Offset forecasters whose output offsets skip a lead time are refused at construction with a message naming the
+  offsets.
+* The refusal of downscaling checkpoints no longer claims that anemoi-inference cannot run them.
 
 ## 0.3.0 — 2026-09-17
 

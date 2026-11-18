@@ -635,8 +635,11 @@ for name, state in evaluation.run().items():
 ```
 
 Two checkpoints are refused at construction: one whose datasets disagree on the timestep or the
-input and output steps, and a downscaling checkpoint whose model does not decode every dataset —
-anemoi-inference cannot run one either.
+input and output steps, and a downscaling checkpoint whose model does not decode every dataset,
+which the evaluation does not support yet. Only forecasters are scored, whatever the number of
+datasets: a temporal downscaler, an autoencoder or any other task is refused at construction with
+a message naming it, and so is an offset forecaster whose outputs skip a lead time (see the
+[reference](reference.md#limitations-and-undefined-behaviour)).
 
 ### Scoring some of the datasets
 
@@ -881,6 +884,7 @@ Config and sources:
 | `from_checkpoint at <key> is only resolved in ...` | it was used in a nested block; move it to the top of the dataset block |
 | `checkpoint ... only a single mapping can be reused` | the recorded `open_dataset` arguments are not one mapping; spell the dataset out |
 | `target datasets must have one member` | the target zarr has an ensemble dimension; select a member in the `open_dataset` arguments |
+| `the checkpoint's task is '...'`, `the output offsets [...] ... do not fit the lead times` | the checkpoint is not a forecaster, or its outputs skip a lead time; only such forecasters are scored so far (MeteoSwiss/anemoi-evaluation#5) |
 
 Dates, grids, variables and merging:
 
