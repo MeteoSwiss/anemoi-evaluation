@@ -541,9 +541,9 @@ class InferenceForecastSource(ForecastSourceBase):
     def _check_every_dataset_is_decoded(self, metadata: Mapping) -> None:
         """Refuse a checkpoint whose model does not decode every dataset (a downscaler).
 
-        anemoi-inference cannot run one at all: `Runner.forecast` indexes the model output by every dataset of
-        `metadata_inference` and raises `KeyError` on the input-only one. The routing is only readable from the
-        stored training config, so a checkpoint that does not carry it is let through."""
+        anemoi-inference runs input-only datasets since ecmwf/anemoi-inference#605, but the evaluation scores every
+        dataset of the checkpoint against targets and does not support downscalers yet. The routing is only readable
+        from the stored training config, so a checkpoint that does not carry it is let through."""
         routed = routed_datasets(metadata)
         if routed is None:
             return
@@ -552,7 +552,7 @@ class InferenceForecastSource(ForecastSourceBase):
         if missing:
             raise ValueError(
                 f"the checkpoint's model does not decode {missing}, it only decodes {sorted(decoded)}: "
-                "downscaling checkpoints cannot be evaluated (anemoi-inference cannot run them either)"
+                "downscaling checkpoints cannot be evaluated yet, see MeteoSwiss/anemoi-evaluation#5"
             )
 
     @property
