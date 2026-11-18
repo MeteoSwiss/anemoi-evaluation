@@ -281,17 +281,16 @@ def test_init_times_need_both_bounds(monkeypatch, tmp_path):
 def test_interpolated_targets_are_warned_about(monkeypatch, tmp_path, caplog):
     source = downscaler_source(monkeypatch, tmp_path, names=fixture.DATASET_NAMES)
     view = source.datasets["era5"]  # the flag reaches a multi-dataset view through its delegation
-    plain = fixture.make_targets("era5")
-    interpolated = DatasetTargets.from_dataset(
-        fixture.FixtureDataset("era5"),
-        kwargs={"dataset": {"cutout": [{"dataset": "lam"}, {"dataset": "global", "interpolate_frequency": "1h"}]}},
-    )
+    path = fixture.write_zarr(tmp_path / "era5.zarr", "era5")
+    plain = DatasetTargets(dataset=path)
+    interpolated = DatasetTargets(dataset=path, interpolate_frequency="1h")
     assert plain.interpolate_frequency == [] and interpolated.interpolate_frequency == ["1h"]
     with caplog.at_level(logging.WARNING):
         Evaluation(view, plain, [T0], WINDOW, ["rmse"])
         assert "interpolate_frequency" not in caplog.text
         Evaluation(view, interpolated, [T0], WINDOW, ["rmse"])
         assert "opened with interpolate_frequency ['1h']" in caplog.text
+        assert "(InterpolateFrequency(frequency=1h) over era5)" in caplog.text
         caplog.clear()
         baseline = LinearInterpolationForecastSource(interpolated, "6h")
         Evaluation(baseline, interpolated, [T0], WINDOW, ["rmse"])

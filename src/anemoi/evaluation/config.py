@@ -385,6 +385,8 @@ class EvaluationConfig(_Model):
     climatology: DatasetsClimatology | ClimatologyConfig | None = None
     output: OutputConfig | None = None
     on_missing_target: Literal["skip", "raise"] = "skip"
+    on_period_mismatch: Literal["warn", "raise", "ignore"] = "warn"
+    on_made_up_dates: Literal["warn", "raise", "ignore"] = "warn"
     include_lead_zero: bool = False
     log_level: str = "INFO"
 

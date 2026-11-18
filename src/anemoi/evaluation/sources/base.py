@@ -207,6 +207,10 @@ class ForecastSourceBase:
         """Unknown."""
         return variable_info(None)
 
+    def accumulation_periods(self) -> dict[str, datetime.timedelta | None]:
+        """No accumulations known."""
+        return {}
+
     def provenance(self) -> dict:
         """Nothing to record."""
         return {}
@@ -266,6 +270,14 @@ class TargetSourceBase:
         """Unknown."""
         return variable_info(None)
 
+    def accumulation_periods(self) -> dict[str, datetime.timedelta | None]:
+        """No accumulations known."""
+        return {}
+
+    def made_up_dates(self) -> list[str]:
+        """None known."""
+        return []
+
     def to_config(self) -> dict:
         """Not serialisable."""
         raise ValueError(f"{type(self).__name__} cannot be written to a config")
@@ -302,6 +314,19 @@ def variable_info(variable: object | None) -> dict:
     if variable is None:
         return {"param": None, "level": None}
     return {"param": getattr(variable, "param", None), "level": getattr(variable, "level", None)}
+
+
+def accumulation_periods(typed_variables: dict) -> dict[str, datetime.timedelta | None]:
+    """The period of each accumulated variable of anemoi typed variables (anemoi-transform `Variable`); None when
+    not recorded."""
+    periods = {}
+    for name, variable in typed_variables.items():
+        if getattr(variable, "is_accumulation", False) is True:
+            try:
+                periods[name] = variable.period
+            except (TypeError, ValueError):  # a malformed `period`
+                periods[name] = None
+    return periods
 
 
 def select_variables(requested: list[str], available: list[str]) -> list[int]:

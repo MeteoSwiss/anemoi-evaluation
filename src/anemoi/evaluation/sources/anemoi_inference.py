@@ -25,6 +25,7 @@ from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import ForecastSourceBase
 from anemoi.evaluation.sources.base import MissingGraphError
+from anemoi.evaluation.sources.base import accumulation_periods
 from anemoi.evaluation.sources.base import lead_time_steps
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.base import variable_info
@@ -463,6 +464,10 @@ class DatasetForecast:
     def variable_info(self, name: str) -> dict:
         """`param` and `level` of a variable of this dataset."""
         return variable_info(self.typed_variables.get(name))
+
+    def accumulation_periods(self) -> dict:
+        """The period of each accumulated variable of this dataset, as the checkpoint records it."""
+        return accumulation_periods(self.typed_variables)
 
     def describe(self) -> dict:
         """What the parent reports for this dataset."""
@@ -1002,6 +1007,10 @@ class InferenceForecastSource(ForecastSourceBase):
     def variable_info(self, name: str) -> dict:
         """`param` and `level` of a variable from the checkpoint's typed variables; None when unknown."""
         return variable_info(self.typed_variables.get(name))
+
+    def accumulation_periods(self) -> dict:
+        """The period of each accumulated variable, as the checkpoint records it (its training dataset's)."""
+        return accumulation_periods(self.typed_variables)
 
     def provenance(self) -> dict:
         """Result-file attrs identifying the checkpoint: its path, uuid and training run id; once the model is loaded,

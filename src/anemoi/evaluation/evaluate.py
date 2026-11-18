@@ -29,6 +29,7 @@ from anemoi.evaluation import regions as regions_module
 from anemoi.evaluation.aggregation import AggregationState
 from anemoi.evaluation.aggregation import Aggregator
 from anemoi.evaluation.binning import Binning
+from anemoi.evaluation.checks import check_targets
 from anemoi.evaluation.config import AnemoiDatasetConfig
 from anemoi.evaluation.config import BinsConfig
 from anemoi.evaluation.config import EvaluationConfig
@@ -122,6 +123,8 @@ class Evaluation:
         include_lead_zero: bool = False,
         climatology: ClimatologySource | None = None,
         dataset: str | None = None,
+        on_period_mismatch: str = "warn",
+        on_made_up_dates: str = "warn",
     ) -> None:
         self.dataset = dataset
         self.forecast = forecast
@@ -135,15 +138,10 @@ class Evaluation:
         if include_lead_zero:
             self.lead_times = [datetime.timedelta(0), *self.lead_times]
         forecast.grid.check_compatible(targets.grid)
-        if getattr(forecast, "temporal_downscaling", False) and getattr(targets, "interpolate_frequency", None):
-            LOG.warning(
-                "the targets are opened with interpolate_frequency %s: between the dates of the dataset it "
-                "interpolates, the truth is itself a linear interpolation, not an analysis; score a region whose "
-                "data is real at every lead time",
-                targets.interpolate_frequency,
-            )
         targets.prefetch_hint(forecast.frames_per_pass)
         self.variables = self._resolve_variables(variables)
+        check_targets(forecast, targets, self.variables, on_period_mismatch, on_made_up_dates)
+        self.on_period_mismatch, self.on_made_up_dates = on_period_mismatch, on_made_up_dates
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)
         if needed > forecast.members:
@@ -349,6 +347,8 @@ class Evaluation:
             "regions": {name: "array" if spec is None else spec for name, spec in self._region_specs.items()},
             "bins": {"time": self.binning.kind, "by": self.binning.by, "count": len(self.binning.coords)},
             "on_missing_target": self.on_missing_target,
+            "on_period_mismatch": self.on_period_mismatch,
+            "on_made_up_dates": self.on_made_up_dates,
             **({"climatology": self.climatology.describe()} if self.climatology is not None else {}),
             "frames": {
                 "total": len(valid_times),
@@ -641,6 +641,8 @@ class Evaluation:
                 "regions": self._region_specs,
                 "bins": {"time": self.binning.kind, "by": self.binning.by},
                 "on_missing_target": self.on_missing_target,
+                "on_period_mismatch": self.on_period_mismatch,
+                "on_made_up_dates": self.on_made_up_dates,
                 "include_lead_zero": self.include_lead_zero,
                 "climatology": self.climatology.to_config() if self.climatology is not None else None,
             }
@@ -955,6 +957,8 @@ def build(
                 include_lead_zero=config.include_lead_zero,
                 climatology=climatologies[name],
                 dataset=name if len(available) > 1 else None,
+                on_period_mismatch=config.on_period_mismatch,
+                on_made_up_dates=config.on_made_up_dates,
             )
         except ValueError as error:  # a shared block that fits one dataset's grid but not another's
             if len(available) == 1:
