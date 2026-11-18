@@ -11,13 +11,14 @@ from anemoi.evaluation.sources.anemoi_inference import CHUNKS_ENV
 from anemoi.evaluation.sources.anemoi_inference import PROCESSOR_CHUNKS_ENV
 from anemoi.evaluation.sources.anemoi_inference import ForcingsCache
 from anemoi.evaluation.sources.anemoi_inference import SharedForcings
-from anemoi.evaluation.sources.anemoi_inference import check_output_offsets
+from anemoi.evaluation.sources.anemoi_inference import check_rollout_timing
 from anemoi.evaluation.sources.anemoi_inference import check_task
 from anemoi.evaluation.sources.anemoi_inference import checkpoint_task
 from anemoi.evaluation.sources.anemoi_inference import create_input_state
 from anemoi.evaluation.sources.anemoi_inference import inference_chunks
 from anemoi.evaluation.sources.anemoi_inference import inference_env
 from anemoi.evaluation.sources.anemoi_inference import patched_metadata
+from anemoi.evaluation.sources.anemoi_inference import rollout_schedule
 
 HOUR = datetime.timedelta(hours=1)
 T0 = datetime.datetime(2024, 1, 1)
@@ -213,18 +214,16 @@ def test_checkpoint_task_reads_each_level_anemoi_core_has_stored():
     )
 
 
-def test_only_forecasters_on_the_lead_time_grid_are_accepted(caplog):
+def test_only_forecasters_are_accepted(caplog):
     for accepted in (
         {},
         metadata(target="anemoi.training.tasks.Forecaster"),  # most checkpoints of anemoi-core #896 to #1450
         metadata(top="forecaster", target="anemoi.training.tasks.Forecaster"),
         metadata(model_task="anemoi.training.train.tasks.GraphEnsForecaster"),
         metadata(task="forecaster"),
-        metadata(task="offset-forecaster", output_offsets=["6h", "12h"], rollout_shift="12h"),
-        metadata(task="offset-forecaster", output_offsets=["6h"]),  # the shift defaults to the last offset
+        metadata(task="offset-forecaster", output_offsets=["6h", "12h", "24h"], rollout_shift="24h"),
     ):
         check_task(accepted)
-        check_output_offsets(accepted)
     assert not caplog.records
     # an unknown class passes with a warning
     check_task(metadata(target="my.package.DAForecaster"))
@@ -245,12 +244,51 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted(caplog):
         check_task(metadata(task="temporal-downscaler"))
     with pytest.raises(ValueError, match=r"not supported yet, only forecaster"):
         check_task(metadata(task="spatial-downscaler"))
-    with pytest.raises(ValueError, match=r"offsets \['6h', '12h', '24h'\] with rollout shift 24h of dataset 'ds'"):
-        check_output_offsets(metadata(task="offset-forecaster", output_offsets=["6h", "12h", "24h"]))
-    with pytest.raises(ValueError, match=r"offsets \['12h'\] with rollout shift 12h"):
-        check_output_offsets(metadata(task="offset-forecaster", output_offsets=["12h"], rollout_shift="12h"))
-    with pytest.raises(ValueError, match=r"offsets \['6h', '12h'\] with rollout shift 6h"):
-        check_output_offsets(metadata(task="offset-forecaster", output_offsets=["6h", "12h"], rollout_shift="6h"))
+
+
+def hours(*values: float) -> list[datetime.timedelta]:
+    return [value * HOUR for value in values]
+
+
+def test_rollout_schedule_follows_the_offsets():
+    # a forecaster: k * timestep, one call per lead time or per `n` of them
+    assert rollout_schedule(18 * HOUR, hours(6), 6 * HOUR) == [(0, 6 * HOUR), (1, 12 * HOUR), (2, 18 * HOUR)]
+    assert rollout_schedule(18 * HOUR, hours(6, 12), 12 * HOUR) == list(zip([0, 0, 1], hours(6, 12, 18)))
+    # an offset forecaster: k * shift + offset, a lead time between calls computes the next call and drops the rest
+    assert rollout_schedule(48 * HOUR, hours(6, 12, 24), 24 * HOUR) == list(
+        zip([0, 0, 0, 1, 1, 1], hours(6, 12, 24, 30, 36, 48))
+    )
+    assert rollout_schedule(36 * HOUR, hours(6, 12, 24), 24 * HOUR) == list(
+        zip([0, 0, 0, 1, 1], hours(6, 12, 24, 30, 36))
+    )
+    # outputs that skip lead times, or reach past the shift
+    assert rollout_schedule(36 * HOUR, hours(12), 12 * HOUR) == list(zip([0, 1, 2], hours(12, 24, 36)))
+    assert rollout_schedule(48 * HOUR, hours(12, 30), 24 * HOUR) == list(zip([0, 0, 1], hours(12, 30, 36)))
+    assert rollout_schedule(26 * HOUR, hours(12, 30), 24 * HOUR) == [(0, 12 * HOUR)]
+
+
+def test_rollout_timing_refuses_only_what_cannot_be_scored():
+    for inputs, outputs, shift in (
+        (hours(-6, 0), hours(6), 6 * HOUR),
+        (hours(-12, 0), hours(6, 12, 24), 24 * HOUR),
+        (hours(0), hours(12), 12 * HOUR),
+        (hours(-12, 0), hours(12, 30), 24 * HOUR),  # past the shift but in order
+        (hours(-24, -6, 0), hours(6, 12), 24 * HOUR),  # gaps between the calls
+    ):
+        check_rollout_timing(inputs, outputs, shift)
+    with pytest.raises(ValueError, match=r"input offsets \['-12h', '-6h'\] do not end at 0h: not supported yet"):
+        check_rollout_timing(hours(-12, -6), hours(6), 6 * HOUR)
+    for outputs, shift in (
+        (hours(0, 6), 6 * HOUR),  # an output at the init time
+        (hours(12, 6), 12 * HOUR),  # out of order
+        (hours(6, 6), 6 * HOUR),
+        (hours(6, 30), 24 * HOUR),  # 30h from both calls
+        (hours(6, 42), 24 * HOUR),  # 30h before 42h, after it
+    ):
+        with pytest.raises(
+            ValueError, match=r"output offsets .* not positive, increasing and within one rollout shift"
+        ):
+            check_rollout_timing(hours(0), outputs, shift)
 
 
 def test_patch_metadata_overrides_the_task():

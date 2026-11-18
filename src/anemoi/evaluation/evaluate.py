@@ -236,7 +236,11 @@ class Evaluation:
         return {"param": params, "level": levels}
 
     def model_calls_per_init(self) -> tuple[int, datetime.timedelta]:
-        """Model calls one init time needs and the lead time they compute, from the source's frames per call."""
+        """Model calls one init time needs and the lead time they compute: the source's `model_calls(lead_time)` when
+        it has one, otherwise from its frames per call on evenly spaced lead times."""
+        model_calls = getattr(self.forecast, "model_calls", None)
+        if model_calls is not None:
+            return model_calls(self.lead_time)
         steps = [lead for lead in self.lead_times if lead > datetime.timedelta(0)]
         calls = math.ceil(len(steps) / self.forecast.frames_per_pass)
         return calls, calls * self.forecast.frames_per_pass * (steps[0] if steps else self.lead_time)
