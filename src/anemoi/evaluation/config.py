@@ -343,9 +343,9 @@ def config_dataset_names(config: Any) -> list[str]:
 
 
 class BinsConfig(_Model):
-    """Time binning: one bin per season, month or date (`time`), of the init or valid time (`by`)."""
+    """Time binning: one bin per season, month, hour or date (`time`), of the init or valid time (`by`)."""
 
-    time: Literal["season", "month", "init_time", "none"] = "season"
+    time: Literal["season", "month", "hour", "init_time", "none"] = "season"
     by: Literal["init_time", "valid_time"] = "init_time"
 
     def build(

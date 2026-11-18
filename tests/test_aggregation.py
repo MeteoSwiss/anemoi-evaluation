@@ -91,6 +91,8 @@ def test_binnings():
         ("season", "valid_time"): (["DJF", "MAM", "JJA", "SON"], 0),
         ("month", "init_time"): ([f"{m:02d}" for m in range(1, 13)], 10),
         ("month", "valid_time"): ([f"{m:02d}" for m in range(1, 13)], 11),
+        ("hour", "init_time"): ([f"{h:02d}" for h in range(24)], 12),
+        ("hour", "valid_time"): ([f"{h:02d}" for h in range(24)], 6),
         ("init_time", "init_time"): (["2024-11-30T12:00:00", "2024-12-01T00:00:00"], 0),
         ("init_time", "valid_time"): (
             [
@@ -111,5 +113,8 @@ def test_binnings():
         build("init_time", "init_time", inits).index(
             Frame(init + 6 * HOUR, lead, init + 6 * HOUR + lead, ["a"], frame.data)
         )
+    lead = lead + datetime.timedelta(minutes=50)
+    sub_hourly = Frame(init, lead, init + lead, ["a"], frame.data)
+    assert build("hour", "valid_time").index(sub_hourly) == 6
     with pytest.raises(ValueError):
         build("week")
