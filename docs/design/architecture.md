@@ -354,7 +354,9 @@ A metric may declare an **extra output axis** through `output_dim`, returning a 
 values; `to_xarray` then writes that metric on the four standard dimensions plus that one and adds the
 coordinate. It lives only here: the state, `load_state` and `merge` keep the four-axis shape, one sum per
 statistic. That is the cheap side of the trade, because the exactness argument is about the sums and the
-sums do not move.
+sums do not move. Metrics naming the same axis share one coordinate, so `metrics.build` refuses two that
+give it different values (two `rev` with different `cost_loss` lists) at config load rather than at the
+end of a run.
 
 ### 3.12 CLI: `__main__.py`
 

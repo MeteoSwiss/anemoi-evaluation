@@ -6,9 +6,10 @@ CPU only, a second or two. Hard checks: n_init, weight sums consistent with the 
 excluded fraction is the NaN fraction; at lead 0 diagnostic variables are excluded entirely and prognostic scores are
 exactly zero when the targets come from the input dataset), mae <= rmse, no NaN metric at leads > 0, and for ensembles
 spread > 0, crps > 0, fair_crps <= crps, member_rmse >= rmse, member_mae >= mae; acc within [-1, 1]. For every
-threshold label found in the file: the score ranges (pod, far, csi, brier and the base rate within [0, 1], ets within
-[-1/3, 1], hss and pss within [-1, 1], bss <= 1, frequency_bias >= 0), csi <= pod, csi <= 1 - far, the four-cell
-identity hit + miss + false_alarm <= state_weights, and, at one member, brier == miss + false_alarm to 1e-12
+threshold label found in the file: the score ranges (pod, far, pofd, csi, f1, brier and the base rate within [0, 1],
+ets within [-1/3, 1], hss, pss, sedi and orss within [-1, 1], bss <= 1, frequency_bias and odds_ratio >= 0),
+csi <= pod, csi <= 1 - far, hit + miss + false_alarm <= state_weights, the four cells adding up to state_weights to
+1e-9 relative when correct_negative is stored, and, at one member, brier == miss + false_alarm to 1e-12
 relative (the identity is exact per element, the sums group the terms differently). For a rank histogram: every bin
 within [0, 1], the bins summing to 1 to 1e-12 relative, `outlier_fraction` equal to the two end bins, the `rank`
 coordinate matching the file's `members` attr, and the raw sums adding up to `state_weights` to 1e-9 relative.
@@ -16,7 +17,9 @@ For every reliability label: the `probability` coordinate matching `k / M`, the 
 forecast-probability distribution within [0, 1], that distribution summing to 1 to 1e-12 relative, the raw level
 sums adding up to `state_weights` to 1e-9 relative and NaN for the variables without a threshold, no NaN
 component at leads > 0, `brier_reliability` and `brier_resolution` non-negative, `brier_uncertainty` within
-[0, 0.25], and `brier_reliability - brier_resolution + brier_uncertainty == brier` to 1e-12 relative.
+[0, 0.25], `brier_reliability - brier_resolution + brier_uncertainty == brier` to 1e-12 relative, the ROC rates within
+[0, 1], 1 at level 0 and non-increasing along `probability`, `roc_area` within [0, 1], and `rev` <= 1 on a strictly
+increasing `cost_loss` coordinate within (0, 1). Also `error_std <= rmse` and `activity_ratio >= 0`.
 
 Prints the attrs, the lead times, regions and variables, n_init per lead, the per-region weight total of one init time,
 the excluded-node fraction per lead, the range of every metric present, the inequality checks, the 2t / z_500 / tp
@@ -71,7 +74,19 @@ if 0 in leads:
         f"lead 0: max |rmse| over finite entries {worst:.3e} (must be 0 when targets == inputs); NaN variables {nan_vars}"
     )
     ok &= worst == 0.0
-for name in ("rmse", "mae", "bias", "crps", "fair_crps", "spread", "spread_skill", "member_rmse", "member_mae", "acc"):
+SCALARS = (
+    "rmse",
+    "mae",
+    "bias",
+    "error_std",
+    "crps",
+    "fair_crps",
+    "spread",
+    "spread_skill",
+    "member_rmse",
+    "member_mae",
+)
+for name in (*SCALARS, "acc", "activity_ratio"):
     if name not in ds:
         continue
     a = ds[name].sel(bin=season)
@@ -82,6 +97,14 @@ if "mae" in ds:
     viol = float((ds["mae"] - ds["rmse"]).sel(bin=season).max())
     print("max(mae - rmse):", f"{viol:.3e}", "(must be <= 0)")
     ok &= viol <= 1e-9
+if "error_std" in ds and "rmse" in ds:
+    viol = float((ds["error_std"] - ds["rmse"]).sel(bin=season).max())
+    print("max(error_std - rmse):", f"{viol:.3e}", "(must be <= 0)")
+    ok &= viol <= 1e-9
+if "activity_ratio" in ds:
+    a = ds["activity_ratio"].sel(bin=season).values[positive]
+    print(f"activity_ratio: min {np.nanmin(a):.4f} max {np.nanmax(a):.4f} (must be >= 0)")
+    ok &= bool(np.nanmin(a) >= 0.0)
 if "member_rmse" in ds:
     viol = float((ds["rmse"] - ds["member_rmse"]).sel(bin=season).max())
     print("max(rmse - member_rmse):", f"{viol:.3e}", "(must be <= 0)")
@@ -116,8 +139,29 @@ for var in ("2t", "z_500", "tp"):
                     for r in ds["region"].values
                 },
             )
-THRESHOLD_KINDS = ("pod", "far", "csi", "ets", "frequency_bias", "hss", "pss", "brier", "bss", "event_frequency")
+THRESHOLD_KINDS = (
+    "pod",
+    "far",
+    "csi",
+    "ets",
+    "frequency_bias",
+    "hss",
+    "pss",
+    "pofd",
+    "sedi",
+    "odds_ratio",
+    "orss",
+    "f1",
+    "brier",
+    "bss",
+    "event_frequency",
+)
 BOUNDS = {
+    "pofd": (0.0, 1.0),
+    "sedi": (-1.0, 1.0),
+    "odds_ratio": (0.0, np.inf),
+    "orss": (-1.0, 1.0),
+    "f1": (0.0, 1.0),
     "pod": (0.0, 1.0),
     "far": (0.0, 1.0),
     "csi": (0.0, 1.0),
@@ -135,6 +179,10 @@ RELIABILITY_KINDS = (
     "brier_reliability",
     "brier_resolution",
     "brier_uncertainty",
+    "roc_pod",
+    "roc_pofd",
+    "roc_area",
+    "rev",
 )
 KINDS = tuple(sorted(THRESHOLD_KINDS + RELIABILITY_KINDS, key=len, reverse=True))
 
@@ -166,7 +214,7 @@ for label in labels:
     # A variable the threshold map does not name is NaN in the raw sums; a variable with a threshold but no observed
     # event is finite there while its `pod` is all NaN, so the sums are the discriminator when the file has them.
     # Only the populated cells count: a bin no frame fell into holds the exact zeros of the empty state, not NaN.
-    sums = [f"state_sum_{kind}_{label}" for kind in ("event_frequency", "hit")]
+    sums = [f"state_sum_{kind}_{label}" for kind in ("event_frequency", "hit", "false_alarm", "correct_negative")]
     sample = next((ds[name].values for name in sums if name in ds), None)
     if sample is None:
         sample = next(iter(present.values())).values  # (lead_time, variable, region)
@@ -210,6 +258,14 @@ for label in labels:
         excess = extremes(np.where(weights > 0, total - weights, 0.0) / np.where(weights > 0, weights, 1.0))[1]
         print(f"  max((hit + miss + false_alarm) / weights - 1): {excess:.3e} (must be <= 0)")
         ok &= bool(np.isnan(excess) or excess <= 1e-9)
+        negatives = f"state_sum_correct_negative_{label}"
+        if negatives in ds:  # the stored fourth cell closes the table
+            total = total + ds[negatives].values[:, :, scored, :]
+            populated = weights > 0
+            gap = np.abs(total[populated] - weights[populated]) / weights[populated]
+            worst = float(np.nanmax(gap)) if gap.size else float("nan")
+            print(f"  max |four cells / weights - 1|: {worst:.3e} (must be <= 1e-9)")
+            ok &= bool(np.isnan(worst) or worst <= 1e-9)
     brier, misses = f"state_sum_brier_{label}", [f"state_sum_{kind}_{label}" for kind in ("miss", "false_alarm")]
     if int(ds.attrs["members"]) == 1 and brier in ds and all(name in ds for name in misses):
         left, right = ds[brier].values, sum(ds[name] for name in misses).values
@@ -304,6 +360,31 @@ for label in reliability_labels:
                 deviation = float(np.abs(rows.sum(-1) - 1.0).max())
                 print(f"    max |sum over the levels - 1|: {deviation:.3e} (must be <= 1e-12 relative)")
                 ok &= bool(np.allclose(rows.sum(-1), 1.0, rtol=1e-12, atol=0.0))
+    for kind in ("roc_pod", "roc_pofd"):
+        if kind not in present:
+            continue
+        values = present[kind].values[positive][:, scored, :, :]  # (lead_time, variable, region, probability)
+        shape_ok = values.shape[-1] == members + 1 and np.array_equal(ds["probability"].values, levels)
+        smallest, largest = extremes(values)
+        first = values[..., 0][np.isfinite(values[..., 0])]
+        rising = float(np.nanmax(np.diff(values, axis=-1), initial=-np.inf))
+        print(
+            f"  {kind}_{label}: {values.shape[-1]} levels, probability k/M: {shape_ok}; min {smallest:.4g} "
+            f"max {largest:.4g} (within [0, 1]); level 0 is 1: {bool((first == 1.0).all())}; "
+            f"max increase along probability {rising:.3e} (must be <= 0)"
+        )
+        ok &= shape_ok and bool((first == 1.0).all()) and rising <= 1e-12
+        ok &= bool(np.isnan(smallest) or (smallest >= -1e-9 and largest <= 1 + 1e-9))
+    if "roc_area" in present:
+        smallest, largest = extremes(present["roc_area"].values[positive][:, scored, :])
+        print(f"  roc_area_{label}: min {smallest:.4g} max {largest:.4g} (within [0, 1])")
+        ok &= bool(np.isnan(smallest) or (smallest >= -1e-9 and largest <= 1 + 1e-9))
+    if "rev" in present:
+        ratios = ds["cost_loss"].values
+        axis_ok = bool(((ratios > 0) & (ratios < 1)).all() and (np.diff(ratios) > 0).all())
+        largest = extremes(present["rev"].values[positive][:, scored, :, :])[1]
+        print(f"  rev_{label}: cost_loss {ratios.tolist()} ok: {axis_ok}; max {largest:.4g} (must be <= 1)")
+        ok &= axis_ok and bool(np.isnan(largest) or largest <= 1 + 1e-9)
     for kind in ("brier_reliability", "brier_resolution", "brier_uncertainty"):
         if kind not in present:
             continue

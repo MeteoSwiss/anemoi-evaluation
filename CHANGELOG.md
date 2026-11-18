@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Features
+
+* New metrics `error_std` (the error standard deviation) and `activity_ratio` (the forecast against the
+  observed anomaly activity, with a climatology like `acc`).
+* New contingency scores `pofd`, `sedi`, `odds_ratio`, `orss` and `f1`, configured with a label and a
+  threshold map like `csi`. The first four store a new `correct_negative_<label>` sum; the existing scores
+  and their sums are unchanged.
+* New ROC metrics `roc_pod` and `roc_pofd` on the `probability` axis, and their area
+  `roc_area`, from the reliability level sums.
+* New metric `rev`, the relative economic value over a configured `cost_loss` list, written on a
+  `cost_loss` axis.
+
 ### Fixes
 
 * Runs on anemoi-inference >= 0.13 as well as on older releases: the initial state was built with
