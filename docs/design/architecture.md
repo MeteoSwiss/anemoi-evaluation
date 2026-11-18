@@ -306,8 +306,9 @@ init-time list for their bin coordinates to match.
 `Evaluation` is the object the YAML config serialises (FR-23, FR-24). Construction has no side
 effects on the model: it validates the arguments, resolves the lead times, checks grid
 compatibility, passes `frames_per_pass` to the target source's `prefetch_hint()`, runs the target
-checks of `checks.py` on the resolved variables (FR-41), checks the metrics' member requirements, resolves the device (the explicit argument, then the forecast
-source's preference, then cuda if available, then cpu) and finally checks the init times against
+checks of `checks.py` on the resolved variables (FR-41), checks the metrics' member requirements,
+resolves the device (the explicit argument, then the forecast source's preference, then cuda if
+available, then cpu) and finally checks the init times against
 the runner's datasets. `weights`, `regions` and `aggregator` are cached properties, so a weight
 spec that needs the checkpoint graph loads the model only when `run()` does.
 

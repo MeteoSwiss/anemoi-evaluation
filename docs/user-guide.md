@@ -170,11 +170,11 @@ targets:
 ```
 
 When the evaluation is built, and so in a dry run, the targets are checked against the model. A
-run warns when a scored accumulation, such as `tp`, covers another period in the targets than in
+run warns when a scored accumulation, such as `tp`, covers another period in these targets than in
 the checkpoint's training data, and when `open_dataset` makes target values up at some dates
 (`interpolate_frequency`, `fill_missing_dates` other than `nan`, `rolling_average`). Set
 `on_period_mismatch` or `on_made_up_dates` to `raise` to refuse the run instead, or to `ignore`;
-the details are in the [reference](reference.md#target-checks).
+the details and what the checks cannot see are in the [reference](reference.md#target-checks).
 
 ### Reusing configs: `base` and `from_checkpoint`
 
@@ -784,9 +784,9 @@ The baseline is `linear_interpolation` between the same bounds, configured like 
 
 **The truth must be real between the bounds.** Targets opened with `interpolate_frequency` are
 themselves linear interpolations, which the baseline matches exactly, so the run warns
-(`on_made_up_dates`). On a cutout
-of an hourly LAM inside an interpolated global analysis, score the LAM as its own region
-(`regions: {lam: {grid: 0}}`). The rules and refusals are in the [reference](reference.md#lead-times).
+(`on_made_up_dates`). On a cutout of an hourly LAM inside an interpolated global analysis, score
+the LAM as its own region (`regions: {lam: {grid: 0}}`). The rules and refusals are in the
+[reference](reference.md#lead-times).
 
 ## Persistence and the other included sources
 
