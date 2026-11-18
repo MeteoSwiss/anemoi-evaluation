@@ -20,6 +20,10 @@
   `cost_loss` axis.
 * Offset forecasters are scored at the lead times of their own output offsets and rollout shift, and
   the init-time check reads the dates of their input offsets. The dry-run plan lists the offsets.
+* Temporal downscalers are scored, for now between analysis bounds: an init time is the window's left bound
+  and `lead_time` the window. Forecast bounds, a downscaler after a forecaster, are planned.
+* New `linear_interpolation` forecast source, the downscaler baseline. A run warns when a downscaler's
+  targets are opened with `interpolate_frequency`.
 
 ### Fixes
 
@@ -29,10 +33,12 @@
 * A checkpoint saved without its training graph (anemoi-core's trimmed inference checkpoints) no longer fails
   with `'NoneType' object is not subscriptable`: the default weights fall back from `area_weight` to
   `spherical_voronoi` with a warning, and an explicit `graph_attribute` raises `MissingGraphError` naming it.
-* Checkpoints of a task not supported yet (temporal downscaler, autoencoder, ...) are refused at construction
-  with a message naming the task, instead of failing mid-run. `patch_metadata` can override the task.
+* Checkpoints of a task not supported yet (autoencoder, temporal downscaler trained on forecast trajectories,
+  ...) are refused at construction with a message naming the task, instead of failing mid-run.
+  `patch_metadata` can override the task.
 * A checkpoint whose timing anemoi-core cannot produce (hand-edited or patched offsets) is refused at
   construction.
+* A runner that does not fit the checkpoint's task is refused at construction, naming the `runner:` to set.
 * The refusal of downscaling checkpoints no longer claims that anemoi-inference cannot run them.
 
 ## 0.3.0 — 2026-09-17

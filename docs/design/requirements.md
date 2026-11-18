@@ -32,8 +32,9 @@ In scope at v0.3.0: deterministic and ensemble forecasts from an anemoi checkpoi
 or multiple datasets, gridded targets from an anemoi dataset on the same grid, deterministic and
 ensemble metrics, weighting, regions, time bins, a persistence baseline, a climatology for anomaly
 scores, a YAML configuration and CLI, and sharding with exact merging. Section 5 lists what is
-deliberately outside. The goal is to score every anemoi task: at v0.3.0 only forecasters are
-supported, the others (downscalers, autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5.
+deliberately outside. The goal is to score every anemoi task: forecasters, and for now temporal
+downscalers between analysis bounds, are supported; the others (temporal downscalers with forecast
+bounds, spatial downscalers, autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5.
 The package itself is device-agnostic, but the anemoi checkpoints it is validated against do not
 run on CPU, so an end-to-end exercise needs a GPU.
 
@@ -93,6 +94,13 @@ end-to-end check of the whole pipeline.*
 
 **FR-6** The package MUST provide a persistence forecast source (the target at init time repeated
 at every lead) as a baseline and as a model-free end-to-end check.
+
+**FR-40** The package MUST score a temporal downscaler between analysis bounds, one window per init
+time, against linear interpolation between the same bounds, and MUST warn when the targets are opened
+with `interpolate_frequency`.
+*Rationale: a first step that compares downscalers; forecast bounds, a downscaler after a forecaster,
+are planned (MeteoSwiss/anemoi-evaluation#5). Interpolated targets would score the distance to an
+interpolation, not to the truth.*
 
 **FR-7** Before a run, the package MUST refuse init times whose rollout would read dates absent
 from, or listed as missing in, the datasets the runner reads.
@@ -361,7 +369,7 @@ is no model-parallel or multi-rank runner (section 5).
 
 **NFR-17** The package MUST NOT modify the anemoi packages and MUST work around what it finds in
 them. Private coupling to anemoi-inference MUST be minimal and isolated in named helpers.
-**Status: met with two couplings**, both named in [`architecture.md`](architecture.md) section 8.
+**Status: met with three couplings**, all named in [`architecture.md`](architecture.md) section 8.
 
 ### 4.5 I/O
 
@@ -435,7 +443,7 @@ Deliberate non-goals at v0.3.0. Each is a decision, not an oversight.
 
 The functional requirements are verified by the unit suite (naive numpy references, fake sources,
 the config forms and the merge checks) and, where they need a real checkpoint, by the scripts in
-[`tools/`](../../tools/README.md): `validate.py` for FR-1 to FR-11 and NFR-1 to NFR-3,
+[`tools/`](../../tools/README.md): `validate.py` for FR-1 to FR-11, FR-40 and NFR-1 to NFR-3,
 `compare_results.py` for NFR-4, `ab_prefetch.py` for NFR-10 and NFR-20, and the run attributes
 for the rest of section 4.2. The measurements behind every *Evidence* line above, and the
 testbeds they were taken on, are in [`../benchmarks.md`](../benchmarks.md).

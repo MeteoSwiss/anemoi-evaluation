@@ -18,6 +18,7 @@ in the [reference](reference.md); the reasons behind the design are in the
 - [Rank histogram](#rank-histogram)
 - [Reliability diagram](#reliability-diagram)
 - [ROC curve and economic value](#roc-curve-and-economic-value)
+- [Temporal downscalers](#temporal-downscalers)
 - [Persistence and the other included sources](#persistence-and-the-other-included-sources)
 - [Sharding and merging](#sharding-and-merging)
 - [Reading the results](#reading-the-results)
@@ -31,7 +32,8 @@ in the [reference](reference.md); the reasons behind the design are in the
   range (`start`, `end`, `frequency`) or as explicit dates. The **lead times** are those the
   forecast source yields up to `lead_time`: `k * timestep` for a forecaster or a persistence baseline
   (so `lead_time` must be a positive multiple of the timestep), the outputs of each model call for an
-  offset forecaster ([lead times](reference.md#lead-times)).
+  offset forecaster ([lead times](reference.md#lead-times)); temporal downscalers differ, see
+  [Temporal downscalers](#temporal-downscalers).
 - A **frame** is one forecast step: float32 `(members, variables, nodes)` at one valid time.
   Every frame is paired with the target field at the same valid time.
 - A **statistic** is computed per element (variable, node) of a frame and accumulated as a
@@ -326,8 +328,8 @@ check reads the dates the model reads: for inputs `[-12h, 0h]`, `init - 12h` and
 `k * timestep` lead times and shares only some of them.
 
 `include_lead_zero: true` adds a lead-0 frame from the initial state, before any model call. It
-works for sources that declare `supports_lead_zero` (the inference and persistence sources do;
-asking for it elsewhere raises `cannot produce lead-0 frames`). For the inference source the
+works for sources that declare `supports_lead_zero` (the inference source of a forecaster and the
+persistence source do; asking for it elsewhere raises `cannot produce lead-0 frames`). For the inference source the
 lead-0 frame is the init-time slice of every requested variable present in the input state, and
 **NaN for the rest**: diagnostic variables such as `tp` have no analysis. Those NaN nodes are
 excluded, so a diagnostic variable at lead 0 has weight sum 0 and a NaN metric, while prognostic
@@ -716,9 +718,9 @@ for name, state in evaluation.run().items():
 ```
 
 Two checkpoints are refused at construction: one whose datasets disagree on the timestep or the
-input and output steps or offsets, and a downscaling checkpoint whose model does not decode every dataset
-(not supported yet). Only forecasters are scored: any other task (temporal downscaler,
-autoencoder, ...) is refused at construction (see the
+input and output steps or offsets, and a spatial downscaler, whose model does not decode every dataset
+(not supported yet). Forecasters and temporal downscalers are scored: any other task
+(autoencoder, ...) is refused at construction (see the
 [reference](reference.md#limitations-and-undefined-behaviour)). A wrong stored
 task can be fixed with `patch_metadata: {metadata_inference: {task: forecaster}}` in the
 `anemoi_inference` block.
@@ -749,6 +751,28 @@ Selecting exactly one dataset makes the run an ordinary single-dataset one: `out
 file has the usual single-dataset layout. It does carry the `dataset` attribute, which names the
 dataset of the checkpoint that was scored; results of a checkpoint that has only one dataset carry
 no such attribute.
+
+## Temporal downscalers
+
+For now a temporal downscaler is scored between analysis bounds: it reads the analyses at `t` and
+`t + T` and is scored against the analyses in between. This measures interpolation skill and is
+meant for comparing downscalers; scoring one after a forecaster, with forecast bounds, is planned
+(MeteoSwiss/anemoi-evaluation#5). An init time is the left bound `t`, `lead_time` is the window `T`,
+the lead times are the offsets of the outputs inside it, and each init time is one model call.
+
+```yaml
+forecast:
+  anemoi_inference: {checkpoint: /path/to/temporal-downscaler.ckpt}   # bounds 0 and 6h, outputs 1h to 5h
+lead_time: 6h                                                       # the window
+```
+
+The baseline is `linear_interpolation` between the same bounds, configured like persistence
+(`timestep` and an explicit `targets` block).
+
+**The truth must be real between the bounds.** Targets opened with `interpolate_frequency` are
+themselves linear interpolations, which the baseline matches exactly, so the run warns. On a cutout
+of an hourly LAM inside an interpolated global analysis, score the LAM as its own region
+(`regions: {lam: {grid: 0}}`). The rules and refusals are in the [reference](reference.md#lead-times).
 
 ## Persistence and the other included sources
 
@@ -966,9 +990,11 @@ Config and sources:
 | `from_checkpoint at <key> is only resolved in ...` | it was used in a nested block; move it to the top of the dataset block |
 | `checkpoint ... only a single mapping can be reused` | the recorded `open_dataset` arguments are not one mapping; spell the dataset out |
 | `target datasets must have one member` | the target zarr has an ensemble dimension; select a member in the `open_dataset` arguments |
-| `the checkpoint's task is '...'` | the checkpoint is not a forecaster: not supported yet (MeteoSwiss/anemoi-evaluation#5). A wrong stored task can be fixed with `patch_metadata` |
+| `the checkpoint's task is '...'` | the checkpoint is neither a forecaster nor a temporal downscaler: not supported yet (MeteoSwiss/anemoi-evaluation#5). A wrong stored task can be fixed with `patch_metadata` |
 | `invalid checkpoint timing: ...` | the input or output offsets or the rollout shift are not ones anemoi-core produces; check a hand-edited checkpoint or a `patch_metadata` block |
 | `lead time ... is shorter than the model's first output offset` | raise `lead_time` to at least the first output offset |
+| `the lead time must be its window ...` | a temporal downscaler is scored one window per init time: set `lead_time` to its window |
+| `... trained on forecast trajectories: not supported yet`, `the temporal downscaler's target times [...] are not supported yet` | not supported yet (MeteoSwiss/anemoi-evaluation#4, #5) |
 
 Dates, grids, variables and merging:
 

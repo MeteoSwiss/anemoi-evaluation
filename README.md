@@ -24,6 +24,7 @@ contents of the result file may still change between releases.
 * **Ensembles** as lockstep rollouts of the same runner, reseeded per member and per model call.
 * **Multi-step-output models and offset forecasters** (several lead times per forward pass, at the
   checkpoint's own offsets) are scored per output time; lead 0 can be scored from the initial state.
+* **Temporal downscalers**, for now between analysis bounds, against a linear-interpolation baseline.
 * **Weights, regions and time bins**: node weights from the model graph, a file, spherical
   Voronoi areas or uniform; regions from a graph attribute, a bounding box, a sub-grid of a
   cutout or a file; bins per season, month or init time, of the init or the valid time.
@@ -33,7 +34,8 @@ contents of the result file may still change between releases.
 * **Sharding** over init times (`--shard i/n`, or automatically from Slurm job steps and job
   arrays) with exact merging of the partial results.
 * **Bring your own sources**: forecast, target and climatology sources are small protocols; a
-  persistence baseline, an in-memory climatology and in-memory fakes are included.
+  persistence baseline, a linear-interpolation baseline, an in-memory climatology and in-memory
+  fakes are included.
 * **Low I/O**: targets are prefetched on a worker thread, with an optional decoded-row cache,
   while the model steps.
 * **Reproducible runs**: the result file records the resolved config, the package versions, the
@@ -168,6 +170,8 @@ src/anemoi/evaluation/
     sources/anemoi_inference.py   forecasts from an anemoi-inference runner
     sources/anemoi_dataset.py     targets from an anemoi-datasets zarr, prefetched
     sources/persistence.py        persistence baseline
+    sources/linear_interpolation.py  linear interpolation baseline of a temporal downscaler
+    sources/temporal_downscaler.py   window, lead times and input state of a temporal downscaler
     sources/climatology.py        climatologies for the anomaly statistics
     sources/fake.py               in-memory synthetic sources
 tests/                   CPU-only test suite on the in-memory fakes

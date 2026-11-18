@@ -49,6 +49,7 @@ from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSource
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.climatology import ArrayClimatology
+from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
 from anemoi.evaluation.sources.persistence import PersistenceForecastSource
 
 LOG = logging.getLogger(__name__)
@@ -130,6 +131,13 @@ class Evaluation:
         if include_lead_zero:
             self.lead_times = [datetime.timedelta(0), *self.lead_times]
         forecast.grid.check_compatible(targets.grid)
+        if getattr(forecast, "temporal_downscaling", False) and getattr(targets, "interpolate_frequency", None):
+            LOG.warning(
+                "the targets are opened with interpolate_frequency %s: between the dates of the dataset it "
+                "interpolates, the truth is itself a linear interpolation, not an analysis; score a region whose "
+                "data is real at every lead time",
+                targets.interpolate_frequency,
+            )
         targets.prefetch_hint(forecast.frames_per_pass)
         self.variables = self._resolve_variables(variables)
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
@@ -757,7 +765,7 @@ def _forecast_views(
     if isinstance(forecast, InferenceForecastSource) and forecast.multi_dataset:
         return {name: forecast.datasets[name] for name in names}, forecast
     if forecast is not None:
-        if len(names) > 1 and not isinstance(forecast, PersistenceForecastSource):
+        if len(names) > 1 and not isinstance(forecast, (PersistenceForecastSource, LinearInterpolationForecastSource)):
             LOG.warning(
                 "%s is not a multi-dataset source: its rollout is run once per dataset (%s), %d times in all",
                 type(forecast).__name__,
@@ -765,8 +773,11 @@ def _forecast_views(
                 len(names),
             )
         return dict.fromkeys(names, forecast), None
-    spec = config.forecast.persistence
-    return {name: PersistenceForecastSource(targets[name], spec.timestep, spec.members) for name in names}, None
+    if config.forecast.linear_interpolation is not None:
+        spec, baseline = config.forecast.linear_interpolation, LinearInterpolationForecastSource
+    else:
+        spec, baseline = config.forecast.persistence, PersistenceForecastSource
+    return {name: baseline(targets[name], spec.timestep, spec.members) for name in names}, None
 
 
 def _dataset_names(config: EvaluationConfig, forecast: ForecastSource | None, targets: object) -> list[str]:

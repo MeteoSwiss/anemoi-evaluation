@@ -27,6 +27,7 @@ from anemoi.evaluation.sources.base import TargetSourceBase
 from anemoi.evaluation.sources.climatology import ArrayClimatology
 from anemoi.evaluation.sources.fake import ArrayTargets
 from anemoi.evaluation.sources.fake import FakeForecastSource
+from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
 from anemoi.evaluation.sources.persistence import PersistenceForecastSource
 
 try:
@@ -48,6 +49,7 @@ __all__ = [
     "Frame",
     "Grid",
     "InferenceForecastSource",
+    "LinearInterpolationForecastSource",
     "MultiEvaluation",
     "PersistenceForecastSource",
     "TargetSourceBase",

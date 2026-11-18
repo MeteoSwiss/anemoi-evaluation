@@ -143,11 +143,17 @@ class PersistenceConfig(_Model):
         return frequency_to_string(value)
 
 
+class LinearInterpolationConfig(PersistenceConfig):
+    """Linear interpolation of the target between the bounds of a window (the run's `lead_time`), the baseline of a
+    temporal downscaler; needs an explicit `targets` block."""
+
+
 class ForecastConfig(_Model):
     """Forecast source, exactly one key."""
 
     anemoi_inference: AnemoiInferenceConfig | None = None
     persistence: PersistenceConfig | None = None
+    linear_interpolation: LinearInterpolationConfig | None = None
 
     @model_validator(mode="after")
     def _one_source(self) -> ForecastConfig:

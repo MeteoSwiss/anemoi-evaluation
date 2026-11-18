@@ -27,6 +27,9 @@ from anemoi.evaluation.sources.base import MissingGraphError
 from anemoi.evaluation.sources.base import lead_time_steps
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.base import variable_info
+from anemoi.evaluation.sources.temporal_downscaler import downscaler_window
+from anemoi.evaluation.sources.temporal_downscaler import trajectory_trained
+from anemoi.evaluation.sources.temporal_downscaler import window_input_state
 
 LOG = logging.getLogger(__name__)
 QUIET_LOGGERS = ("anemoi.inference", "anemoi.utils.timer")
@@ -223,11 +226,10 @@ class SharedForcings:
         return getattr(self.provider, name)
 
 
-SUPPORTED_TASKS = ("forecaster", "offset-forecaster")
+SUPPORTED_TASKS = ("forecaster", "offset-forecaster", "temporal-downscaler")
 # Tasks blocked by anemoi-inference, with the reason the refusal gives.
 INFERENCE_BLOCKERS = {
     "autoencoder": "anemoi-inference has no runner for it",
-    "temporal-downscaler": "anemoi-inference runs it only through `execute()`, not step by step",
 }
 # Class names of the task classes (`config.task._target_`) and of the older lightning modules
 # (`config.training.model_task`). Ensemble and diffusion modules are forecasters.
@@ -296,9 +298,10 @@ def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
     return result
 
 
-def check_task(metadata: Mapping) -> None:
-    """Refuse a checkpoint whose task is not supported yet. An unknown class path only warns: anemoi-inference runs
-    it as a forecaster."""
+def check_task(metadata: Mapping) -> str:
+    """The checkpoint's task; refuse one that is not supported yet. An unknown class path only warns: anemoi-inference
+    runs it as a forecaster. A temporal downscaler trained on forecast trajectories is refused too: its bounds are
+    forecasts and its truth a trajectory, which the evaluation cannot read yet."""
     task, origin = checkpoint_task(metadata)
     if task not in SUPPORTED_TASKS and "." in task:
         LOG.warning("unknown task class (%s), the checkpoint is evaluated as a forecaster", origin)
@@ -308,6 +311,32 @@ def check_task(metadata: Mapping) -> None:
             + (f" ({INFERENCE_BLOCKERS[task]})" if task in INFERENCE_BLOCKERS else "")
             + f", only {', '.join(SUPPORTED_TASKS)} so far, see MeteoSwiss/anemoi-evaluation#5"
         )
+    elif task == "temporal-downscaler" and trajectory_trained(metadata):
+        raise ValueError(
+            f"the checkpoint is a temporal downscaler ({origin}) trained on forecast trajectories: not supported yet "
+            "(only downscalers between analysis bounds so far; forecast bounds need trajectory targets, see "
+            "MeteoSwiss/anemoi-evaluation#4), see MeteoSwiss/anemoi-evaluation#5"
+        )
+    return task
+
+
+def check_runner(task: str, runner: object, configured: object, stored: object) -> None:
+    """Refuse a runner that does not fit the task, since the evaluation drives a temporal downscaler and a forecaster
+    differently; `configured` is the run configuration's `runner`, `stored` the `metadata_inference.task`, the only
+    field anemoi-inference's `auto` runner reads."""
+    from anemoi.inference.runners.temporal_downscaler import TemporalDownscalerMultiOutRunner
+
+    downscaler = task == "temporal-downscaler"
+    if downscaler == isinstance(runner, TemporalDownscalerMultiOutRunner):
+        return
+    cause = ""
+    if configured == "auto" and task_name(str(stored or "forecaster")) != task:
+        cause = f" (anemoi-inference's `runner: auto` reads only `metadata_inference.task`, which is {stored!r})"
+    raise ValueError(
+        f"the checkpoint's task is {task!r} but anemoi-inference built a {type(runner).__name__}{cause}: set "
+        f"`runner: {'temporal_downscaler' if downscaler else 'default'}` in the anemoi_inference block, or fix the "
+        "stored task with `patch_metadata: {metadata_inference: {task: ...}}`"
+    )
 
 
 def check_rollout_timing(
@@ -482,8 +511,10 @@ class InferenceForecastSource(ForecastSourceBase):
             config = RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"})
             # before the runner is built: the `auto` runner raises on a task it has no runner for
             metadata = load_metadata(Checkpoint(config.checkpoint).path)
-            check_task(patched_metadata(metadata, config.patch_metadata))
+            patched = patched_metadata(metadata, config.patch_metadata)
+            self.task = check_task(patched)
             self.runner = create_runner(config)
+            check_runner(self.task, self.runner, config.runner, (patched.get("metadata_inference") or {}).get("task"))
         self.dataset_names = list(self.runner.dataset_names)
         # One cache per dataset: the arrays depend on the state's latitudes and longitudes, so a single cache
         # would serve the first grid and bypass every other one for ever. `forcings_cache_bytes` is the budget
@@ -506,9 +537,18 @@ class InferenceForecastSource(ForecastSourceBase):
         self._check_shared_timing()
         self.input_offsets = list(self.runner.checkpoint.lagged)
         self.output_offsets = list(self.runner.checkpoint.output_offsets)
-        self.output_horizon = self.runner.checkpoint.rollout_shift
-        check_rollout_timing(self.input_offsets, self.output_offsets, self.output_horizon)
-        self.frames_per_pass = len(self.output_offsets)
+        if self.task == "temporal-downscaler":
+            # one window per init time: its outputs come from one model call, placed by `downscaler_window`
+            self.temporal_downscaling = True
+            self.window, self.window_leads = downscaler_window(self.runner.checkpoint)
+            self.output_horizon = self.window
+            self.frames_per_pass = len(self.window_leads)
+            self.supports_lead_zero = False  # lead 0 is the left bound, an input
+            self._window_constants: dict[str, dict] = {}
+        else:
+            self.output_horizon = self.runner.checkpoint.rollout_shift
+            check_rollout_timing(self.input_offsets, self.output_offsets, self.output_horizon)
+            self.frames_per_pass = len(self.output_offsets)
         self._check_every_dataset_is_decoded(metadata)
         # Which datasets the run scores; every one of them until an evaluation narrows it (the `datasets:` config
         # key). The model predicts them all whatever this says: the runner needs an input state for each one.
@@ -570,7 +610,7 @@ class InferenceForecastSource(ForecastSourceBase):
             )
 
     def _check_every_dataset_is_decoded(self, metadata: Mapping) -> None:
-        """Refuse a checkpoint whose model does not decode every dataset (a downscaler).
+        """Refuse a checkpoint whose model does not decode every dataset (a spatial downscaler).
 
         anemoi-inference runs one since ecmwf/anemoi-inference#605, but the evaluation does not score it yet. The
         routing is only readable from the stored training config, so a checkpoint that does not carry it is let
@@ -583,7 +623,7 @@ class InferenceForecastSource(ForecastSourceBase):
         if missing:
             raise ValueError(
                 f"the checkpoint's model does not decode {missing}, it only decodes {sorted(decoded)}: "
-                "downscaling checkpoints cannot be evaluated yet, see MeteoSwiss/anemoi-evaluation#5"
+                "spatial downscalers are not supported yet, see MeteoSwiss/anemoi-evaluation#5"
             )
 
     @property
@@ -593,7 +633,15 @@ class InferenceForecastSource(ForecastSourceBase):
 
     def lead_times(self, lead_time: datetime.timedelta) -> list[datetime.timedelta]:
         """Lead times of the model's outputs up to `lead_time` (see `rollout_schedule`); warns when the model's last
-        call computes beyond `lead_time`. A forecaster's `lead_time` must be a multiple of its timestep."""
+        call computes beyond `lead_time`. A forecaster's `lead_time` must be a multiple of its timestep, a temporal
+        downscaler's must be its window."""
+        if self.temporal_downscaling:
+            if lead_time != self.window:
+                raise ValueError(
+                    "a temporal downscaler is scored one window per init time: the lead time must be its window "
+                    f"{frequency_to_string(self.window)}, got {frequency_to_string(lead_time)}"
+                )
+            return list(self.window_leads)
         n = len(self.output_offsets)
         regular = self.output_offsets == [(i + 1) * self.timestep for i in range(n)]
         if regular and self.output_horizon == n * self.timestep:
@@ -633,6 +681,8 @@ class InferenceForecastSource(ForecastSourceBase):
 
     def model_calls(self, lead_time: datetime.timedelta) -> tuple[int, datetime.timedelta]:
         """Model calls a rollout up to `lead_time` makes and the lead time the last one computes."""
+        if self.temporal_downscaling:
+            return 1, self.window
         calls = math.ceil(lead_time / self.output_horizon)
         return calls, (calls - 1) * self.output_horizon + self.output_offsets[-1]
 
@@ -662,6 +712,9 @@ class InferenceForecastSource(ForecastSourceBase):
 
         The runner reuses the dict it yields and the per-dataset `fields` dicts, replacing only the arrays, so every
         dataset's frame is built (which copies the fields into a new tensor) before the dict is yielded."""
+        if self.temporal_downscaling:
+            yield from self._window_frames(init_time, lead_time, variables, device)
+            return
         names = list(variables)
         for name in names:
             select_variables(list(variables[name]), self.datasets[self._resolve_dataset(name)].variables)
@@ -718,6 +771,8 @@ class InferenceForecastSource(ForecastSourceBase):
     ) -> Frame:
         """Lead-0 frame of `dataset`: the init-time slice of every requested variable present in the input state
         (prognostics), NaN for the others (diagnostics have no analysis), identical for every member."""
+        if self.temporal_downscaling:
+            raise ValueError("a temporal downscaler has no lead-0 frame: lead 0 is its left bound, an input")
         name = self._resolve_dataset(dataset)
         view = self.datasets[name]
         select_variables(list(variables), view.variables)
@@ -745,11 +800,82 @@ class InferenceForecastSource(ForecastSourceBase):
             self._initial[dataset] = (init_time, state)
         return self._initial[dataset][1]
 
+    def _window_frames(
+        self,
+        init_time: datetime.datetime,
+        lead_time: datetime.timedelta,
+        variables: Mapping[str, list[str]],
+        device: torch.device,
+    ) -> Iterator[dict[str, Frame]]:
+        """A temporal downscaler's `multi_frames`: one model call per member over the window starting at
+        `init_time`, one frame per output offset, the left bound skipped.
+
+        The members advance in lockstep as a forecaster's do and each member's model call is preceded by
+        `member_seed(seed, init_time, member, 0)`. The runner yields the left bound first when it writes the initial
+        state (no model call), so a member is reseeded before every `next()` until its first output; its fields are
+        numpy arrays whatever `return_numpy` says, and are copied into tensors before the next `next()`. Any other
+        step than the window's leads, or a missing one, raises."""
+        names = list(variables)
+        for name in names:
+            select_variables(list(variables[name]), self.datasets[self._resolve_dataset(name)].variables)
+        leads = self.lead_times(lead_time)
+        states = {
+            name: window_input_state(self.runner, name, init_time, self.window, self._window_constants)
+            for name in self.dataset_names
+        }
+        self.runner.reference_date = None
+        with self._quiet(), torch.inference_mode():
+            generators = [
+                self.runner.run(input_states=states, lead_time=self.window, return_numpy=False)
+                for _ in range(self.members)
+            ]
+            called, yielded = [False] * self.members, []
+            try:
+                while True:
+                    outputs = []
+                    for member, generator in enumerate(generators):
+                        if not called[member]:
+                            torch.manual_seed(member_seed(self.seed, init_time, member, 0))
+                        output = next(generator, None)
+                        if output is not None and output[names[0]]["step"] > datetime.timedelta(0):
+                            called[member] = True
+                        outputs.append(output)
+                    if all(output is None for output in outputs):
+                        break
+                    if any(output is None for output in outputs):
+                        raise RuntimeError(f"members out of step at {init_time}")
+                    first = outputs[0][names[0]]
+                    step, date = first["step"], first["date"]
+                    if any(output[names[0]]["step"] != step for output in outputs):
+                        raise RuntimeError(f"members out of step at {init_time} + {step}")
+                    if step == datetime.timedelta(0) or first.get("temporally_downscaled") is False:
+                        continue  # the left bound, an input
+                    if step not in leads:
+                        raise RuntimeError(f"the runner yielded {step} at {init_time}, not a lead of the window")
+                    yielded.append(step)
+                    frames = {}
+                    for name in names:
+                        columns = list(variables[name])
+                        data = torch.stack(
+                            [
+                                torch.stack([torch.as_tensor(output[name]["fields"][v]) for v in columns])
+                                for output in outputs
+                            ]
+                        ).float()
+                        frames[name] = Frame(init_time, step, date, columns, data.to(device))
+                    yield frames
+            finally:
+                for generator in generators:
+                    generator.close()
+        if yielded != leads:
+            raise RuntimeError(f"the runner yielded the steps {yielded} at {init_time}, the window's leads are {leads}")
+
     def check_init_times(
         self, init_times: list[datetime.datetime], lead_time: datetime.timedelta, dataset: str | None = None
     ) -> None:
         """Raise unless every date a rollout reads exists in the runner's datasets and is not missing; every dataset
-        of the checkpoint unless one is named."""
+        of the checkpoint unless one is named. A temporal downscaler reads its inputs at the two bounds of the window
+        only, and no boundary forcings."""
         from anemoi.inference.inputs.dataset import DatasetInput
         from anemoi.inference.inputs.empty import EmptyInput
 
@@ -762,7 +888,7 @@ class InferenceForecastSource(ForecastSourceBase):
                 ("boundary forcings", runner.boundary_forcings_inputs, True),
             ):
                 source = sources[name]
-                if isinstance(source, EmptyInput):
+                if isinstance(source, EmptyInput) or (self.temporal_downscaling and kind == "boundary forcings"):
                     continue
                 if not isinstance(source, DatasetInput):
                     LOG.warning("%s input %s is not a dataset, init times are not checked against it", kind, source)
@@ -770,13 +896,16 @@ class InferenceForecastSource(ForecastSourceBase):
                 dates = source.ds_dates.astype("datetime64[us]").tolist()
                 available, missing = set(dates), {dates[i] for i in source.ds.missing}
                 for init_time in init_times:
-                    required = required_dates(
-                        init_time,
-                        self.input_offsets,
-                        self.output_offsets,
-                        self.output_horizon,
-                        lead_time if rollout else None,
-                    )
+                    if self.temporal_downscaling:
+                        required = [init_time, init_time + self.window]
+                    else:
+                        required = required_dates(
+                            init_time,
+                            self.input_offsets,
+                            self.output_offsets,
+                            self.output_horizon,
+                            lead_time if rollout else None,
+                        )
                     absent = missing_dates(required, available, missing)
                     if absent:
                         raise ValueError(
@@ -896,11 +1025,19 @@ class InferenceForecastSource(ForecastSourceBase):
         info = {
             "source": "anemoi_inference",
             **self.provenance(),
+            "task": self.task,
+            **({"window": frequency_to_string(self.window)} if self.temporal_downscaling else {}),
             "timestep": frequency_to_string(self.timestep),
             "multi_step_input": self.multi_step_input,
             "multi_step_output": self.multi_step_output,
-            "input_offsets": [frequency_to_string(offset) for offset in self.input_offsets],
-            "output_offsets": [frequency_to_string(offset) for offset in self.output_offsets],
+            **(
+                {}
+                if self.temporal_downscaling
+                else {
+                    "input_offsets": [frequency_to_string(offset) for offset in self.input_offsets],
+                    "output_offsets": [frequency_to_string(offset) for offset in self.output_offsets],
+                }
+            ),
             "output_horizon": frequency_to_string(self.output_horizon),
             "members": self.members,
             "seed": self.seed,
@@ -948,6 +1085,8 @@ class InferenceForecastSource(ForecastSourceBase):
     def close(self) -> None:
         """Release the runner and the model."""
         self._initial = {}
+        if self.temporal_downscaling:
+            self._window_constants = {}
         self.runner = None
         for cache in self._forcings.values():
             cache.clear()

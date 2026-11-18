@@ -22,6 +22,16 @@ from anemoi.evaluation.sources.base import variable_info
 DEFAULT_PREFETCH = 2
 
 
+def _interpolate_frequencies(value: Any) -> list:
+    """Every `interpolate_frequency` value in an `open_dataset` argument tree."""
+    if isinstance(value, dict):
+        found = [value["interpolate_frequency"]] if "interpolate_frequency" in value else []
+        return found + [item for key, child in value.items() for item in _interpolate_frequencies(child)]
+    if isinstance(value, (list, tuple)):
+        return [item for child in value for item in _interpolate_frequencies(child)]
+    return []
+
+
 def _plain(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _plain(item) for key, item in value.items()}
@@ -104,6 +114,11 @@ class DatasetTargets(TargetSourceBase):
         self._cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
         self._cache_size = 0
         self._stats = {"reads": 0, "read_seconds": 0.0, "cache_hits": 0}
+
+    @property
+    def interpolate_frequency(self) -> list:
+        """The `interpolate_frequency` values the dataset is opened with, anywhere in its arguments; empty when none."""
+        return _interpolate_frequencies([list(self.args), self.kwargs])
 
     @property
     def stats(self) -> dict:

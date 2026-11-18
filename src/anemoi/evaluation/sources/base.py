@@ -182,6 +182,9 @@ class ForecastSourceBase:
     has_graph: bool = False
     frames_per_pass: int = 1
     supports_lead_zero: bool = False
+    # Scores the states between two input bounds (a temporal downscaler, its linear-interpolation baseline): the
+    # evaluation then warns about targets that are themselves interpolated in time.
+    temporal_downscaling: bool = False
 
     def model_calls(self, lead_time: datetime.timedelta) -> tuple[int, datetime.timedelta]:
         """`frames_per_pass` evenly spaced lead times per call."""
