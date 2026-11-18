@@ -247,8 +247,7 @@ and targets read the same zarr. The dataset must have exactly one member (`shape
 
 Run when the evaluation is built, on metadata only, so a dry run shows them. Each problem is one
 warning (naming the dataset in a multi-dataset run), or a `ValueError` with `raise`; `ignore`
-silences it. `Evaluation` takes `on_period_mismatch` and `on_made_up_dates` as keyword arguments,
-keeps them as attributes and reports them in `plan()`.
+silences it.
 
 - **Accumulation period** (`on_period_mismatch`). For every scored variable the forecast source
   reports as an accumulation, the period recorded in the targets' `variables_metadata` must equal
