@@ -77,6 +77,16 @@ def test_metrics_match_closed_form(fake_sources):
     xr.testing.assert_allclose(full.sel(bin="DJF", drop=True), full.sel(bin="all", drop=True))
     assert full["param"].values.tolist() == ["", ""] and np.isnan(full["level"].values).all()
 
+    evaluation = evaluate(forecast, targets, bins={"time": "hour", "by": "valid_time"})
+    hourly = evaluation.run().to_xarray(evaluation.metrics)
+    assert hourly.attrs["bin_kind"] == "hour" and hourly.sizes["bin"] == 25
+    filled = ~np.isnan(hourly["rmse"].sel(region="global", variable="t", lead_time=hourly.lead_time[0]))
+    assert hourly.bin.values[filled.values].tolist() == ["06", "18", "all"]
+    xr.testing.assert_allclose(hourly[list(expected)].sel(bin="all"), full[list(expected)].sel(bin="all"))
+    merged = evaluation.run([INITS[0]]).merge(evaluation.run([INITS[1]])).to_xarray(evaluation.metrics)
+    assert merged["n_init"].equals(hourly["n_init"]) and merged["weight_sum"].equals(hourly["weight_sum"])
+    xr.testing.assert_allclose(merged[list(expected)], hourly[list(expected)], rtol=1e-12)
+
     forecast, targets = fake_sources(members=3, drift=drift, spread=spread, frames_per_pass=2)
     evaluation = evaluate(forecast, targets)
     xr.testing.assert_allclose(evaluation.run().to_xarray(evaluation.metrics), full)

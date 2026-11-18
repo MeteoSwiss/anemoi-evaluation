@@ -27,7 +27,8 @@ contents of the result file may still change between releases.
 * **Temporal downscalers**, for now between analysis bounds, against a linear-interpolation baseline.
 * **Weights, regions and time bins**: node weights from the model graph, a file, spherical
   Voronoi areas or uniform; regions from a graph attribute, a bounding box, a sub-grid of a
-  cutout or a file; bins per season, month or init time, of the init or the valid time.
+  cutout or a file; bins per season, month, hour of day or init time, of the init or the valid
+  time.
 * **Multi-dataset checkpoints**: a checkpoint trained on multiple datasets is scored as one
   evaluation per dataset sharing one rollout, each with its own grid, variables, targets, weights,
   regions and result file.
@@ -162,7 +163,7 @@ src/anemoi/evaluation/
     statistics.py        per-element statistics in float64
     aggregation.py       weighted, masked, binned sums over nodes and init times
     metrics.py           metrics as functions of mean statistics
-    binning.py           time bins: season, month, init time; of the init or the valid time
+    binning.py           time bins: season, month, hour, init time; of the init or the valid time
     weights.py           node weights
     regions.py           region masks
     output.py            xarray output, netcdf round trip, merging

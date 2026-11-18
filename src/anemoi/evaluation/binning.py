@@ -1,4 +1,4 @@
-"""Time binning: the second state axis, one bin per season, month or date of a frame's init or valid time."""
+"""Time binning: the second state axis, one bin per season, month, hour or date of a frame's init or valid time."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from anemoi.evaluation.frame import Frame
 
 SEASONS = ("DJF", "MAM", "JJA", "SON")
 MONTHS = tuple(f"{month:02d}" for month in range(1, 13))
-KINDS = ("season", "month", "init_time", "none")
+HOURS = tuple(f"{hour:02d}" for hour in range(24))
+KINDS = ("season", "month", "hour", "init_time", "none")
 BY = ("init_time", "valid_time")
 _SEASON_OF_MONTH = (0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 0)
 
@@ -66,6 +67,16 @@ class MonthBinning(_DateBinning):
         return self.date(frame).month - 1
 
 
+class HourBinning(_DateBinning):
+    """One bin per hour of day, labelled 00 to 23; sub-hourly times fold into their hour."""
+
+    kind = "hour"
+    coords = list(HOURS)
+
+    def index(self, frame: Frame) -> int:
+        return self.date(frame).hour
+
+
 class InitTimeBinning(_DateBinning):
     """One bin per date: the init times, or every valid time they reach with `lead_times` when by valid time."""
 
@@ -113,6 +124,8 @@ def build(
         return SeasonBinning(by)
     if kind == "month":
         return MonthBinning(by)
+    if kind == "hour":
+        return HourBinning(by)
     if kind == "init_time":
         return InitTimeBinning(init_times, lead_times, by)
     if kind == "none":

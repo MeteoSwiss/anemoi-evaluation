@@ -310,7 +310,7 @@ mapping falls back to `{global: all}`.
 
 | Key | Type | Default | Values |
 |---|---|---|---|
-| `time` | enum | `season` | `season`, `month`, `init_time`, `none`. |
+| `time` | enum | `season` | `season`, `month`, `hour`, `init_time`, `none`. |
 | `by` | enum | `init_time` | `init_time`, `valid_time`. |
 
 Bin coordinates per `time` value:
@@ -319,6 +319,7 @@ Bin coordinates per `time` value:
 |---|---|
 | `season` | `DJF`, `MAM`, `JJA`, `SON` (DJF is months 12, 1, 2). |
 | `month` | `01` .. `12`. |
+| `hour` | `00` .. `23`, the UTC hour, always all 24; a sub-hourly time falls in its hour. |
 | `init_time` | The sorted distinct dates, ISO formatted: the init times when `by: init_time`, every `init + lead` when `by: valid_time`. A frame whose date is not one of them raises. |
 | `none` | A single bin `all`. |
 
@@ -979,9 +980,9 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
   `exceedance_counts(pred, target, thresholds, label, aux)`, `rank_counts(pred, target, aux)` and
   `validate_thresholds(label, thresholds)` are the helpers for writing a custom `Statistic`.
 - `binning`: the `Binning` protocol (`kind`, `by`, `coords`, `index(frame)`); `SeasonBinning`,
-  `MonthBinning`, `InitTimeBinning(init_times, lead_times=(), by="init_time")` and `NoBinning`, each
-  taking `by="init_time"`; `build(kind="season", by="init_time", init_times=(), lead_times=())`;
-  `season_of(date)` and the constants `SEASONS`, `MONTHS`, `KINDS`, `BY`.
+  `MonthBinning`, `HourBinning`, `InitTimeBinning(init_times, lead_times=(), by="init_time")` and
+  `NoBinning`, each taking `by="init_time"`; `build(kind="season", by="init_time", init_times=(),
+  lead_times=())`; `season_of(date)` and the constants `SEASONS`, `MONTHS`, `HOURS`, `KINDS`, `BY`.
 - `weights`: `uniform(grid)`, `spherical_voronoi(grid)`, `from_file(path, grid)`,
   `graph_node_attribute(forecast, name, grid)`, each returning `(N,)` float64.
 - `regions`: `all(grid)`, `bbox(grid, north, west, south, east)`, `from_file(path, grid)`, each returning
