@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime
 import gc
 import hashlib
@@ -18,6 +19,7 @@ from collections.abc import Mapping
 import numpy as np
 import torch
 from anemoi.utils.dates import frequency_to_string
+from anemoi.utils.dates import frequency_to_timedelta
 
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
@@ -225,6 +227,116 @@ class SharedForcings:
         return getattr(self.provider, name)
 
 
+SUPPORTED_TASKS = ("forecaster", "offset-forecaster")
+# Tasks blocked by anemoi-inference, with the reason the refusal gives.
+INFERENCE_BLOCKERS = {
+    "autoencoder": "anemoi-inference has no runner for it",
+    "temporal-downscaler": "anemoi-inference runs it only through `execute()`, not step by step",
+}
+# Class names of the task classes (`config.task._target_`) and of the older lightning modules
+# (`config.training.model_task`). Ensemble and diffusion modules are forecasters.
+TASK_CLASSES = {
+    "Forecaster": "forecaster",
+    "OffsetForecaster": "offset-forecaster",
+    "TemporalDownscaler": "temporal-downscaler",
+    "Autoencoder": "autoencoder",
+    "GraphForecaster": "forecaster",
+    "GraphEnsForecaster": "forecaster",
+    "GraphDiffusionForecaster": "forecaster",
+    "GraphDiffusionTendForecaster": "forecaster",
+    "GraphInterpolator": "temporal-downscaler",
+    "GraphMultiOutInterpolator": "temporal-downscaler",
+    "GraphAutoEncoder": "autoencoder",
+}
+# Older name stored in `metadata_inference.task`.
+TASK_ALIASES = {"time-interpolator": "temporal-downscaler"}
+
+
+def task_name(value: str) -> str:
+    """Map a stored task name or class path to a task name (`_` becomes `-`); an unknown class path is kept as is."""
+    cls = value.rsplit(".", 1)[-1]
+    if cls in TASK_CLASSES:
+        return TASK_CLASSES[cls]
+    if "." in value:
+        return value
+    name = value.replace("_", "-")
+    return TASK_ALIASES.get(name, name)
+
+
+def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
+    """The checkpoint's task and the field it was read from (`None` for the default, `forecaster`). Lookup order:
+    `metadata_inference.task`, top-level `task`, `config.task._target_`, `config.training.model_task`."""
+    config = metadata.get("config") or {}
+    task = config.get("task")
+    candidates = (
+        ("metadata_inference.task", (metadata.get("metadata_inference") or {}).get("task")),
+        ("task", metadata.get("task")),
+        ("config.task._target_", task.get("_target_") if isinstance(task, Mapping) else None),
+        ("config.training.model_task", (config.get("training") or {}).get("model_task")),
+    )
+    for origin, value in candidates:
+        if value:
+            return task_name(str(value)), f"{origin}: {value}"
+    return "forecaster", None
+
+
+def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
+    """`metadata` with a `patch_metadata` block applied to the first dataset, as anemoi-inference does."""
+    if not patch:
+        return metadata
+    from anemoi.inference.config.utils import multi_datasets_config
+
+    names = list((metadata.get("metadata_inference") or {}).get("dataset_names") or ["data"])
+
+    def merge(main: dict, update: Mapping) -> None:
+        for key, value in update.items():
+            if isinstance(value, Mapping) and isinstance(main.get(key, {}), Mapping):
+                merge(main.setdefault(key, {}), value)
+            else:
+                main[key] = value
+
+    result = copy.deepcopy(dict(metadata))
+    merge(result, multi_datasets_config(patch, names[0], names, strict=False))
+    return result
+
+
+def check_task(metadata: Mapping) -> None:
+    """Refuse a checkpoint whose task is not supported yet. An unknown class path only warns: anemoi-inference runs
+    it as a forecaster."""
+    task, origin = checkpoint_task(metadata)
+    if task not in SUPPORTED_TASKS and "." in task:
+        LOG.warning("unknown task class (%s), the checkpoint is evaluated as a forecaster", origin)
+    elif task not in SUPPORTED_TASKS:
+        raise ValueError(
+            f"the checkpoint's task is {task!r} ({origin}): not supported yet"
+            + (f" ({INFERENCE_BLOCKERS[task]})" if task in INFERENCE_BLOCKERS else "")
+            + f", only {', '.join(SUPPORTED_TASKS)} so far, see MeteoSwiss/anemoi-evaluation#5"
+        )
+
+
+def check_output_offsets(metadata: Mapping) -> None:
+    """Refuse output offsets other than `timestep, ..., n * timestep` with a rollout shift of `n * timestep`, the
+    only ones that fall on the lead times. A checkpoint without `output_offsets` passes."""
+    inference = metadata.get("metadata_inference") or {}
+    for name in inference.get("dataset_names") or ():
+        timesteps = (inference.get(name) or {}).get("timesteps") or {}
+        if not timesteps.get("output_offsets"):
+            continue
+        timestep = frequency_to_timedelta(timesteps["timestep"])
+        stored = list(timesteps["output_offsets"])
+        stored_shift = timesteps.get("rollout_shift") or stored[-1]
+        offsets = [frequency_to_timedelta(offset) for offset in stored]
+        shift = frequency_to_timedelta(stored_shift)
+        n = len(offsets)
+        if offsets != [(i + 1) * timestep for i in range(n)] or shift != n * timestep:
+            step = frequency_to_string(timestep)
+            raise ValueError(
+                f"the output offsets {stored} with rollout shift {stored_shift} of dataset {name!r} do not fit the "
+                f"lead times, not supported yet: expected {step}, 2 * {step}, ..., n * {step} with a rollout shift of "
+                f"n * {step}, see MeteoSwiss/anemoi-evaluation#5"
+            )
+
+
 def routed_datasets(metadata: Mapping) -> tuple[set[str], set[str]] | None:
     """The datasets a checkpoint's model encodes and decodes, from the training config it stores, or None when the
     config does not say (legacy single-dataset checkpoints have no `encoders`/`decoders` routing)."""
@@ -349,6 +461,7 @@ class InferenceForecastSource(ForecastSourceBase):
         forcings_cache_bytes: int = DEFAULT_FORCINGS_CACHE_BYTES,
         **run_config: object,
     ) -> None:
+        from anemoi.inference.checkpoint import Checkpoint
         from anemoi.inference.config.run import RunConfiguration
         from anemoi.inference.runners import create_runner
         from anemoi.utils.checkpoints import load_metadata
@@ -367,7 +480,11 @@ class InferenceForecastSource(ForecastSourceBase):
         self.forcings_cache_bytes = forcings_cache_bytes
         self._initial: dict[str, tuple[datetime.datetime, dict]] = {}
         with self._quiet():
-            self.runner = create_runner(RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"}))
+            config = RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"})
+            # before the runner is built: the `auto` runner raises on a task it has no runner for
+            metadata = load_metadata(Checkpoint(config.checkpoint).path)
+            check_task(patched_metadata(metadata, config.patch_metadata))
+            self.runner = create_runner(config)
         self.dataset_names = list(self.runner.dataset_names)
         # One cache per dataset: the arrays depend on the state's latitudes and longitudes, so a single cache
         # would serve the first grid and bypass every other one for ever. `forcings_cache_bytes` is the budget
@@ -390,7 +507,7 @@ class InferenceForecastSource(ForecastSourceBase):
         self.output_horizon = self.timestep * self.multi_step_output
         self.frames_per_pass = self.multi_step_output
         self._check_shared_timing()
-        metadata = load_metadata(self.checkpoint)
+        check_output_offsets(metadata)
         self._check_every_dataset_is_decoded(metadata)
         # Which datasets the run scores; every one of them until an evaluation narrows it (the `datasets:` config
         # key). The model predicts them all whatever this says: the runner needs an input state for each one.
@@ -454,9 +571,9 @@ class InferenceForecastSource(ForecastSourceBase):
     def _check_every_dataset_is_decoded(self, metadata: Mapping) -> None:
         """Refuse a checkpoint whose model does not decode every dataset (a downscaler).
 
-        anemoi-inference cannot run one at all: `Runner.forecast` indexes the model output by every dataset of
-        `metadata_inference` and raises `KeyError` on the input-only one. The routing is only readable from the
-        stored training config, so a checkpoint that does not carry it is let through."""
+        anemoi-inference runs one since ecmwf/anemoi-inference#605, but the evaluation does not score it yet. The
+        routing is only readable from the stored training config, so a checkpoint that does not carry it is let
+        through."""
         routed = routed_datasets(metadata)
         if routed is None:
             return
@@ -465,7 +582,7 @@ class InferenceForecastSource(ForecastSourceBase):
         if missing:
             raise ValueError(
                 f"the checkpoint's model does not decode {missing}, it only decodes {sorted(decoded)}: "
-                "downscaling checkpoints cannot be evaluated (anemoi-inference cannot run them either)"
+                "downscaling checkpoints cannot be evaluated yet, see MeteoSwiss/anemoi-evaluation#5"
             )
 
     @property

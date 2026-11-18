@@ -179,8 +179,9 @@ last call computes past `lead_time` and the extra outputs are computed and disca
 Every other key goes to `anemoi.inference.config.run.RunConfiguration` (`checkpoint`, `device`, `input`,
 `env`, ...). The block is loaded as `{"verbosity": 0, **block, "output": "none"}`: `verbosity: 0` is only
 a default and the block can override it, while `output` is forced. Constraints: `date` must not be set
-(init times come from the evaluation), `output` must be absent or `none`, and the checkpoint's datasets
-must agree on the timing and all be decoded (see Multi-dataset checkpoints).
+(init times come from the evaluation), `output` must be absent or `none`, the checkpoint must be a
+forecaster whose outputs fall on the lead times (see [limitations](#limitations-and-undefined-behaviour)),
+and the checkpoint's datasets must agree on the timing and all be decoded (see Multi-dataset checkpoints).
 
 #### `persistence` (`PersistenceConfig`)
 
@@ -244,7 +245,7 @@ differ, so a sharded multi-dataset run is merged once per dataset.
 
 Refused at construction: a checkpoint whose datasets disagree on the timestep, the input and output steps
 or the rollout shift, and a downscaling checkpoint whose model does not decode every dataset
-(anemoi-inference cannot run one either).
+(not supported yet).
 
 The default weights (`{graph_attribute: area_weight}`) are read from each dataset's own node set of the
 model graph. When `graph_data` is a mapping it must be keyed by the dataset names — a key that names no
@@ -1026,6 +1027,9 @@ Useful when reading the code or writing a tool against it, but not part of the p
   processor-chunk default added.
 - `sources.anemoi_inference.ForcingsCache(cache_bytes)` and `SharedForcings(provider, cache)`: the
   forcings cache and the provider wrapper that reads through it.
+- `sources.anemoi_inference.checkpoint_task(metadata) -> (task, origin)`, `check_task(metadata)` and
+  `check_output_offsets(metadata)`: the task lookup and the two refusals above;
+  `patched_metadata(metadata, patch)` applies a `patch_metadata` block.
 
 ## Sharding
 
@@ -1086,6 +1090,26 @@ Consequences:
 
 Constraints the code enforces, with the message or behaviour:
 
+- **Only forecasters are scored.** The task is read from `metadata_inference.task`, then the top-level
+  `task`, then `config.task._target_`, then `config.training.model_task`, and defaults to `forecaster`.
+  Class paths count by class name, so ensemble and diffusion forecasters are forecasters. Any task but
+  `forecaster` and `offset-forecaster` is refused at construction with `the checkpoint's task is
+  '<task>' (<field>: <value>): not supported yet, ...`; the message names the anemoi-inference blocker
+  where there is one (no runner for an autoencoder, a temporal downscaler runs only through
+  `execute()`). An unknown class path is evaluated as a forecaster, with a warning. Other tasks are
+  tracked in MeteoSwiss/anemoi-evaluation#5.
+- **`patch_metadata` overrides the task.** It is applied before the task is read, so `patch_metadata:
+  {metadata_inference: {task: forecaster}}` repairs a checkpoint with a wrong stored task. An explicit
+  `runner:` does not bypass the check, and the runner itself is not checked: a non-forecaster `runner:`
+  on a forecaster checkpoint is not caught. The output offsets and the routing are read unpatched.
+- **Outputs must fall on the lead times.** The output offsets of one model call must be `timestep,
+  2 * timestep, ..., n * timestep` with a rollout shift of `n * timestep`. An `offset-forecaster` with
+  other offsets is refused at construction with `the output offsets [...] with rollout shift ... of
+  dataset '<name>' do not fit the lead times, ...`.
+- **The init-time pre-check assumes regular input steps.** `check_init_times` checks the window
+  `init - (multi_step_input - 1) * timestep .. init`, not the checkpoint's input offsets, so irregular
+  input offsets (`[-12h, 0h]` at a 6 h timestep) are checked on the wrong dates; the forecast itself
+  reads the right ones.
 - **Multi-dataset checkpoints must share the timing and decode every dataset.** A checkpoint whose
   datasets disagree on the timestep or the input and output steps, and a downscaling checkpoint whose
   model does not decode every dataset, are refused at construction.

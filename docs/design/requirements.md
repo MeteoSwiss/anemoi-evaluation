@@ -32,8 +32,10 @@ In scope at v0.3.0: deterministic and ensemble forecasts from an anemoi checkpoi
 or multiple datasets, gridded targets from an anemoi dataset on the same grid, deterministic and
 ensemble metrics, weighting, regions, time bins, a persistence baseline, a climatology for anomaly
 scores, a YAML configuration and CLI, and sharding with exact merging. Section 5 lists what is
-deliberately outside. The package itself is device-agnostic, but the anemoi checkpoints it is
-validated against do not run on CPU, so an end-to-end exercise needs a GPU.
+deliberately outside. The goal is to score every anemoi task: at v0.3.0 only forecasters are
+supported, the others (downscalers, autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5.
+The package itself is device-agnostic, but the anemoi checkpoints it is validated against do not
+run on CPU, so an end-to-end exercise needs a GPU.
 
 ### 1.3 Audience
 
@@ -414,8 +416,6 @@ Deliberate non-goals at v0.3.0. Each is a decision, not an oversight.
   only gain is per-step Python overhead, which is nil at 1.7M nodes, and it is incompatible with a
   sharded model. Should the ensemble memory of NFR-13 ever bind, the fix is the opposite one,
   sequential members with a pinned host buffer ([`architecture.md`](architecture.md) section 9).
-* **Downscaling checkpoints** (`input_datasets != target_datasets`): anemoi-inference cannot run
-  them at all, so they are refused where the training config makes the routing readable (FR-39).
 * **Comparing several checkpoints in one run**: one checkpoint per run, comparison is offline from
   result files.
 * **Neighbourhood scores** (FSS and its relatives). They are not per-node reductions, and on an
