@@ -156,12 +156,16 @@ Exactly one of the two forms.
 
 ### Lead times
 
-Lead times are not configured directly. The forecast source turns `lead_time` into the list it yields:
-both included sources return `k * timestep` for `k = 1 .. lead_time / timestep`, and raise unless
-`lead_time` is a positive multiple of the timestep. With `include_lead_zero: true` a lead of `0` is
-prepended. A multi-step-output model computes `ceil(lead_time / output_horizon)` calls, where
-`output_horizon = timestep * multi_step_output`; when `lead_time` is not a multiple of the horizon the
-last call computes past `lead_time` and the extra outputs are computed and discarded, with a warning.
+Lead times are not configured directly. The forecast source turns `lead_time` into the list it yields,
+and raises unless `lead_time` is a positive multiple of the timestep. The persistence source returns
+`k * timestep` for `k = 1 .. lead_time / timestep`. The inference source returns the lead times of the
+model's outputs, `k * output_horizon + offset` for every output offset of the checkpoint, up to
+`lead_time` and sorted, where `output_horizon` is the checkpoint's rollout shift; for a forecaster
+(`multi_step_output` outputs `timestep` apart) that is `k * timestep` again, and for an offset forecaster
+with outputs `[6h, 12h, 24h]` and a shift of `24h` it is `6h, 12h, 1d, 30h, 36h, 2d` up to `lead_time:
+48h`. With `include_lead_zero: true` a lead of `0` is prepended. The model makes
+`ceil(lead_time / output_horizon)` calls; when the last of them computes past `lead_time` the extra
+outputs are computed and discarded, with a warning.
 
 ### Forecast sources
 
@@ -244,7 +248,7 @@ result plus a `dataset` attribute. Merging is per dataset: `merge` refuses input
 differ, so a sharded multi-dataset run is merged once per dataset.
 
 Refused at construction: a checkpoint whose datasets disagree on the timestep, the input and output steps
-or the rollout shift, and a downscaling checkpoint whose model does not decode every dataset
+or offsets or the rollout shift, and a downscaling checkpoint whose model does not decode every dataset
 (not supported yet).
 
 The default weights (`{graph_attribute: area_weight}`) are read from each dataset's own node set of the
@@ -973,9 +977,14 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 
 - `InferenceForecastSource(members=1, seed=0, quiet=True, forcings_cache_bytes=2**30, **run_config)`:
   runs an anemoi-inference checkpoint. `has_graph = True`, `supports_lead_zero = True`,
-  `frames_per_pass = multi_step_output`. Members are lockstep rollouts of one runner over one shared
-  initial state. Beyond the protocol: `dataset_args_kwargs()`, `model_loaded`, and the attributes
-  `timestep`, `multi_step_input`, `multi_step_output`, `output_horizon`, `checkpoint`, `checkpoint_uuid`,
+  `frames_per_pass = len(output_offsets)` (`multi_step_output`). Members are lockstep rollouts of one
+  runner over one shared initial state. Beyond the protocol: `dataset_args_kwargs()`, `model_loaded`,
+  `rollout_schedule(lead_time)` (the `(model call, lead time)` of every frame, in order),
+  `model_calls(lead_time)` (the calls and the lead time the last one computes, which
+  `Evaluation.model_calls_per_init()` uses when a source has it), and the attributes `timestep`,
+  `multi_step_input`, `multi_step_output`, `input_offsets`, `output_offsets` (the checkpoint's offsets as
+  `timedelta`s, `-k * timestep` and `k * timestep` for a forecaster), `output_horizon` (the rollout
+  shift, `timestep * multi_step_output` for a forecaster), `checkpoint`, `checkpoint_uuid`,
   `checkpoint_run_id`, `dataset_name`. `initial_frame` returns the init-time slice of the prognostic
   variables and NaN for the others, identical for every member.
 - `PersistenceForecastSource(targets, timestep, members=1)`: the target at init time at every lead;
@@ -1086,8 +1095,12 @@ Useful when reading the code or writing a tool against it, but not part of the p
 - `sources.anemoi_inference.ForcingsCache(cache_bytes)` and `SharedForcings(provider, cache)`: the
   forcings cache and the provider wrapper that reads through it.
 - `sources.anemoi_inference.checkpoint_task(metadata) -> (task, origin)`, `check_task(metadata)` and
-  `check_output_offsets(metadata)`: the task lookup and the two refusals above;
-  `patched_metadata(metadata, patch)` applies a `patch_metadata` block.
+  `check_rollout_timing(input_offsets, output_offsets, rollout_shift)`: the task lookup and the two
+  refusals above; `patched_metadata(metadata, patch)` applies a `patch_metadata` block.
+- `sources.anemoi_inference.rollout_schedule(lead_time, output_offsets, rollout_shift)`,
+  `required_dates(init_time, input_offsets, lead_time=None, output_offsets=(), rollout_shift=None)` and
+  `missing_dates(required, available, missing)`: the frames a rollout yields, and the dates an input
+  reads and the ones it lacks, behind `lead_times()` and `check_init_times()`.
 
 ## Sharding
 
@@ -1118,8 +1131,8 @@ run. For what the merge guarantees numerically, see [merging](#merging).
 The inference source reseeds torch's global RNG before every member's model call:
 
 ```
-call = step_index // frames_per_pass
-torch.manual_seed(member_seed(seed, init_time, member, step=call))
+call, lead_time = rollout_schedule(lead_time)[step_index]   # step_index // frames_per_pass for a forecaster
+torch.manual_seed(member_seed(seed, init_time, member, step=call))   # before the first frame of each call
 member_seed(seed, init_time, member, step)
     = blake2b(f"{seed}|{init_time.isoformat()}|{member}|{step}", digest_size=8) >> 1   # a 63-bit int
 ```
@@ -1159,17 +1172,18 @@ Constraints the code enforces, with the message or behaviour:
 - **`patch_metadata` overrides the task.** It is applied before the task is read, so `patch_metadata:
   {metadata_inference: {task: forecaster}}` repairs a checkpoint with a wrong stored task. An explicit
   `runner:` does not bypass the check, and the runner itself is not checked: a non-forecaster `runner:`
-  on a forecaster checkpoint is not caught. The output offsets and the routing are read unpatched.
-- **Outputs must fall on the lead times.** The output offsets of one model call must be `timestep,
-  2 * timestep, ..., n * timestep` with a rollout shift of `n * timestep`. An `offset-forecaster` with
-  other offsets is refused at construction with `the output offsets [...] with rollout shift ... of
-  dataset '<name>' do not fit the lead times, ...`.
-- **The init-time pre-check assumes regular input steps.** `check_init_times` checks the window
-  `init - (multi_step_input - 1) * timestep .. init`, not the checkpoint's input offsets, so irregular
-  input offsets (`[-12h, 0h]` at a 6 h timestep) are checked on the wrong dates; the forecast itself
-  reads the right ones.
+  on a forecaster checkpoint is not caught. The routing is read unpatched; the offsets come from
+  anemoi-inference, which applies the patch.
+- **Model calls must not repeat or reorder lead times.** The last input offset must be `0h`, since
+  anemoi-inference starts the rollout at the last input date: otherwise `the input offsets [...] do
+  not end at 0h: not supported yet`. The output offsets must be positive, increasing, and span less
+  than the rollout shift, so that every lead time comes from one model call and they increase along
+  the rollout: otherwise `the output offsets [...] with rollout shift ... are not positive, increasing
+  and within one rollout shift ...: not supported yet`. Offsets that skip lead times, such as
+  `[12h]` with a shift of `12h`, are scored on the lead times they give. The rollout's steps are checked
+  against `rollout_schedule()` as they come, and a mismatch raises.
 - **Multi-dataset checkpoints must share the timing and decode every dataset.** A checkpoint whose
-  datasets disagree on the timestep or the input and output steps, and a downscaling checkpoint whose
+  datasets disagree on the timestep or the input and output steps or offsets, and a downscaling checkpoint whose
   model does not decode every dataset, are refused at construction.
 - **The `tools/` scripts take a single-dataset checkpoint.** `validate.py`, `make_climatology.py` and
   `ab_prefetch.py` read `forecast.dataset_name`, the `forecast.anemoi_inference.input.dataset` block and
@@ -1180,8 +1194,12 @@ Constraints the code enforces, with the message or behaviour:
 - **Grids must match.** `Grid.check_compatible` raises unless forecast, target and climatology grids have
   the same nodes within `1e-5` degrees.
 - **`lead_time` must be a positive multiple of the forecast timestep**, otherwise `lead_time_steps`
-  raises. A `lead_time` that is not a multiple of a multi-step model's `output_horizon` is allowed, warns,
-  and discards the outputs beyond it.
+  raises. A `lead_time` before the end of the model's last call (not a multiple of a forecaster's
+  `output_horizon`, or `36h` for outputs `[6h, 12h, 24h]` with a shift of `24h`) is allowed, warns, and
+  discards the outputs beyond it.
+- **Baselines keep their own lead times.** The persistence source yields `k * timestep`, so it shares
+  only some lead times with an offset forecaster; a comparison uses the lead times both result files
+  have.
 - **Metrics needing members.** Constructing an `Evaluation` whose metrics need more members than the
   forecast source has raises. A metric whose statistics depend on the ensemble size learns it there through
   `bind_members`, called by `metrics.build` from the evaluation and from the merge CLI (where it comes from

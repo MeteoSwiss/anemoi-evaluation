@@ -307,7 +307,7 @@ Model time and memory both grow linearly with members: four lockstep members cos
 and an extra member costs about 1.45 GiB on a 6-hourly 2-in/1-out 1 km checkpoint, about 6 GiB on
 an hourly 7-in/6-out one ([benchmarks](benchmarks.md#3-model-step-time-and-gpu-memory)).
 
-## Multi-step-output models and lead 0
+## Multi-step-output models, offset forecasters and lead 0
 
 A model whose checkpoint has `multi_step_output > 1` produces several output times per forward
 pass. Nothing has to be configured: the source reports `frames_per_pass`, each output time is
@@ -316,6 +316,15 @@ is that `lead_time` should be a multiple of the model's **output horizon**
 (`timestep * multi_step_output`), not only of the timestep: a 1-hourly 6-output model asked for
 `lead_time: 9h` makes two calls, computes 12 h and discards the last three frames. That is legal,
 logs a warning, and the dry-run plan says so in its `note` and in `computed_lead_time`.
+
+An **offset forecaster** is scored on its own input and output offsets. Its lead times are
+`k * rollout_shift + offset` for every output offset, so a checkpoint with inputs `[-12h, 0h]`,
+outputs `[6h, 12h, 24h]` and a rollout shift of `24h` asked for `lead_time: 48h` is scored at 6h,
+12h, 1d, 30h, 36h and 2d, from two model calls; the result file's `lead_time` axis is then not
+evenly spaced. The output horizon is the rollout shift, so `lead_time: 36h` computes 2d and
+discards the last output, with the same warning. The init-time check reads the dates the model
+reads: here `init - 12h` and `init`, not `init - 6h`. The dry-run plan lists the offsets under
+`forecast`. A persistence baseline keeps its `k * timestep` lead times and shares only some of them.
 
 `include_lead_zero: true` adds a lead-0 frame from the initial state, before any model call. It
 works for sources that declare `supports_lead_zero` (the inference and persistence sources do;
@@ -710,8 +719,9 @@ for name, state in evaluation.run().items():
 Two checkpoints are refused at construction: one whose datasets disagree on the timestep or the
 input and output steps, and a downscaling checkpoint whose model does not decode every dataset
 (not supported yet). Only forecasters are scored: any other task (temporal downscaler,
-autoencoder, ...) is refused at construction, and so is an offset forecaster whose outputs skip a
-lead time (see the [reference](reference.md#limitations-and-undefined-behaviour)). A wrong stored
+autoencoder, ...) is refused at construction, and so is an offset forecaster whose model calls
+would repeat or reorder lead times (see the
+[reference](reference.md#limitations-and-undefined-behaviour)). A wrong stored
 task can be fixed with `patch_metadata: {metadata_inference: {task: forecaster}}` in the
 `anemoi_inference` block.
 
@@ -958,7 +968,7 @@ Config and sources:
 | `from_checkpoint at <key> is only resolved in ...` | it was used in a nested block; move it to the top of the dataset block |
 | `checkpoint ... only a single mapping can be reused` | the recorded `open_dataset` arguments are not one mapping; spell the dataset out |
 | `target datasets must have one member` | the target zarr has an ensemble dimension; select a member in the `open_dataset` arguments |
-| `the checkpoint's task is '...'`, `the output offsets [...] ... do not fit the lead times` | the checkpoint is not a forecaster, or its outputs skip a lead time: not supported yet (MeteoSwiss/anemoi-evaluation#5). A wrong stored task can be fixed with `patch_metadata` |
+| `the checkpoint's task is '...'`, `the input offsets [...] do not end at 0h`, `the output offsets [...] ... are not positive, increasing and within one rollout shift` | the checkpoint is not a forecaster, or its model calls would repeat or reorder lead times: not supported yet (MeteoSwiss/anemoi-evaluation#5). A wrong stored task can be fixed with `patch_metadata` |
 
 Dates, grids, variables and merging:
 
