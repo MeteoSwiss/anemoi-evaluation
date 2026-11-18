@@ -224,7 +224,7 @@ def test_only_forecasters_on_the_lead_time_grid_are_accepted():
     ):
         with pytest.raises(ValueError, match=f"task is {named}.*only forecasters"):
             check_task(metadata(**task))
-    with pytest.raises(ValueError, match=r"offsets \['6h', '12h', '24h'\] with rollout shift 1d of dataset 'ds'"):
+    with pytest.raises(ValueError, match=r"offsets \['6h', '12h', '24h'\] with rollout shift 24h of dataset 'ds'"):
         check_output_offsets(metadata(task="offset-forecaster", output_offsets=["6h", "12h", "24h"]))
     with pytest.raises(ValueError, match=r"offsets \['12h'\] with rollout shift 12h"):
         check_output_offsets(metadata(task="offset-forecaster", output_offsets=["12h"], rollout_shift="12h"))

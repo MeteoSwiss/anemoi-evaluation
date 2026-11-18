@@ -294,16 +294,17 @@ def check_output_offsets(metadata: Mapping) -> None:
         if not timesteps.get("output_offsets"):
             continue
         timestep = frequency_to_timedelta(timesteps["timestep"])
-        offsets = [frequency_to_timedelta(offset) for offset in timesteps["output_offsets"]]
-        shift = frequency_to_timedelta(timesteps["rollout_shift"]) if timesteps.get("rollout_shift") else offsets[-1]
+        stored = list(timesteps["output_offsets"])
+        stored_shift = timesteps.get("rollout_shift") or stored[-1]
+        offsets = [frequency_to_timedelta(offset) for offset in stored]
+        shift = frequency_to_timedelta(stored_shift)
         n = len(offsets)
         if offsets != [(i + 1) * timestep for i in range(n)] or shift != n * timestep:
             step = frequency_to_string(timestep)
             raise ValueError(
-                f"the output offsets {list(timesteps['output_offsets'])} with rollout shift "
-                f"{frequency_to_string(shift)} of dataset {name!r} do not fit the lead times: only offsets {step}, "
-                f"2 * {step}, ..., n * {step} with a rollout shift of n * {step} can be evaluated, see "
-                "MeteoSwiss/anemoi-evaluation#5"
+                f"the output offsets {stored} with rollout shift {stored_shift} of dataset {name!r} do not fit the "
+                f"lead times: only offsets {step}, 2 * {step}, ..., n * {step} with a rollout shift of n * {step} can "
+                "be evaluated, see MeteoSwiss/anemoi-evaluation#5"
             )
 
 
