@@ -70,9 +70,10 @@ def task_env(env: Mapping[str, str] | None = None) -> tuple[int, int, int]:
 
 def init_group(group: MemberGroup, device: torch.device, timeout: datetime.timedelta = GROUP_TIMEOUT) -> None:
     """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise, rendezvous at `MASTER_ADDR` and
-    `MASTER_PORT`, then a barrier, so that every rank is up before the model loads and every later batch of sends and
-    receives may leave ranks out (NCCL needs all of them in the first one). With NCCL the CUDA device must be set
-    first."""
+    `MASTER_PORT`, then a collective over every rank, so that every rank is up before the model loads and every later
+    batch of sends and receives may leave ranks out (NCCL needs all of them in the first one). The collective gathers
+    the device names, and ranks on different GPU models are refused there rather than after the run. With NCCL the
+    CUDA device must be set first."""
     missing = [name for name in ("MASTER_ADDR", "MASTER_PORT") if not os.environ.get(name)]
     if missing:
         raise ValueError(
@@ -88,7 +89,11 @@ def init_group(group: MemberGroup, device: torch.device, timeout: datetime.timed
         timeout=timeout,
         **({"device_id": torch.device("cuda", torch.cuda.current_device())} if nccl else {}),
     )
-    dist.barrier()
+    names = [None] * group.size
+    dist.all_gather_object(names, torch.cuda.get_device_name() if nccl else device.type)
+    if len(set(names)) > 1:
+        dist.destroy_process_group()
+        raise ValueError(f"the ranks run on different GPU models {sorted(set(names))}, a member group needs one")
 
 
 def _rank_and_size(group: dist.ProcessGroup | None) -> tuple[int, int]:
