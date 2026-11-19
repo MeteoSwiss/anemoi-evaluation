@@ -816,16 +816,19 @@ sharding and merging. For now this is the Python API only; YAML for observations
 supported.
 
 A point target source hands out, per valid time, an `Observations`: a `PointSet` (the coordinates of
-the points, their time offsets and per-point attributes such as an elevation) and its values. You
-write one for your observations by subclassing `PointTargetSourceBase` (see
+the points, their time offsets and per-point attributes such as an elevation) and its values. The first
+shipped one reads a **gridded station dataset**: an ordinary anemoi dataset whose grid is a fixed set of
+stations, NaN where a station did not report. `StationDatasetTargets` reads one through a
+`DatasetTargets`, converts each variable to the model's name and units, and can read a per-station
+attribute file. For other observations, you write one by subclassing `PointTargetSourceBase` (see
 [Bringing your own source](#bringing-your-own-source)); `ArrayPointTargets` holds them in memory, for
 tests and notebooks. The shipped operators are `Nearest` (the value of the nearest model node) and
 `LapseRate` (a fixed-lapse-rate height correction of a temperature), and they chain.
 
 ### A worked example
 
-A model trained on a gridded analysis, scored against a fixed set of stations held in memory, in the
-model's units under the model's names:
+A model trained on a gridded analysis, scored against SwissMetNet stations stored under their DWH
+names in °C:
 
 ```python
 import anemoi.evaluation as ae
@@ -836,9 +839,15 @@ forecast = ae.InferenceForecastSource(
     input={"dataset": {"use_original_paths": True}},
     device="cuda",
 )
-points = ae.PointSet(latitudes, longitudes, attributes={"elevation": elevations})   # one per station, m
-stations = ae.ArrayPointTargets.fixed(points, ["2t", "2d"], fields)   # valid time -> (2, P) float32, K
-orography = operators.ArrayConstants({"orography": (model_orography, "m")})   # (N,) on the model grid
+stations = ae.StationDatasetTargets(
+    ae.DatasetTargets("/path/to/synop-stations.zarr", frequency="6h", select=["tre200s0", "tde200s0"]),
+    variables={
+        "tre200s0": {"name": "2t", "offset": 273.15},   # degC to K, scored as the model's 2t
+        "tde200s0": {"name": "2d", "offset": 273.15},
+    },
+    stations="stations.csv",                 # one row per station, in dataset order
+    attributes={"elevation": "elevation"},   # point attribute <- column of the file
+)
 init_times = ae.init_times("2020-01-01T00", "2020-01-31T18", "6h")
 common = dict(metrics=["bias", "rmse", "mae"], variables=["2t", "2d"], bins="none")
 lapse = operators.Chain([operators.Nearest(max_distance_km=5.0), operators.LapseRate("2t", rate=0.0065)])
@@ -848,46 +857,57 @@ runs = {
         forecast, stations, init_times, "120h",
         observation_operator=operators.Nearest(max_distance_km=5.0), **common,
     ),
-    "lapse_rate": ae.Evaluation(
-        forecast, stations, init_times, "120h", observation_operator=lapse, constants=orography, **common
-    ),
+    "lapse_rate": ae.Evaluation(forecast, stations, init_times, "120h", observation_operator=lapse, **common),
 }
 analysis = ae.DatasetTargets.from_forecast(forecast)
 runs["persistence"] = ae.Evaluation(
     ae.PersistenceForecastSource(analysis, "6h"), stations, init_times, "120h",
-    observation_operator=lapse, constants=orography, **common,
+    observation_operator=lapse,
+    constants=operators.DatasetConstants(analysis),   # orography from the analysis's z, in m
+    **common,
 )
 for name, evaluation in runs.items():
     evaluation.run().to_xarray(evaluation.metrics).to_netcdf(f"results-{name}.nc")
-for source in (forecast, analysis):
+for source in (forecast, stations, analysis):
     source.close()
 ```
 
 What each piece does:
 
-- **The point targets.** A point target source returns, per valid time, an `Observations` of a
-  `PointSet` and `(1, V, P)` float32 values, NaN where a station did not report, in the model's units
-  under the model's names: the scores are then in the model's units and compare with a gridded run of
-  the same model.
-  `ArrayPointTargets.fixed` has the same points at every valid time; a source whose points change
-  from one valid time to the next is scored the same way. The point attributes an operator reads
-  (`elevation` for `LapseRate`) must be among the source's `point_attributes`.
+- **Unit conversion and names.** `variables` maps a dataset variable to its result name and a
+  conversion `value * scale + offset` (`scale` 1 and `offset` 0 by default), applied in float64 on the
+  target side. The scores are then in the model's units under the model's names, so they compare with
+  a gridded run of the same model, and thresholds stay in the model's units. Nothing checks the
+  units, since the dataset carries none: the conversion is your statement, recorded in the result.
+  `{"tre200s0": "2t"}` renames without converting. Accumulation periods are not checked either: an
+  accumulated station variable mapped to `tp` is accepted as is, whatever its period. The inner
+  `DatasetTargets` can rename and rescale too, through anemoi-datasets' `open_dataset(rename=...,
+  rescale=...)`, but in the dataset's dtype (float32 for most) rather than float64; convert in one
+  place only.
+- **The station file.** A CSV (comma-separated by default, `delimiter=` otherwise) with a header row,
+  one row per station in the dataset's order, and `latitude` and `longitude` columns that must equal
+  the dataset's coordinates within `tolerance` degrees (`1e-6` by default; raise it for coordinates
+  written with fewer decimals). `attributes` maps a point attribute to a numeric column; an empty cell
+  is unknown. The file is needed for `LapseRate` only, and its sha256 is part of the result's
+  identity. The point attributes an operator reads (`elevation` for `LapseRate`) must be among the
+  source's `point_attributes`, here the keys of `attributes`.
 - **`Nearest(max_distance_km=...)`** takes each station's value from its nearest model node. The
   distance is required: a station farther than that from every node, outside a limited-area domain,
   gets a NaN forecast and is not scored. Pass `None` to map every point, which suits a global model
   only.
-- **`LapseRate`** corrects `2t` by `rate * (elevation - orography)`, the station elevation (a point
-  attribute) minus the model orography at the nearest node, in metres. The orography is a **model
-  constant**, served by the provider given as `constants=`, here an `ArrayConstants` of an `(N,)`
-  array on the model grid, in the model's node order: for instance the geopotential `z` of the
-  model's dataset divided by g (`z / 9.80665`). Only the declared units are checked, so a
-  geopotential declared as `m` would pass. An operator that needs constants is refused without a
-  provider. A station with no elevation gets a NaN forecast for the corrected `2t` only; its other
-  variables are scored. When `2t` is not among the scored variables, `LapseRate` is passed through
-  and needs neither the orography nor the elevations.
-- **Persistence through the same operator.** A persistence baseline of the analysis is scored through
-  the same operator and the same constants. The scored variables are the operator's outputs that the
-  targets have.
+- **`LapseRate`** corrects `2t` by `rate * (elevation - orography)`, the station elevation from the
+  file minus the model orography at the nearest node, in metres. The orography is a **model
+  constant**: without `constants=`, the evaluation asks the forecast source at the first init time of
+  the run, and an inference checkpoint serves it from the geopotential `z` it reads as a constant
+  forcing, divided by g. A station with no elevation gets a NaN forecast for the corrected `2t` only;
+  its other variables are scored. When `2t` is not among the scored variables, `LapseRate` is passed
+  through and needs neither the orography nor the elevations.
+- **Persistence through the same operator.** A persistence baseline of the analysis has no
+  constants of its own, so it is refused without `constants=`; `DatasetConstants` reads the
+  orography from a dataset on the forecast grid (by default `z` divided by g, in metres, at the
+  dataset's first available date); `constants=operators.ForecastConstants(forecast)` gives it the
+  model's own orography instead. The scored variables are the operator's outputs that the targets
+  have.
 
 One operator instance can be given to several evaluations: each takes a deep copy and binds it to
 its own forecast in `run()` (or `pairs()`, or `attrs()`); the dry run binds a throwaway copy on the
@@ -937,29 +957,30 @@ At construction, before any model call:
 | a chain starting in points space, or with two `grid -> points` steps | the forecast is gridded, and there is no way back from points |
 | a step with a time stencil wider than the valid time | not supported yet |
 | a fixed point set with time offsets (non-zero `timedeltas`) | they need a time stencil, which the driver does not run yet; leave `timedeltas` out, or zero, to score at the valid time |
-| a point attribute the operator needs and the targets lack | `LapseRate` on targets without an `elevation`, for instance |
-| an operator needing model constants without `constants=` | there is nothing to read the orography from |
+| a point attribute the operator needs and the targets lack | `LapseRate` on targets without an `elevation`, such as `StationDatasetTargets` without a station file |
+| a model constant the forecast cannot serve | a persistence baseline has none: pass `constants=operators.DatasetConstants(...)` |
 | `graph_attribute` or `spherical_voronoi` weights, `grid` regions | they are per model node, not per observation |
 | weight or region files and arrays on a varying point set | a varying set has no fixed shape to give one value per point |
 | anomaly metrics and a climatology | ACC at points is not supported yet |
 | `to_config()` | YAML for observations is not supported yet, so the result has no `config` attr; the operator and the targets are recorded in their own attrs |
 
 At bind, at the start of `run()` and in `plan()`: a constant in the wrong units (`LapseRate` needs
-the orography in `m`, and geopotential is not a height) or of the wrong shape, and a merge identity
-holding a value it cannot record exactly (an object, a set, a non-string key; paths and dates are
-fine). Also refused at
-construction: `constants=` for an operator that needs none.
+the orography in `m`, and geopotential is not a height), of the wrong shape, or a constants dataset on
+another grid, and a merge identity holding a value it cannot record exactly (an object, a set, a
+non-string key; paths and dates are fine). Also refused at construction: `constants=` for an operator
+that needs none.
 
 During the run, a valid time with no observation (the source raises `MissingTargetError`, or returns
-an empty point set) is a missing target, skipped (or raised with `on_missing_target="raise"`) and not
-counted in `n_init`. A varying point set with time offsets is refused when it is read.
+an empty point set; `StationDatasetTargets` raises it when every station value is NaN) is a missing
+target, skipped (or raised with `on_missing_target="raise"`) and not counted in `n_init`; the dry run
+cannot know it before reading, so its `with_targets` count stays optimistic. A varying point set with
+time offsets is refused when it is read.
 
-`merge` refuses results whose operator or point targets differ, and a mixture of point and gridded
-results; the diagnostics are for information and come from the first input. The point targets are
-compared on the source's `merge_identity()`, in a canonical JSON form, so key order does not count:
-the base class, and so `ArrayPointTargets`, gives the
-class, the sizes and the attribute names only, so a source of your own should return what identifies
-its data.
+`merge` refuses results whose operator or point targets (dataset, conversions, station file) differ,
+and a mixture of point and gridded results; the diagnostics are for information and come from the
+first input. The point targets are compared on the source's `merge_identity()`, in a canonical JSON
+form, so key order does not count: the base class, and so `ArrayPointTargets`, gives the class, the
+sizes and the attribute names only, so a source of your own should return what identifies its data.
 
 Not yet supported: YAML for observations, tabular (point) datasets, models that predict at
 observation points directly, ACC at points, per-station scores, and time interpolation. Of the spatial

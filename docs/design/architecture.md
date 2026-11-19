@@ -402,7 +402,7 @@ scores one. A shard of such a run writes one file per dataset; merging is then p
 refuses inputs whose `dataset` attributes differ (FR-30). The
 module imports torch and the package lazily inside the command functions, so `--help` is cheap.
 
-### 3.13 Observations: `points.py`, `operators/`, `point_scoring.py`
+### 3.13 Observations: `points.py`, `operators/`, `point_scoring.py`, `sources/stations.py`
 
 A `PointSet` holds the `P` points of one valid time: `latitudes` and `longitudes` (float64 degrees),
 `timedeltas` (float32 seconds relative to the valid time, zero by default) and named per-point
@@ -447,20 +447,31 @@ chain counts its spatial step's points only; a later step gives NaN where it can
 `LapseRate` subtracts `rate * (elevation - orography)` from one variable. `Identity` is the gridded
 path itself, which keeps its own code: no operator, or identities only, changes nothing.
 
-Constants come from a provider (`ConstantsProvider`), given to the evaluation as `constants`;
-`ArrayConstants` holds arrays in memory. An operator whose steps that run need constants is refused
-without a provider.
+Constants come from a provider: `ForecastConstants` asks the forecast source's `constant_field()`
+(the inference source serves its retrieved constant forcings from the runner's constant-forcings
+input, without loading the model), `DatasetConstants` reads variables of a gridded dataset in one
+row, `ArrayConstants` holds arrays; each converts `field * scale + offset` and declares the units.
+The driver builds a `ForecastConstants` at the first init time of the whole run when a step that
+runs needs constants and none are given, so every shard reads the same date; one given without a
+date is replaced by a dated copy (`with_date`), never changed. Station variables and constants share
+one conversion record, `variables.Conversion`.
+
+`StationDatasetTargets` is the first point target: an adapter over a `DatasetTargets` whose grid is
+a fixed set of stations, handing that grid out as a fixed `PointSet`, converting each variable to
+its result name and units, and reading per-station attributes (elevation) from a CSV checked
+against the dataset's coordinates. A valid time at which every value read is NaN raises
+`MissingTargetError`, which `available()` cannot know before the read.
 
 Provenance is kept outside `config`, which a Python-only operator does not have: the chain's
 `merge_identity()` is the `observation_operator` attr: each step's declarations and `parameters()`,
-with the provider's `merge_identity()` (a digest
-of the values), and the targets' `merge_identity()` is the `point_targets` attr (what makes the
-observations what they are). Both are canonical JSON (`identity_json`: sorted keys, exact numbers,
-arrays by value or by sha256), checked when the operator is bound, and `merge` refuses inputs that
-differ in either, compared in that form. For information only, and
-kept from the first input by `merge`: the full `describe()` of the targets, `point_targets_description`,
-and the chain's `diagnostics()` of a fixed set, `observation_diagnostics` (a JSON object, so a new
-spatial operator adds its own facts without a new attr).
+with the provider's `merge_identity()` (the conversions and a digest of the values), and the targets'
+`merge_identity()` is the `point_targets` attr (the dataset's open arguments, the conversions, the
+station file's digest). Both are canonical JSON (`identity_json`: sorted keys, exact numbers, arrays by
+value or by sha256), checked when the operator is bound, and `merge` refuses inputs that differ in
+either, compared in that form. For information only, and kept
+from the first input by `merge`: the full `describe()` of the targets, `point_targets_description`, and
+the chain's `diagnostics()` of a fixed set, `observation_diagnostics` (a JSON object, so a new spatial
+operator adds its own facts without a new attr).
 
 ## 4. Data flow of a run
 
@@ -522,7 +533,8 @@ the shared multi-dataset rollout and lead 0 are covered too, and the forecast is
 operator's inputs rather than the scored variables. A wrapper forecast source would have missed the
 rollout and the default weights. The plan of a point set and its `W` are cached by
 `PointSet.identity`, so a fixed station network is prepared once per run and today's gridded path
-keeps its single `W`.
+keeps its single `W`. Units are converted on the target side only (FR-8): a score stays in the
+model's units under the model's name and compares with a gridded run.
 
 **Float64 per-element sums and a matrix-product node reduction.** Statistics return float64 and the
 reduction over nodes is `values.double() @ W`, which produces every region in one operation and
@@ -648,6 +660,9 @@ listed here because they are what to re-check when a pin moves.
   anemoi-core's trimmed inference checkpoints store none, which is found out only when the model
   loads: the default weights then fall back to `spherical_voronoi` with a warning, and an explicit
   graph-attribute weight or region raises `MissingGraphError`.
+* **The runner's constant-forcings input serves the retrieved constant forcings** (`z`, `lsm`, ...)
+  without loading the model, which is how `ForecastConstants` gives an operator the model
+  orography before the run starts, through the same input-state helper as the initial state.
 * **Dataset inputs refuse multi-member zarrs**, and the model's noise is drawn from the global RNG
   with no explicit generator, which is what makes `torch.manual_seed` before a forward pass
   sufficient for FR-3.

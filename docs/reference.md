@@ -761,9 +761,9 @@ Point targets, written only by a run with an observation operator (they are reco
 
 | Attr | Content |
 |---|---|
-| `observation_operator` | Canonical JSON (below) of the chain's `merge_identity()`: `{"steps": [...]}`, one entry per step (its `merge_identity()`: class, space, declarations and `parameters`), plus `constants`, the provider's `merge_identity()` (for `ArrayConstants`, the names and units and a sha256 of their names, units and values), when a step needs constants. Compared by `merge`. |
-| `point_targets` | Canonical JSON (below) of the targets' `merge_identity()`: what makes the observations what they are, without execution settings such as prefetch or cache sizes. `PointTargetSourceBase` returns its `describe()`, the class, the sizes and the attribute names only, so a source of your own should return what identifies its data. Compared by `merge`. |
-| `point_targets_description` | JSON of the targets' full `describe()`, for information; not compared. |
+| `observation_operator` | Canonical JSON (below) of the chain's `merge_identity()`: `{"steps": [...]}`, one entry per step (its `merge_identity()`: class, space, declarations and `parameters`), plus `constants`, the provider's `merge_identity()` (the conversions of the constants served and a sha256 of their names, units and values), when a step needs constants. Compared by `merge`. |
+| `point_targets` | Canonical JSON (below) of the targets' `merge_identity()`: what makes the observations what they are. For `StationDatasetTargets`, the dataset's `open_dataset` arguments, the conversions, the station count and attributes, and the station file's sha256 and column map; not the file's path, the tolerance, the prefetch or the cache. `PointTargetSourceBase` returns its `describe()`, the class, the sizes and the attribute names only, so a source of your own should return what identifies its data. Compared by `merge`. |
+| `point_targets_description` | JSON of the targets' full `describe()`, for information (the station file's path, the largest coordinate offset, the prefetch depth); not compared. |
 | `observation_diagnostics` | Fixed point sets only: JSON of the chain's `diagnostics()` of the set, e.g. `{"nearest_node_max_km": ...}`, the largest distance in km from a point in the domain to its nearest node. For information: not compared by `merge`, which keeps the first input's. |
 
 `observation_operator` and `point_targets` are written by `output.identity_json`; see [what a merge identity may contain](#what-a-merge-identity-may-contain).
@@ -823,7 +823,9 @@ unsharded control; that is a measurement of one configuration, not a guarantee.
   shard, and each dataset merges on its own); results of a single-dataset checkpoint carry no `dataset` attr;
 - inputs that differ in `observation_operator` or `point_targets`, or carry one of them in some inputs
   only (`output.IDENTITY_ATTRS`): they are part of what the numbers mean. Each is parsed and written
-  again by `identity_json` before the comparison, so key order and whitespace do not count;
+  again by `identity_json` before the comparison, so key order and whitespace do not count. Shards that
+  differ only in the station file's directory, the prefetch, the cache, or in `ForecastConstants` against
+  `DatasetConstants` serving the same values, merge;
 - a state scored against point targets with one scored on the grid;
 - a set of `shard` attrs that is neither all absent nor exactly the `0..n-1` of one run: a missing shard,
   a duplicate, disagreeing shard counts, a mix of tagged and untagged inputs, or a malformed tag. Inputs
@@ -864,7 +866,7 @@ fails the same way. The identities encoded at bind are the ones the run writes.
 
 ## Python API
 
-`anemoi.evaluation.__all__` holds 33 names and is the public surface. Six of them are modules
+`anemoi.evaluation.__all__` holds 34 names and is the public surface. Six of them are modules
 (`metrics`, `statistics`, `binning`, `weights`, `regions`, `operators`), whose contents are public too. Every name not
 listed in this section is internal and may change without notice.
 
@@ -896,9 +898,12 @@ maps the gridded forecast to the points. Construction then:
 - refuses an operator needing a point attribute the targets' `point_attributes` lack. Only the steps that
   run for the `forecast_variables` count: a step passed through (a `LapseRate("2t")` when `2t` is not
   scored) needs no point attribute and no constant;
-- when a step that runs needs model constants: takes `constants` (a `ConstantsProvider`), which is then
-  required. It refuses a missing provider, a provider whose `names` lack a constant the operator needs,
-  and `constants` given to an operator none of whose steps needs constants;
+- when a step that runs needs model constants: takes `constants` (a `ConstantsProvider`), or builds
+  `operators.ForecastConstants(forecast)` at `min(init_times)`, the whole run's first init time, so every
+  shard reads the same date; a `ForecastConstants` given without a date is replaced by its `with_date`
+  copy at that date, and the one given is not changed. It refuses a provider whose `names` lack a
+  constant the operator needs, a forecast that cannot serve them, and `constants` given to an operator
+  none of whose steps needs constants;
 - parses the weights and regions once against the point targets: weights `uniform` (the default), `file`
   or an array, the last two on a fixed point set only, shape-checked against it; regions `all`, `bbox` (on
   the point coordinates), `graph_attribute` (read at each point's nearest node, any distance, never
@@ -959,7 +964,7 @@ halves of `run()`, for a driver that feeds the frames itself; `MultiEvaluation` 
 | `dataset` | str or `None` | The dataset of a multi-dataset checkpoint this evaluation scores. |
 | `on_points` | bool | Whether the targets are a point target source. |
 | `forecast_variables` | `list[str]` | What the forecast is asked for: `variables` on the grid, the operator's inputs on points. |
-| `constants` | provider or `None` | The constants provider the operator reads, as given; `None` when none is given. |
+| `constants` | provider or `None` | The constants provider the operator reads: the one given (a dated copy for a `ForecastConstants` given without a date), else the built `ForecastConstants`; `None` when no step that runs needs constants and none are given. |
 
 #### `MultiEvaluation`
 
@@ -1143,10 +1148,34 @@ On point targets the `bytes` sizes that scale with the points use the fixed set'
 - `ArrayTargets(grid, variables, fields)` and `FakeForecastSource(targets, timestep, members=1,
   drift=0.0, spread=0.0, frames_per_pass=1, device=None)`: in-memory synthetic sources for tests and
   notebooks.
+- `StationDatasetTargets(dataset, variables, stations=None, attributes=None, tolerance=1e-6,
+  delimiter=",")`: point targets from a gridded station dataset, an anemoi dataset whose grid is a fixed
+  set of stations. `dataset` is the `DatasetTargets` that reads it (one row per valid time, its prefetch
+  and cache); its grid is the fixed `PointSet`, timedeltas zero. `variables` maps a dataset variable to
+  `{name, scale, offset}` (each optional: the dataset name, 1, 0) or to a result name alone; values are
+  `raw * scale + offset` in float64, then float32, and `variables` of the source are the result names.
+  Two variables with one result name, an unknown key and a non-finite scale or offset raise. `stations`
+  is a CSV with a header row and one row per station in dataset order (`delimiter`-separated, UTF-8,
+  blank lines skipped): its `latitude` and `longitude` columns must equal the dataset's within
+  `tolerance` degrees (longitudes modulo 360), `attributes` maps a point attribute to a numeric column
+  (an empty cell is NaN, any other non-number raises, naming the file line), other columns are ignored.
+  `attributes` without `stations` raises. A valid time at which every requested value is NaN raises
+  `MissingTargetError` after the read; `available()` is the dataset's. `variable_info` is unknown, so
+  `param` and `level` come from the forecast. Also `conversions`, `stations_sha256`,
+  `coordinate_offset` (the largest coordinate difference in degrees), `merge_identity()` and
+  `describe()`. The file reader is `sources.stations.read_station_file(path, latitudes, longitudes,
+  attributes, tolerance, delimiter=",")`.
 - `ArrayPointTargets(variables, observations, point_attributes=None)`: in-memory point targets from a
   dict of valid time to `(PointSet, (V, P) array)`, the set varying; `ArrayPointTargets.fixed(points,
   variables, fields)` one with the same `points` at every valid time. A valid time absent from the dict
   raises `MissingTargetError`. `point_attributes` defaults to the attributes every point set carries.
+- `DatasetTargets.dates`: the dataset's dates, missing ones included.
+- `InferenceForecastSource.constant_variables` (the variables the checkpoint takes as retrieved constant
+  forcings, `z`, `lsm`, ... when the model reads them; computed forcings are not among them),
+  `dataset_constant_variables(dataset=None)` and `constant_field(name, date, dataset=None) -> (N,)
+  float64`, in the units the model reads it (`z` is a geopotential), from the runner's constant-forcings
+  input without loading the model; the input state of each date read is kept until `close()`.
+  `DatasetForecast` delegates both for its dataset.
 
 #### Other
 
@@ -1170,6 +1199,8 @@ frames(init_time: datetime, lead_time: timedelta, variables: list[str], device: 
 check_init_times(init_times: list[datetime], lead_time: timedelta) -> None
 graph_node_attribute(name: str, nodes: str = "data") -> np.ndarray
 variable_info(name: str) -> dict
+constant_variables -> list[str]   # property: what constant_field can serve without loading the model
+constant_field(name: str, date: datetime) -> np.ndarray   # (N,) float64, in the model's units
 provenance() -> dict
 stats -> dict            # property
 describe() -> dict       # must not load a model
@@ -1232,7 +1263,8 @@ fixed set with time offsets is refused at construction); an empty `PointSet` cou
 
 `ForecastSourceBase`, `TargetSourceBase`, `PointTargetSourceBase` and `ClimatologySourceBase` implement the
 optional capabilities with defaults: no device preference, no graph, no date check, no sub-grids, no
-lead-0 frame, `frames_per_pass = 1`, `model_calls` counting `frames_per_pass` evenly spaced lead times per call, empty
+lead-0 frame, no model constants (`constant_field` raises, pointing at `operators.DatasetConstants`),
+`frames_per_pass = 1`, `model_calls` counting `frames_per_pass` evenly spaced lead times per call, empty
 `stats` and `provenance`, unknown `variable_info`, and `to_config()` raising; for point targets a varying
 set (`fixed_points = None`, `max_points` the fixed set's size else `None`), no attributes, everything
 available, and `merge_identity()` returning `describe()` ([what a merge identity may contain](#what-a-merge-identity-may-contain)). Their `describe()` reports the class name, the
@@ -1367,10 +1399,23 @@ optionally `names` (checked against the operator's needs at construction), `chec
 `merge_identity()` (its entry in the `observation_operator` attr, `describe()` when absent; [what a merge identity may contain](#what-a-merge-identity-may-contain)). Serving a
 constant must not need the model loaded: the dry run binds the operator.
 
-- `ArrayConstants({name: Constant or (values, units)})`: in-memory arrays; `describe()` and
-  `merge_identity()` carry the names, the units and a sha256 of their names, units and values.
+- `ForecastConstants(forecast, constants=None, date=None)`: from the forecast source's `constant_field()`,
+  read at `date`; the default provider of `Evaluation`, which reads one given without a `date` through
+  `with_date(date)`, a copy at the run's first init time with nothing served yet. Refused at construction
+  when the forecast cannot serve the variables (a persistence baseline serves none); the forecast need
+  not be the evaluated one, so a model's `ForecastConstants` serves its persistence baseline.
+- `DatasetConstants(dataset, constants=None, date=None)`: from variables of a gridded target source such as
+  `DatasetTargets`, every variable in one read at `date`, by default the dataset's first available date
+  (a given date is checked). Its grid must be the forecast's (checked at bind).
+- `ArrayConstants({name: Constant or (values, units)})`: in-memory arrays.
 
-`Evaluation` takes the provider as `constants`, required when a step that runs needs constants.
+`constants` of the first two maps a constant name to `{variable, scale, offset, units}`, all optional
+(`variable` defaults to the name): the constant is `field * scale + offset` in float64, declared in
+`units`; nothing checks the units against the source, which carries none. The default is
+`DEFAULT_CONSTANTS`, `{"orography": {"variable": "z", "scale": 1 / 9.80665, "units": "m"}}`, the
+orography from the geopotential. A constant is read once, at the chain's `bind`. `describe()` carries the
+conversions, the constants served and a sha256 of their names, units, conversions and values;
+`merge_identity()` keeps only the conversions and the sha256, not the source, the paths or the date.
 
 #### Writing an operator
 
@@ -1445,7 +1490,10 @@ Useful when reading the code or writing a tool against it, but not part of the p
 - `point_scoring.PointScoring`: the point-target half of `Evaluation` (the chain and its bind, the plan
   and `W` cache, weights and regions on points); `config.region_entries(regions, check_array)`: the
   region parsing both paths share.
-- `operators.base.constants_digest(constants)`: the sha256 of the constants providers.
+- `variables.linear_conversion(spec, keys, where) -> (scale, offset)` and `variables.Conversion(variable,
+  scale=1.0, offset=0.0, units=None)`: the `value * scale + offset` conversion of station variables and
+  constants.
+- `operators.base.constants_digest(constants, specs=None)`: the sha256 of the constants providers.
 - `evaluate.package_versions(packages=PACKAGES)`: the versions recorded in a result.
 - `evaluate.PhaseTimer(device=None)`: per-phase wall time with a CUDA synchronisation at each `mark`.
 - `evaluate.PHASES`, `evaluate.PACKAGES`: the phase and package name tuples.
@@ -1561,15 +1609,20 @@ Constraints the code enforces, with the message or behaviour:
   cost GPU memory linearly.
 - **Target datasets must have one member** (`shape[2] == 1`).
 - **Grids must match.** `Grid.check_compatible` raises unless forecast, target and climatology grids have
-  the same nodes within `1e-5` degrees. Point targets are not on the grid and are not checked.
+  the same nodes within `1e-5` degrees. Point targets are not on the grid and are not checked; a
+  `DatasetConstants` dataset is.
 - **Point targets, for now.** From the Python API only, through a `valid_time`-stencil operator that starts
-  on the grid and ends on points, on a gridded forecast. The contract expresses more than the driver runs:
-  it refuses bracketing stencils and, on gridded targets, any operator other than `Identity` (a
-  `grid -> grid` step before the spatial step on point targets is driven), and gives no point-space
-  `ModelSide`; `Chain` supports these and they are tested on throwaway operators only. Operator `to_config()` shapes are provisional. Not
+  on the grid and ends on points, on a gridded forecast; `StationDatasetTargets` is the one shipped source,
+  with a fixed point set. The contract expresses more than the driver runs: it refuses bracketing
+  stencils and, on gridded targets, any operator other than `Identity` (a `grid -> grid` step before the
+  spatial step on point targets is driven), and gives no point-space `ModelSide`; `Chain` supports these
+  and they are tested on throwaway operators only. Operator `to_config()` shapes are provisional. Not
   yet: YAML for observations, tabular datasets, point-native forecast sources, ACC at points (anomaly
   metrics and a climatology are refused at construction), time offsets (non-zero `timedeltas` are
   refused), and per-station scores.
+- **An all-NaN station row is found out by reading it.** `StationDatasetTargets.available()` is the
+  dataset's, so the dry run's `with_targets` count includes valid times that turn out to have no value;
+  the run skips them as missing targets.
 - **The out-of-domain set depends on the model.** Two models on different limited-area domains score
   different points through `Nearest` unless a region restricts both to the same ones; `out_of_domain`
   says how many were missed.

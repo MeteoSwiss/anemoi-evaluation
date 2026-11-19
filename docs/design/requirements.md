@@ -30,10 +30,11 @@ kept light: numbered requirements, MUST / SHOULD / MAY, a rationale where one is
 
 In scope at v0.4.0: deterministic and ensemble forecasts from an anemoi checkpoint trained on one
 or multiple datasets (offset forecasters included), gridded targets from an anemoi dataset on the
-same grid, observations at points as targets through an observation operator (from the Python
-API), deterministic and ensemble metrics, weighting, regions, time bins, persistence and
-linear-interpolation baselines, a climatology for anomaly scores, a YAML configuration and CLI, and
-sharding with exact merging. Section 5 lists what is deliberately outside. The goal is to score
+same grid, observations at points as targets through an observation operator (from the Python API,
+starting with gridded station datasets), deterministic and ensemble metrics, weighting, regions,
+time bins, persistence and linear-interpolation baselines, a climatology for anomaly scores, a
+YAML configuration and CLI, and sharding with exact merging. Section 5 lists what is deliberately
+outside. The goal is to score
 every anemoi task: forecasters, and for now temporal downscalers between analysis bounds, are
 supported; the others (temporal downscalers with forecast bounds, spatial downscalers,
 autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. The package itself is
@@ -135,13 +136,16 @@ regridding and no unit conversion; a source on a different grid (beyond 1e-5 deg
 be refused at construction. Point targets MUST be read once per valid time as a point set and its
 values, and MUST be scored through an observation operator that maps the forecast to those points;
 point targets without an operator, and an operator other than the identity on gridded targets, MUST
-be refused at construction.
+be refused at construction. A unit conversion and a renaming (`value * scale + offset`, in float64)
+MAY happen on the target side only, so that a score stays in the model's units under the model's
+variable name and compares with a gridded run; the forecast is never converted.
 *Rationale: on the grid the comparison is then the one the model was trained against, with no
 interpolation error the package cannot account for; on points the operator is that error, named and
 recorded (NFR-5).*
-**Status: met from the Python API, for point target sources of your own** (`PointTargetSourceBase`).
-Not yet: YAML for observations, tabular datasets, point-native forecast sources, ACC at points, point
-time offsets (refused) and operators with a time stencil wider than the valid time.
+**Status: met from the Python API, for gridded station datasets** (a fixed point set) **and point
+target sources of your own** (`PointTargetSourceBase`). Not yet: YAML for observations, tabular
+datasets, point-native forecast sources, ACC at points, point time offsets (refused) and operators with
+a time stencil wider than the valid time.
 
 **FR-9** The default target dataset of a scored dataset MUST be that dataset's own prognostics
 input, and MUST cover the evaluation period rather than the period the model was trained on,
@@ -331,11 +335,11 @@ three nodes (benchmarks 6).*
 checkpoint path, uuid and training run id, package versions, resolved configuration, ensemble
 size, inference chunk counts and GPU model, and on point targets the observation operator (its
 steps, their parameters and a digest of the model constants it uses) and what makes the
-observations what they are (the point target source's identity). The mapper chunk count changes
-a reduction order and device noise depends on the GPU's SM count, so two runs differing in either
-are not comparable bit for bit. The operator and the observations are recorded outside the
-configuration, since a Python-only operator has none, and merging MUST refuse inputs that differ
-in them.
+observations what they are (the source, the unit conversions, a digest of the station attribute
+file). The mapper chunk count changes a reduction order and device noise depends on the GPU's SM
+count, so two runs differing in either are not comparable bit for bit. The operator and the
+observations are recorded outside the configuration, since a Python-only operator has none, and
+merging MUST refuse inputs that differ in them.
 
 **NFR-6** Bit-level reproducibility of ensemble members MUST be understood as per GPU model;
 shards that must merge bit-exactly MUST run on one GPU model.
@@ -401,7 +405,9 @@ them. Private coupling to anemoi-inference MUST be minimal and isolated in named
 ### 4.5 I/O
 
 **NFR-18** Exactly three things MUST touch the filesystem during a run: the checkpoint, the
-target rows, and the result netcdf.
+target rows, and the result netcdf. On point targets two more reads are allowed, each once per run:
+the station attribute file, at construction, and the model constants, at the operator's bind
+(the checkpoint's constant forcings, or one row of a constants dataset).
 
 **NFR-19** Target reading MUST cost at most one dataset row per valid time, and MUST NOT need a
 lock on the dataset handle.
@@ -443,8 +449,8 @@ Deliberate non-goals at v0.4.0. Each is a decision, not an oversight.
 
 * **Spectra, and any statistic that is not a per-node reduction.**
 * **Regridded or converted forecast fields.** A target on another grid is scored at its points
-  through an observation operator (FR-8); the package never produces a forecast field on another
-  grid or in other units.
+  through an observation operator, and a target in other units is converted on the target side
+  (FR-8); the package never produces a forecast field on another grid or in other units.
 * **Plots and reports.** A result file is the product; presentation is downstream tooling.
 * **Distributed torch.** Data-parallel evaluation over init times was designed and deferred: it
   is the job array without the files, and its only gain is one file instead of n. Model-parallel
