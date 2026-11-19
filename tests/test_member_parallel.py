@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import logging
 import os
 import time
 
@@ -15,6 +16,8 @@ from anemoi.evaluation import metrics
 from anemoi.evaluation.aggregation import AggregationState
 from anemoi.evaluation.aggregation import Aggregator
 from anemoi.evaluation.binning import SeasonBinning
+from anemoi.evaluation.distributed import TIMING_ATTRS
+from anemoi.evaluation.distributed import abort
 from anemoi.evaluation.distributed import abort_on_error
 from anemoi.evaluation.distributed import blocks
 from anemoi.evaluation.distributed import concat_states
@@ -101,10 +104,47 @@ def _identical(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(torch.where(a.isnan(), 0.0, a).view(bits), torch.where(b.isnan(), 0.0, b).view(bits))
 
 
+def _rank_attrs(rank: int, case: dict, block: slice) -> dict:
+    """Attrs as `Evaluation.attrs` writes them, with numbers that differ per rank and the non-finite climatology nodes
+    of the rank's own variables only, so the merge rules can be told apart."""
+    nonfinite = (~case["climatology"][block].isfinite()).sum(-1).tolist()
+    return {
+        "checkpoint": "x.ckpt",
+        "checkpoint_uuid": "1234",
+        "gpu": "A100",
+        "config": "forecast: {}",
+        "package_versions": json.dumps({"torch": "2"}),
+        "init_times": "2024-01-01",
+        **{key: 1.5 * (rank + 1) for key in TIMING_ATTRS},
+        "model_calls": 2,
+        "target_reads": 4 + rank,
+        "target_cache_hits": rank,
+        "forcings_computed": 3,
+        "forcings_hits": 10 * rank,
+        "peak_gpu_memory_bytes": 100 * (3 - rank),
+        "climatology_nonfinite_nodes": json.dumps(dict(zip(case["variables"][block], nonfinite))),
+    }
+
+
+def _check_merged_attrs(merged: dict, case: dict, size: int, label: str) -> None:
+    ranks = [_rank_attrs(rank, case, part) for rank, part in enumerate(blocks(len(case["variables"]), size))]
+    for key in TIMING_ATTRS:
+        assert merged[key] == sum(item[key] for item in ranks), f"{label} {key}"
+    assert merged["target_reads"] == sum(4 + rank for rank in range(size)), label
+    assert merged["forcings_hits"] == sum(10 * rank for rank in range(size)) and merged["forcings_computed"] == 3 * size
+    assert merged["peak_gpu_memory_bytes"] == 300 and merged["model_calls"] == 2, label
+    whole = dict(zip(case["variables"], (~case["climatology"].isfinite()).sum(-1).tolist()))
+    assert json.loads(merged["climatology_nonfinite_nodes"]) == whole and whole[case["variables"][-1]] == 5, label
+    assert {key: merged[key] for key in ("checkpoint", "gpu", "config", "init_times")} == {
+        key: ranks[0][key] for key in ("checkpoint", "gpu", "config", "init_times")
+    }, label
+
+
 def _split_worker(rank: int, size: int, store: str, out: str) -> None:
     _init(rank, size, store)
     pair = dist.new_group([1, 2])
-    for group, members, n_variables in ((None, 7, 5), (pair, 7, 5), (None, 5, 2)):
+    # the last case leaves rank 2 with neither members nor variables
+    for group, members, n_variables in ((None, 7, 5), (pair, 7, 5), (None, 5, 2), (None, 2, 2)):
         if dist.get_rank(group) < 0:
             continue
         group_rank, group_size = dist.get_rank(group), dist.get_world_size(group)
@@ -123,10 +163,14 @@ def _split_worker(rank: int, size: int, store: str, out: str) -> None:
                     swapped = swap(pred[mine].contiguous(), members, group)
                     assert _identical(swapped, pred[:, block].contiguous()), f"{label} rank {group_rank}"
                     frames.append((frame_init, lead, swapped, target))
-            gathered.append(gather_state(_aggregate(case, restricted, block, frames), group))
+            state = _aggregate(case, restricted, block, frames)
+            state.attrs = _rank_attrs(group_rank, case, block)
+            gathered.append(gather_state(state, group))
         if group_rank != 0:
             assert gathered == [None, None]
             continue
+        for state in gathered:
+            _check_merged_attrs(state.attrs, case, group_size, label)
         full = _aggregate(case, statistics, slice(None), case["frames"])
         path = f"{out}/{label.replace(' ', '_')}.nc"
         write(to_xarray(gathered[1], built), path)
@@ -144,14 +188,26 @@ def _split_worker(rank: int, size: int, store: str, out: str) -> None:
 
 def test_member_split_scores_like_the_unsplit_run(tmp_path):
     """Members split over 3 ranks and over a 2-rank subgroup, swapped to variable blocks, scored with restricted
-    statistics and gathered give the unsplit state bit for bit, also after a netcdf round trip and `merge`; with
-    `V < R` one rank scores no variable, and every rank but one lacks the threshold variable in some case."""
+    statistics and gathered give the unsplit state bit for bit, also after a netcdf round trip and `merge`, and the
+    attrs merged by the rules of `merge_attrs`; with `V < R` one rank scores no variable, with `M, V < R` one rank has
+    neither members nor variables, and every rank but one lacks the threshold variable in some case."""
     _spawn(_split_worker, 3, str(tmp_path / "store"), str(tmp_path))
+
+
+class _Records(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
 
 
 def _abort_worker(rank: int, size: int, store: str, done: str) -> None:
     _init(rank, size, store)
+    dist.barrier()
     if rank == 1:
+        time.sleep(0.3)  # rank 0 is inside the swap by now
         try:
             with abort_on_error():
                 raise RuntimeError("boom")
@@ -159,6 +215,10 @@ def _abort_worker(rank: int, size: int, store: str, done: str) -> None:
             assert str(error) == "boom"
         else:
             raise AssertionError("abort_on_error swallowed the error")
+        records = _Records()
+        logging.getLogger("anemoi.evaluation.distributed").addHandler(records)
+        abort()  # the group is gone: one line, no traceback, no error
+        assert [(r.levelno, r.exc_info) for r in records.records] == [(logging.WARNING, None)], records.records
         deadline = time.monotonic() + 30
         while not os.path.exists(done) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -193,8 +253,10 @@ def test_blocks_concat_and_attrs():
     with pytest.raises(ValueError, match="bound"):
         metrics.build([{"brier": WET}])[0].statistics["brier_wet"].restrict(slice(0, 1))
 
-    def state(variables, n_init=1, inits=INITS[:1], attrs=None):
-        result = AggregationState.zeros(LEADS, ["all"], variables, REGIONS, ["error"], 3, "cpu", {"param": variables})
+    def state(variables, n_init=1, inits=INITS[:1], attrs=None, members=3):
+        result = AggregationState.zeros(
+            LEADS, ["all"], variables, REGIONS, ["error"], members, "cpu", {"param": variables}
+        )
         result.n_init += n_init
         result.init_times, result.attrs = list(inits), dict(attrs or {})
         return result
@@ -206,6 +268,10 @@ def test_blocks_concat_and_attrs():
         concat_states([state(["a"]), state(["b"], n_init=2)])
     with pytest.raises(ValueError, match="init_times"):
         concat_states([state(["a"]), state(["b"], inits=INITS[1:])])
+    with pytest.raises(ValueError, match="members"):
+        concat_states([state(["a"]), state(["b"], members=4)])
+    with pytest.raises(ValueError, match="overlap"):
+        concat_states([state(["a", "b"]), state(["b"])])
 
     ranks = [
         {"time_model_s": 1.5, "target_reads": 3, "forcings_hits": 2, "peak_gpu_memory_bytes": 10, "model_calls": 4},
@@ -221,3 +287,6 @@ def test_blocks_concat_and_attrs():
         merge_attrs([ranks[0], {**ranks[1], "gpu": "PG506-232"}])
     with pytest.raises(ValueError, match="inference_chunks_processor"):
         merge_attrs([{**ranks[0], "inference_chunks_processor": 2}, ranks[1]])
+    for key in ("checkpoint_uuid", "config", "package_versions"):
+        with pytest.raises(ValueError, match=key):
+            merge_attrs([{**ranks[0], key: "a"}, {**ranks[1], key: "b"}])

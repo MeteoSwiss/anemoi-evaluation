@@ -23,7 +23,7 @@ from anemoi.evaluation.output import TIMING_ATTRS
 LOG = logging.getLogger(__name__)
 SUMMED_ATTRS = ("target_reads", "target_cache_hits")
 SUMMED_PREFIXES = ("forcings_",)
-IDENTITY_ATTRS = ("gpu",)
+IDENTITY_ATTRS = ("gpu", "checkpoint_uuid", "config", "package_versions")
 IDENTITY_PREFIXES = ("inference_chunks_",)
 
 
@@ -49,10 +49,14 @@ def swap(data: torch.Tensor, members: int, group: dist.ProcessGroup | None = Non
     """This rank's (M_r, V, N) member block -> the (M, V_r, N) variable block of every member, in global member order.
 
     The members of rank `r` are `blocks(members, R)[r]` and its variables `blocks(V, R)[r]`. Every rank of `group` must
-    call it with the same `members` and `V`, including the ranks whose member or variable block is empty. It is one
-    batch of point-to-point sends and receives, which gloo and NCCL both run (gloo has no list all-to-all and NCCL
-    serialises unbatched ones); with NCCL the current CUDA device must be set, and the first operation on the group
-    must involve all its ranks, which a rank with neither members nor variables would skip.
+    call it with the same `members`, `V` and `N`, including the ranks whose member or variable block is empty; the
+    blocks are derived from them, so ranks that disagree exchange messages of the wrong size. It is one batch of
+    point-to-point sends and receives, which gloo and NCCL both run (gloo has no list all-to-all and NCCL serialises
+    unbatched ones); with NCCL the current CUDA device must be set, and the first operation on the group must involve
+    all its ranks, which a rank with neither members nor variables would skip.
+
+    The peak memory is the input, the contiguous copies sent to the other ranks and the output, about three times the
+    (M_r, V, N) frame when the blocks are even.
     """
     rank, size = _rank_and_size(group)
     member_blocks, variable_blocks = blocks(members, size), blocks(data.shape[1], size)
@@ -87,7 +91,8 @@ def merge_attrs(attrs: list[dict]) -> dict:
     Timings and the target-read and forcings counters are summed, `peak_gpu_memory_bytes` is the maximum, the
     `climatology_nonfinite_nodes` maps are unioned, and everything else, `model_calls` included (every rank makes the
     same calls, each for its own members), is rank 0's. Ranks on different GPU models or inference chunk counts are refused,
-    since the bit-exact members depend on both.
+    since the bit-exact members depend on both, and so are ranks that disagree on the checkpoint uuid, the config or
+    the package versions.
     """
     if not attrs:
         raise ValueError("no attrs to merge")
@@ -96,7 +101,9 @@ def merge_attrs(attrs: list[dict]) -> dict:
         if key in IDENTITY_ATTRS or key.startswith(IDENTITY_PREFIXES):
             values = [item.get(key) for item in attrs]
             if len({str(value) for value in values}) > 1:
-                raise ValueError(f"the ranks disagree on {key!r}: {values}; a member group must run on one GPU model")
+                raise ValueError(
+                    f"the ranks disagree on {key!r}: {values}; a member group runs one setup on one GPU model"
+                )
     result = dict(attrs[0])
     for key in keys:
         values = [item[key] for item in attrs if key in item]
@@ -122,6 +129,10 @@ def concat_states(states: list[AggregationState]) -> AggregationState:
     if not states:
         raise ValueError("no states to concatenate")
     first = states[0]
+    names = [name for state in states for name in state.variables]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"the variable blocks overlap: {duplicates} are in more than one")
     for rank, state in enumerate(states[1:], start=1):
         for name in ("lead_times", "bins", "regions", "members", "init_times"):
             if getattr(state, name) != getattr(first, name):
@@ -134,7 +145,7 @@ def concat_states(states: list[AggregationState]) -> AggregationState:
     return AggregationState(
         list(first.lead_times),
         list(first.bins),
-        [name for state in states for name in state.variables],
+        names,
         list(first.regions),
         {name: torch.cat([state.sums[name] for state in states], dim=2) for name in first.sums},
         torch.cat([state.weights for state in states], dim=2),
@@ -155,30 +166,34 @@ def gather_state(state: AggregationState, group: dist.ProcessGroup | None = None
     return concat_states(gathered) if rank == 0 else None
 
 
-def abort(group: dist.ProcessGroup | None = None) -> None:
-    """Tear down `group` without waiting for the other ranks: NCCL communicators are aborted, any other backend is
-    destroyed; a failure to do so is logged, not raised."""
+def abort() -> None:
+    """Tear down the world group, and every group made from it, without waiting for the other ranks: NCCL
+    communicators are aborted, any other backend is destroyed; a failure to do so (a group already gone) is logged in
+    one line, not raised."""
     try:
-        if "nccl" in str(dist.get_backend(group)) and hasattr(dist.distributed_c10d, "_abort_process_group"):
-            dist.distributed_c10d._abort_process_group(group)
+        if "nccl" in str(dist.get_backend()) and hasattr(dist.distributed_c10d, "_abort_process_group"):
+            dist.distributed_c10d._abort_process_group()
         else:
-            dist.destroy_process_group(group)
-    except Exception:
-        LOG.exception("could not abort the process group")
+            dist.destroy_process_group()
+    except Exception as error:
+        LOG.warning("could not abort the process group: %s", error)
 
 
 @contextlib.contextmanager
-def abort_on_error(group: dist.ProcessGroup | None = None) -> Iterator[None]:
-    """Abort `group` and re-raise when the block raises, so the other ranks fail instead of waiting for this one.
+def abort_on_error() -> Iterator[None]:
+    """Abort the world group and re-raise when the block raises, so the other ranks fail instead of waiting for this
+    one.
 
+    Only the world group: destroying a gloo subgroup does not unblock its peers, they wait until this process exits.
     With gloo the other ranks see the connections close and raise in their next or current operation. With NCCL the
-    abort frees only this rank's communicators: a rank already inside a collective waits for NCCL's timeout. Run a
-    member group under `srun --kill-on-bad-exit=1`, so that Slurm kills the other tasks of the step as soon as one
-    exits with an error.
+    abort frees only this rank's communicators: a rank already inside a collective waits for NCCL's timeout, and
+    torch's abort is meant to run with `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, since otherwise NCCL's watchdog may abort
+    the group by itself first. Run a member group under `srun --kill-on-bad-exit=1`, so that Slurm kills the other
+    tasks of the step as soon as one exits with an error.
     """
     try:
         yield
     except BaseException:
         LOG.error("this rank of the member group failed, aborting the group")
-        abort(group)
+        abort()
         raise
