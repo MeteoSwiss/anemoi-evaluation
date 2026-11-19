@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import json
 import logging
 from collections.abc import Iterable
+from collections.abc import Mapping
 from pathlib import Path
+from pathlib import PurePath
+from typing import Any
 
 import numpy as np
 import torch
@@ -20,21 +25,132 @@ BIN_ALL = "all"
 TIMING_ATTRS = ("time_model_s", "time_target_s", "time_target_read_s", "time_statistics_s", "time_total_s")
 COUNT_ATTRS = ("target_reads", "target_cache_hits", "model_calls")
 MAX_ATTRS = ("peak_gpu_memory_bytes",)
+# attrs that identify the numbers themselves: shards must agree on them to merge
+IDENTITY_ATTRS = ("observation_operator", "point_targets")
+# arrays and tensors of at most this many elements are written value by value in a merge identity, larger ones as
+# their dtype, shape and a sha256 of their values
+IDENTITY_ARRAY_VALUES = 64
 _DIMS = ("lead_time", "bin", "variable", "region")
 _STATE_DIMS = ("lead_time", "state_bin", "variable", "region")
 _STATE_SUM = "state_sum_"
 
 
+def identity_json(value: Any, what: str = "the merge identity") -> str:
+    """The canonical JSON of a merge identity (`IDENTITY_ATTRS`): keys sorted, Python and numpy scalars and 0-d
+    tensors as exact JSON numbers, arrays and tensors (bool, int, uint, float up to 64 bits, str) as
+    `{"array": dtype, "shape": [...], "values": [...]}`, or with `"sha256"` (of the values' bytes in C order,
+    little-endian) in place of `"values"` above `IDENTITY_ARRAY_VALUES` elements. Non-finite floats are written as
+    `NaN`, `Infinity` and `-Infinity`, as Python's `json` does.
+
+    Paths, dates and durations are tagged, so they differ from a string of the same text: `{"__path__": posix}`,
+    `{"__datetime__": iso}`, `{"__date__": iso}` (pandas timestamps keep their nanoseconds),
+    `{"__timedelta__": [nanoseconds, "ns"]}` (pandas' too), and for numpy `{"__datetime64__": [text, unit]}` and
+    `{"__timedelta64__": [count, unit]}` (`"NaT"` for not-a-time). These tag keys, and a dict of exactly `array`,
+    `shape` and `values` or `sha256`, are reserved: a dict written that way equals the value it imitates.
+
+    Raises TypeError on a non-string key or on any other value (an object, a set, a masked array), naming where it
+    is in `what`, rather than writing its `str()`."""
+    return json.dumps(_canonical(value, what), sort_keys=True)
+
+
+def _canonical_time(value: Any) -> dict | None:
+    """The tagged form of a path, date or duration; None for any other value."""
+    if isinstance(value, PurePath):
+        return {"__path__": value.as_posix()}
+    if isinstance(value, datetime.datetime):
+        return {"__datetime__": value.isoformat()}
+    if isinstance(value, datetime.date):
+        return {"__date__": value.isoformat()}
+    if isinstance(value, datetime.timedelta):
+        if hasattr(value, "asm8"):  # pandas.Timedelta: nanoseconds, which the microsecond fields would drop
+            return {"__timedelta__": [int(value.asm8.astype("timedelta64[ns]").astype(np.int64)), "ns"]}
+        return {"__timedelta__": [(value // datetime.timedelta(microseconds=1)) * 1000, "ns"]}
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        unit, count = np.datetime_data(value.dtype)
+        unit = unit if count == 1 else f"{count}{unit}"
+        if isinstance(value, np.datetime64):
+            return {"__datetime64__": [str(value), unit]}
+        return {"__timedelta64__": ["NaT" if np.isnat(value) else int(value.astype(np.int64)), unit]}
+    return None
+
+
+def _canonical(value: Any, where: str) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    tagged = _canonical_time(value)
+    if tagged is not None:
+        return tagged
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating) and value.dtype.itemsize <= 8:
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        try:
+            array = value.detach().cpu().numpy()
+        except TypeError:
+            raise TypeError(f"{where}: a {value.dtype} tensor cannot be held exactly by a merge identity") from None
+        return _canonical_array(array, where)
+    if isinstance(value, np.ndarray):
+        return _canonical_array(value, where)
+    if isinstance(value, Mapping):
+        items = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"{where}: the key {key!r} ({type(key).__name__}) is not a str, and a merge identity takes str "
+                    "keys only"
+                )
+            items[str(key)] = _canonical(item, f"{where}.{key}")
+        return items
+    if isinstance(value, (list, tuple)):
+        return [_canonical(item, f"{where}[{i}]") for i, item in enumerate(value)]
+    raise TypeError(
+        f"{where}: {type(value).__name__} cannot be held exactly by a merge identity, which takes dicts with str keys, "
+        "lists, tuples, str, int, float, bool, None, numpy numbers, numpy arrays, tensors, paths, dates and durations"
+    )
+
+
+def _canonical_array(array: np.ndarray, where: str) -> Any:
+    if isinstance(array, np.ma.MaskedArray):
+        raise TypeError(
+            f"{where}: a masked array cannot be held exactly by a merge identity (its mask would be lost); pass "
+            "array.filled(np.nan), or the data and the mask"
+        )
+    if array.ndim == 0:
+        return _canonical(array[()], where)
+    if array.dtype.kind not in "biufU" or (array.dtype.kind == "f" and array.dtype.itemsize > 8):
+        raise TypeError(f"{where}: a {array.dtype} array cannot be held exactly by a merge identity")
+    encoded: dict = {"array": array.dtype.name, "shape": list(array.shape)}
+    if array.size <= IDENTITY_ARRAY_VALUES:
+        encoded["values"] = array.tolist()
+    else:
+        little = np.ascontiguousarray(array, dtype=array.dtype.newbyteorder("<"))
+        encoded["sha256"] = hashlib.sha256(little.tobytes()).hexdigest()
+    return encoded
+
+
 def to_xarray(state: AggregationState, metrics: list[Metric], attrs: dict | None = None) -> xr.Dataset:
     """Metrics on (lead_time, bin, variable, region), plus any extra dimension a metric declares through `output_dim`,
     `bin` being the stored bins plus a derived `all`, the raw state on `state_bin` (stored bins only) and the
-    contributed init times as `init_time`; attrs extend `state.attrs`."""
+    contributed init times as `init_time`; attrs extend `state.attrs`. A state scored against point targets adds
+    `out_of_domain` (lead_time, bin) and `state_out_of_domain` (lead_time, state_bin), the observation points the
+    operator could not map."""
     state = state.cpu()
     sums = {name: total.numpy() for name, total in state.sums.items()}
     weights, n_init, bins = state.weights.numpy(), state.n_init.numpy(), list(state.bins)
+    outside = None if state.out_of_domain is None else state.out_of_domain.numpy()
     if bins != [BIN_ALL]:
         sums = {name: _with_total(total) for name, total in sums.items()}
         weights, n_init, bins = _with_total(weights), _with_total(n_init), bins + [BIN_ALL]
+        outside = None if outside is None else _with_total(outside)
     means = {name: torch.from_numpy(total) / torch.from_numpy(weights) for name, total in sums.items()}
     data_vars, extra_coords = {}, {}
     for metric in metrics:
@@ -54,6 +170,9 @@ def to_xarray(state: AggregationState, metrics: list[Metric], attrs: dict | None
         data_vars[_STATE_SUM + name] = (_STATE_DIMS, total.numpy())
     data_vars["state_weights"] = (_STATE_DIMS, state.weights.numpy())
     data_vars["state_n_init"] = (_STATE_DIMS[:2], state.n_init.numpy())
+    if outside is not None:
+        data_vars["out_of_domain"] = (_DIMS[:2], outside)
+        data_vars["state_out_of_domain"] = (_STATE_DIMS[:2], state.out_of_domain.numpy())
     coords = {
         "lead_time": np.array(state.lead_times, dtype="timedelta64[ns]"),
         "bin": bins,
@@ -102,6 +221,9 @@ def load_state(path: str | Path) -> AggregationState:
         variable_coords,
         dataset["init_time"].values.astype("datetime64[us]").tolist(),
         {key: value for key, value in dataset.attrs.items() if key != "members"},
+        torch.from_numpy(np.asarray(dataset["state_out_of_domain"].values, dtype=np.int64))
+        if "state_out_of_domain" in dataset
+        else None,
     )
 
 
@@ -109,13 +231,17 @@ def merge(items: Iterable[AggregationState | str | Path], *, partial: bool = Fal
     """Sum states or result files with disjoint init times, whose `shard` tags must be the complete `0..n-1` of one
     run unless `partial`; attrs come from the first except the timing totals and the counters (summed),
     `peak_gpu_memory_bytes` (the maximum), `init_times` (the union), `config` (a JSON `{"merge": [...]}` of every
-    input's config) and `shard` (dropped, or the shards merged when `partial` allowed an incomplete set)."""
+    input's config) and `shard` (dropped, or the shards merged when `partial` allowed an incomplete set). Inputs that
+    differ in an attr of `IDENTITY_ATTRS` (the operator, the point targets), or have it in some only, are refused: they
+    are part of what the numbers mean. Informational attrs such as `point_targets_description` and
+    `observation_diagnostics` are the first input's."""
     items = list(items)
     states = [load_state(item) if isinstance(item, (str, Path)) else item for item in items]
     if not states:
         raise ValueError("nothing to merge")
     labels = [str(item) if isinstance(item, (str, Path)) else f"input {i}" for i, item in enumerate(items)]
     _check_one_dataset(states, labels)
+    _check_identity(states, labels)
     shard = _merged_shard(states, labels, partial)
     result = states[0]
     for state in states[1:]:
@@ -148,6 +274,29 @@ def _check_one_dataset(states: list[AggregationState], labels: list[str]) -> Non
     if len(found) > 1:
         listed = ", ".join(f"{name or '(none)'} ({', '.join(names)})" for name, names in sorted(found.items()))
         raise ValueError(f"the inputs are results of different datasets: {listed}; merge one dataset at a time")
+
+
+def _check_identity(states: list[AggregationState], labels: list[str]) -> None:
+    """Refuse a merge of inputs that disagree on an attr of `IDENTITY_ATTRS` (absent counts as a value), compared in
+    the canonical form of `identity_json`, so key order and whitespace do not count."""
+    for key in IDENTITY_ATTRS:
+        found: dict[str, list[str]] = {}
+        for state, label in zip(states, labels):
+            found.setdefault(_canonical_attr(state.attrs.get(key)), []).append(label)
+        if len(found) > 1:
+            listed = "; ".join(f"{', '.join(names)}: {value}" for value, names in found.items())
+            raise ValueError(f"the inputs differ in their {key} attr, they are not results of the same run: {listed}")
+
+
+def _canonical_attr(value: Any) -> str:
+    """An identity attr parsed and written again by `identity_json`; as it is when it is not JSON, `(none)` when
+    absent."""
+    if value is None:
+        return "(none)"
+    try:
+        return identity_json(json.loads(value))
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _shard_tag(value: str, label: str) -> tuple[frozenset[int], int]:

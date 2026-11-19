@@ -37,8 +37,16 @@ from anemoi.evaluation.config import build_weights
 from anemoi.evaluation.config import config_dataset_names
 from anemoi.evaluation.config import load_config
 from anemoi.evaluation.config import per_dataset
+from anemoi.evaluation.config import region_entries
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.metrics import Metric
+from anemoi.evaluation.operators.base import Chain
+from anemoi.evaluation.operators.base import ConstantsProvider
+from anemoi.evaluation.operators.base import ObservationOperator
+from anemoi.evaluation.point_scoring import PointScoring
+from anemoi.evaluation.point_scoring import observation_chain
+from anemoi.evaluation.point_scoring import resolve_constants
+from anemoi.evaluation.points import PointSet
 from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
 from anemoi.evaluation.sources.anemoi_inference import DatasetForecast
 from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
@@ -46,7 +54,10 @@ from anemoi.evaluation.sources.base import ClimatologySource
 from anemoi.evaluation.sources.base import ForecastSource
 from anemoi.evaluation.sources.base import MissingGraphError
 from anemoi.evaluation.sources.base import MissingTargetError
+from anemoi.evaluation.sources.base import Observations
+from anemoi.evaluation.sources.base import PointTargetSource
 from anemoi.evaluation.sources.base import TargetSource
+from anemoi.evaluation.sources.base import is_point_target
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.climatology import ArrayClimatology
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
@@ -55,7 +66,16 @@ from anemoi.evaluation.sources.persistence import PersistenceForecastSource
 LOG = logging.getLogger(__name__)
 PHASES = ("model", "target", "statistics", "total")
 DEFAULT_DATASET = "data"
-PACKAGES = ("anemoi-evaluation", "anemoi-inference", "anemoi-models", "anemoi-graphs", "anemoi-datasets", "torch")
+PACKAGES = (
+    "anemoi-evaluation",
+    "anemoi-inference",
+    "anemoi-models",
+    "anemoi-graphs",
+    "anemoi-datasets",
+    "anemoi-transform",
+    "scipy",
+    "torch",
+)
 # benchmarks.md sections 7 and 9: about 90 s of cold-node startup plus about 15 s of first-call overheads.
 STARTUP_SECONDS = 105.0
 
@@ -100,12 +120,25 @@ class Evaluation:
 
     `dataset` names the dataset of a multi-dataset checkpoint this evaluation scores; it is written to the result as
     the `dataset` attr and is None for a checkpoint that has only one dataset, whose results are unchanged.
+
+    Point targets (`PointTargetSource`, observations at points that may change from one valid time to the next) need
+    an `observation_operator` (an operator or a `Chain`, from `anemoi.evaluation.operators`) mapping the gridded
+    forecast to the points. When the operator needs model constants such as the orography, `constants` (a
+    `ConstantsProvider`, e.g. `operators.ArrayConstants`) serves them, and an operator that needs them is refused
+    without one. The operator is deep-copied, so one instance can serve several evaluations (a model and its
+    persistence baseline); the copy is bound to the forecast by `begin()`, `pairs()` and `attrs()`, while `plan()`
+    binds a throwaway copy on the CPU. The forecast is asked for the operator's inputs for the scored variables
+    (`forecast_variables`), and the scored variables are taken from the operator's output by name; a step passed
+    through for those variables needs no constants and no point attributes. On points, the default weights are
+    uniform per observation (so the `weight_sum` of a statistic is its count of finite pairs); weights and regions
+    are per point set, see `point_weights` and `point_regions`. Gridded targets take no operator, or an `Identity`,
+    which is the gridded path itself.
     """
 
     def __init__(
         self,
         forecast: ForecastSource,
-        targets: TargetSource,
+        targets: TargetSource | PointTargetSource,
         init_times: list[datetime.datetime],
         lead_time: datetime.timedelta | str,
         metrics: list[Metric | str | dict],
@@ -118,10 +151,13 @@ class Evaluation:
         include_lead_zero: bool = False,
         climatology: ClimatologySource | None = None,
         dataset: str | None = None,
+        observation_operator: ObservationOperator | None = None,
+        constants: ConstantsProvider | None = None,
     ) -> None:
         self.dataset = dataset
         self.forecast = forecast
         self.targets = targets
+        self.on_points = is_point_target(targets)
         self.init_times = [as_datetime(date) for date in init_times]
         self.lead_time = frequency_to_timedelta(lead_time)
         self.lead_times = forecast.lead_times(self.lead_time)
@@ -130,7 +166,8 @@ class Evaluation:
         self.include_lead_zero = include_lead_zero
         if include_lead_zero:
             self.lead_times = [datetime.timedelta(0), *self.lead_times]
-        forecast.grid.check_compatible(targets.grid)
+        if not self.on_points:
+            forecast.grid.check_compatible(targets.grid)
         if getattr(forecast, "temporal_downscaling", False) and getattr(targets, "interpolate_frequency", None):
             LOG.warning(
                 "the targets are opened with interpolate_frequency %s: between the dates of the dataset it "
@@ -139,11 +176,25 @@ class Evaluation:
                 targets.interpolate_frequency,
             )
         targets.prefetch_hint(forecast.frames_per_pass)
-        self.variables = self._resolve_variables(variables)
+        chain = observation_chain(observation_operator, constants, self.on_points)
+        self.variables = self._resolve_variables(variables, chain)
+        self.forecast_variables = list(self.variables) if chain is None else chain.input_variables(self.variables)
+        if chain is not None:
+            missing = [name for name in self.forecast_variables if name not in forecast.variables]
+            if missing:
+                raise ValueError(
+                    f"the observation operator needs the forecast variables {missing} for {self.variables}, the "
+                    f"forecast source has {list(forecast.variables)}"
+                )
+            chain.check_attributes(targets.point_attributes, self.forecast_variables)
+            constants = resolve_constants(chain, constants, self.forecast_variables)
+        self.constants = constants
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)
         if needed > forecast.members:
             raise ValueError(f"the metrics need at least {needed} members, the forecast source has {forecast.members}")
+        if self.on_points and ("climatology" in metrics_module.required_aux(self.metrics) or climatology is not None):
+            raise ValueError("anomaly metrics and a climatology are not supported on point targets yet")
         self.climatology = climatology
         if "climatology" in metrics_module.required_aux(self.metrics) and climatology is None:
             raise ValueError("the anomaly metrics need a climatology source")
@@ -163,22 +214,31 @@ class Evaluation:
 
         grid = forecast.grid
         self._default_weights = weights is None
-        if weights is None:
-            weights = {"graph_attribute": "area_weight"} if forecast.has_graph else {"uniform": {}}
-        self._weights_spec = weights if isinstance(weights, dict) else None
-        self._weights = (
-            weights if isinstance(weights, dict) else grid.check_shape(np.asarray(weights, dtype=np.float64), "weights")
-        )
-        regions = dict(regions or {"global": "all"})
-        if not regions:
-            raise ValueError("at least one region is required")
-        self._region_specs = {name: spec if isinstance(spec, (str, dict)) else None for name, spec in regions.items()}
-        self._regions = {
-            name: spec
-            if isinstance(spec, (str, dict))
-            else grid.check_shape(np.asarray(spec, dtype=bool), f"region {name!r}")
-            for name, spec in regions.items()
-        }
+        self._points: PointScoring | None = None
+        if chain is not None:
+            self._points = PointScoring(
+                chain,
+                forecast,
+                targets,
+                self.variables,
+                self.forecast_variables,
+                constants,
+                weights,
+                regions,
+                self.device,
+                len(self.lead_times) + 1,
+            )
+            self._weights_spec, self._region_specs = self._points.weights_spec, self._points.region_specs
+        else:
+            if weights is None:
+                weights = {"graph_attribute": "area_weight"} if forecast.has_graph else {"uniform": {}}
+            self._weights_spec = weights if isinstance(weights, dict) else None
+            self._weights = (
+                weights
+                if isinstance(weights, dict)
+                else grid.check_shape(np.asarray(weights, dtype=np.float64), "weights")
+            )
+            self._region_specs, self._regions = region_entries(regions, grid.check_shape)
         self.timing: dict[str, float] = {}
         self.model_calls = 0
         self.climatology_nonfinite: dict[str, int] = {}
@@ -187,7 +247,12 @@ class Evaluation:
 
     @cached_property
     def weights(self) -> np.ndarray:
-        """Node weights (N,) float64, resolved from the spec on first use."""
+        """Node weights (N,) float64, resolved from the spec on first use.
+
+        On point targets: the weights (P,) of the fixed point set; a varying point set has no fixed weights and
+        raises (see `point_weights`)."""
+        if self._points is not None:
+            return self._points.weights(self._points.fixed("weights"))
         if isinstance(self._weights, dict):
             try:
                 return build_weights(self._weights, self.forecast.grid, self.forecast)
@@ -205,7 +270,12 @@ class Evaluation:
 
     @cached_property
     def regions(self) -> dict[str, np.ndarray]:
-        """Region masks (N,) bool by name, resolved from the specs on first use."""
+        """Region masks (N,) bool by name, resolved from the specs on first use.
+
+        On point targets: the masks (P,) of the fixed point set; a varying point set has no fixed masks and raises
+        (see `point_regions`)."""
+        if self._points is not None:
+            return self._points.regions(self._points.fixed("regions"))
         grid = self.forecast.grid
         return {
             name: build_region(spec, grid, self.forecast, self.targets) if isinstance(spec, (str, dict)) else spec
@@ -214,16 +284,52 @@ class Evaluation:
 
     @cached_property
     def aggregator(self) -> Aggregator:
-        """The aggregator over the resolved weights and regions."""
-        _, masks = regions_module.stack(self.regions, self.forecast.grid.n)
+        """The aggregator over the resolved weights and regions; on point targets one without a `W` of its own, given
+        the `W` of each frame's point set."""
         statistics = metrics_module.unique_statistics(self.metrics)
+        if self._points is not None:
+            return Aggregator.for_points(len(self._region_specs), statistics, self.binning, self.device)
+        _, masks = regions_module.stack(self.regions, self.forecast.grid.n)
         return Aggregator(self.weights, masks, statistics, self.binning, self.device)
 
-    def _resolve_variables(self, variables: list[str] | None) -> list[str]:
+    @property
+    def observation_operator(self) -> Chain | None:
+        """The observation operator as a `Chain` (a deep copy of the one given), bound once `begin()`, `pairs()` or
+        `attrs()` has run, unbound before; None on the gridded path."""
+        return None if self._points is None else self._points.chain
+
+    def _bind(self) -> None:
+        """Bind the observation operator to the forecast, once (a constant of the wrong units, shape or grid fails
+        here); a no-op on the gridded path."""
+        if self._points is not None:
+            self._points.bind()
+
+    def point_weights(self, points: PointSet) -> np.ndarray:
+        """Weights (P,) float64 of `points` on point targets: uniform by default, or the fixed set's file or array,
+        through the same specs as on the grid."""
+        return self._point_scoring().weights(points)
+
+    def point_regions(self, points: PointSet) -> dict[str, np.ndarray]:
+        """Region masks (P,) bool of `points` by name, on point targets: `all`, a bbox on the point coordinates and
+        the fixed set's file or array through the same specs as on the grid, and a graph attribute read at each
+        point's nearest model node (never interpolated)."""
+        return self._point_scoring().regions(points)
+
+    def _point_scoring(self) -> PointScoring:
+        if self._points is None:
+            raise ValueError("point weights and regions are for point targets, these targets are on the grid")
+        return self._points
+
+    def _resolve_variables(self, variables: list[str] | None, chain: Chain | None) -> list[str]:
+        """The scored variables: given, or those the forecast (through the operator, when there is one) and the
+        targets share."""
+        available = self.forecast.variables
+        if chain is not None:
+            available = chain.output_variables(self.forecast.variables)
         if variables is None:
-            variables = [name for name in self.forecast.variables if name in self.targets.variables]
+            variables = [name for name in available if name in self.targets.variables]
         else:
-            select_variables(list(variables), self.forecast.variables)
+            select_variables(list(variables), available)
             select_variables(list(variables), self.targets.variables)
         if not variables:
             raise ValueError("no variables to evaluate")
@@ -281,10 +387,13 @@ class Evaluation:
         self, init_times: list[datetime.datetime] | None = None, step_time: float | None = None, shards: int = 1
     ) -> dict:
         """What a run over `init_times` would do, without loading a model or resolving weights and regions;
-        `step_time` adds the `time` estimate of `time_estimate`, for a run split over `shards` shards."""
+        `step_time` adds the `time` estimate of `time_estimate`, for a run split over `shards` shards.
+
+        On point targets the operator is described from a throwaway copy bound on the CPU, which the evaluation does
+        not keep: it stays unbound, and a run's CUDA device need not be present."""
         init_times = list(self.init_times if init_times is None else init_times)
         valid_times = [init + lead for init in init_times for lead in self.lead_times]
-        v, n, r = len(self.variables), self.forecast.grid.n, len(self._regions)
+        v, n, r = len(self.variables), self.forecast.grid.n, len(self._region_specs)
         row = v * n * 4
         forecast, targets = self.forecast.describe(), self.targets.describe()
         calls, computed = self.model_calls_per_init()
@@ -336,6 +445,8 @@ class Evaluation:
             },
             **({"time": self.time_estimate(step_time, len(init_times), shards)} if step_time is not None else {}),
         }
+        if self._points is not None:
+            self._points.plan(plan, valid_times)
         if computed > self.lead_time:
             plan["note"] = (
                 f"the last of the {calls} model calls per init time computes up to {plan['computed_lead_time']}; "
@@ -384,15 +495,21 @@ class Evaluation:
                 )
         self.timing = {}
         self.model_calls = 0
+        if self._points is not None:
+            # bound before any model call, so the operator's constants fail here; the point-set cache is the run's own
+            self._points.begin()
+            regions = list(self._region_specs)
+        else:
+            regions = list(self.regions)
         return self.aggregator.new_state(
-            self.lead_times, self.variables, list(self.regions), self.forecast.members, self.variable_coords()
+            self.lead_times, self.variables, regions, self.forecast.members, self.variable_coords()
         )
 
     def frames(self, init_time: datetime.datetime) -> Iterator[Frame]:
         """The forecast frames of one init time, the lead-0 one first when it is scored; announces the valid times
         to the target source first."""
         self.targets.prefetch([init_time + lead for lead in self.lead_times], self.variables)
-        frames = self.forecast.frames(init_time, self.lead_time, self.variables, self.device)
+        frames = self.forecast.frames(init_time, self.lead_time, self.forecast_variables, self.device)
         if self.include_lead_zero:
             frames = itertools.chain(self._initial_frames(init_time), frames)
         return frames
@@ -401,11 +518,17 @@ class Evaluation:
         """Score one frame into `state`; a frame whose target is missing is skipped or raises.
 
         `charge_model` False leaves the time before the target read uncharged: it is another timer's, which is how
-        `MultiEvaluation` keeps one dataset's target reads out of another's `model` (see `_run_shared`)."""
+        `MultiEvaluation` keeps one dataset's target reads out of another's `model` (see `_run_shared`). On point
+        targets the frame is mapped to the valid time's points by the operator first (charged to `statistics`), and
+        the points it reports out of its domain are counted in the state's `out_of_domain`."""
         target = self._target(frame, timer, charge_model)
         if target is None:
             return
-        self.aggregator.add(state, frame, target, self._aux(frame))
+        if self._points is not None:
+            mapped, entry = self._points.map(frame, target.points)
+            self.aggregator.add(state, mapped, target.values, W=entry.W, out_of_domain=entry.out_of_domain)
+        else:
+            self.aggregator.add(state, frame, target, self._aux(frame))
         timer.mark("statistics")
 
     def charge(
@@ -460,22 +583,31 @@ class Evaluation:
         state.attrs.update(self.attrs(init_times, self.timing))
 
     def pairs(self, init_times: list[datetime.datetime] | None = None) -> Iterator[tuple[Frame, torch.Tensor]]:
-        """Yield `(frame, target)` pairs for a custom loop, without aggregation; the loop runs in inference mode."""
+        """Yield `(frame, target)` pairs for a custom loop, without aggregation; the loop runs in inference mode.
+
+        On point targets the frame is the operator's output on the valid time's points, (M, V, P) with the scored
+        variables and its `points` set, and the target the observations (1, V, P); the operator is bound before the
+        first frame."""
+        self._bind()
         with torch.inference_mode():
             for init_time in self.init_times if init_times is None else init_times:
                 yield from self._pairs_one(init_time, PhaseTimer())
 
     def _initial_frames(self, init_time: datetime.datetime) -> Iterator[Frame]:
         try:
-            yield self.forecast.initial_frame(init_time, self.variables, self.device)
+            yield self.forecast.initial_frame(init_time, self.forecast_variables, self.device)
         except MissingTargetError as error:
             LOG.warning("%s: no lead-0 frame for init %s", error, init_time)
 
-    def _target(self, frame: Frame, timer: PhaseTimer, charge_model: bool = True) -> torch.Tensor | None:
-        """The target of `frame`, None when it is missing and missing targets are skipped."""
+    def _target(self, frame: Frame, timer: PhaseTimer, charge_model: bool = True) -> torch.Tensor | Observations | None:
+        """The target of `frame`, None when it is missing and missing targets are skipped; on point targets the
+        valid time's `Observations`, an empty point set counting as missing."""
         timer.mark("model") if charge_model else timer.skip()
         try:
-            target = self.targets.frame(frame.valid_time, self.variables, self.device)
+            if self._points is not None:
+                target = self._points.observations(frame.valid_time)
+            else:
+                target = self.targets.frame(frame.valid_time, self.variables, self.device)
         except MissingTargetError as error:
             if self.on_missing_target == "raise":
                 raise
@@ -485,12 +617,21 @@ class Evaluation:
         timer.mark("target")
         return target
 
+    def _pair(self, frame: Frame, timer: PhaseTimer) -> tuple[Frame, torch.Tensor] | None:
+        """`(frame, target)` as `pairs` yields it, None when the target is missing and skipped."""
+        target = self._target(frame, timer)
+        if target is None:
+            return None
+        if self._points is not None:
+            return self._points.map(frame, target.points)[0], target.values
+        return frame, target
+
     def _pairs_one(self, init_time: datetime.datetime, timer: PhaseTimer) -> Iterator[tuple[Frame, torch.Tensor]]:
         for frame in self.frames(init_time):
-            target = self._target(frame, timer)
-            if target is None:
+            pair = self._pair(frame, timer)
+            if pair is None:
                 continue
-            yield frame, target
+            yield pair
             timer.mark("statistics")
         timer.mark("model")
 
@@ -532,6 +673,9 @@ class Evaluation:
             attrs["target_cache_hits"] = int(stats.get("cache_hits", 0))
         for key, value in getattr(self.forecast, "stats", {}).items():
             attrs[key] = int(value)
+        if self._points is not None:
+            # their own attrs, outside `config`; binding first keeps them the same before and after a run
+            attrs.update(self._points.attrs())
         return attrs
 
     @classmethod
@@ -549,9 +693,12 @@ class Evaluation:
         return build(config, forecast, targets, climatology)
 
     def to_config(self) -> dict:
-        """YAML-ready dict; raises when sources, weights or regions were given as objects without a spec."""
+        """YAML-ready dict; raises when sources, weights or regions were given as objects without a spec, and on point
+        targets (Python API only for now)."""
         if self._config is not None:
             return self._config.model_dump(mode="json", exclude_none=True)
+        if self._points is not None:
+            raise ValueError("point targets and observation operators cannot be written to a config yet")
         if self._weights_spec is None or None in self._region_specs.values():
             raise ValueError("weights and regions given as arrays cannot be serialised, give specs instead")
         config = EvaluationConfig.model_validate(
@@ -578,6 +725,8 @@ class MultiEvaluation:
 
     Every dataset has its own targets, variables, weights, regions, climatology, aggregator and result; the datasets
     only share the model call, the init times and the lead times. `run()` returns one aggregation state per dataset.
+    A dataset may be scored against point targets through its evaluation's observation operator: the rollout asks
+    each dataset for its `forecast_variables` and each evaluation maps its own frames.
     """
 
     def __init__(self, evaluations: dict[str, Evaluation], forecast: InferenceForecastSource | None = None) -> None:
@@ -641,6 +790,8 @@ class MultiEvaluation:
     def run(self, init_times: list[datetime.datetime] | None = None) -> dict[str, AggregationState]:
         """Evaluate `init_times` (default: all) and return one aggregation state per dataset."""
         init_times = list(self.init_times if init_times is None else init_times)
+        for evaluation in self.evaluations.values():
+            evaluation._bind()  # every operator and merge identity checked before any dataset runs
         if self.forecast is None:  # no shared rollout (a persistence baseline per dataset)
             states = {name: evaluation.run(init_times) for name, evaluation in self.evaluations.items()}
             self.timing = {}
@@ -690,7 +841,10 @@ class MultiEvaluation:
                             evaluation.add_frame(states[name], frame, timers[name], charge_model=False)
                 shared.skip()  # the prefetch calls and the lead-0 frames are not the rollout
                 stream = self.forecast.multi_frames(
-                    init_time, self.lead_time, {name: self.evaluations[name].variables for name in names}, self.device
+                    init_time,
+                    self.lead_time,
+                    {name: self.evaluations[name].forecast_variables for name in names},
+                    self.device,
                 )
                 with contextlib.closing(stream):
                     for frames in stream:
@@ -711,6 +865,8 @@ class MultiEvaluation:
 
     def pairs(self, init_times: list[datetime.datetime] | None = None) -> Iterator[tuple[str, Frame, torch.Tensor]]:
         """Yield `(dataset, frame, target)` triples for a custom loop, without aggregation."""
+        for evaluation in self.evaluations.values():
+            evaluation._bind()
         if self.forecast is None:
             for name, evaluation in self.evaluations.items():
                 for frame, target in evaluation.pairs(init_times):
@@ -724,18 +880,21 @@ class MultiEvaluation:
                     evaluation = self.evaluations[name]
                     if evaluation.include_lead_zero:
                         for frame in evaluation._initial_frames(init_time):
-                            target = evaluation._target(frame, timer)
-                            if target is not None:
-                                yield name, frame, target
+                            pair = evaluation._pair(frame, timer)
+                            if pair is not None:
+                                yield name, *pair
                 stream = self.forecast.multi_frames(
-                    init_time, self.lead_time, {name: self.evaluations[name].variables for name in names}, self.device
+                    init_time,
+                    self.lead_time,
+                    {name: self.evaluations[name].forecast_variables for name in names},
+                    self.device,
                 )
                 with contextlib.closing(stream):  # a caller that breaks out closes the runner generators
                     for frames in stream:
                         for name in names:
-                            target = self.evaluations[name]._target(frames[name], timer)
-                            if target is not None:
-                                yield name, frames[name], target
+                            pair = self.evaluations[name]._pair(frames[name], timer)
+                            if pair is not None:
+                                yield name, *pair
 
     def attrs(self, init_times: list[datetime.datetime] | None = None) -> dict[str, dict]:
         """The result attrs of each dataset."""

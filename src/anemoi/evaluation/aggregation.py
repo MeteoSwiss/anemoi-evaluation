@@ -23,6 +23,8 @@ class AggregationState:
 
     `variable_coords` are auxiliary per-variable labels (`param`, `level`) written next to the variable axis;
     `init_times` are the init times whose frames were added, so that shards can refuse to merge twice.
+    `out_of_domain` counts, per (lead_time, bin), the observation points an operator could not map (point targets
+    only, None otherwise); it is additive like the sums.
     """
 
     lead_times: list[datetime.timedelta]
@@ -36,6 +38,7 @@ class AggregationState:
     variable_coords: dict[str, list] = field(default_factory=dict)
     init_times: list[datetime.datetime] = field(default_factory=list)
     attrs: dict = field(default_factory=dict)
+    out_of_domain: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         self._lead_index = {lead: i for i, lead in enumerate(self.lead_times)}
@@ -45,6 +48,9 @@ class AggregationState:
                 raise ValueError(f"{name} must be float64 {shape}, got {tensor.dtype} {tuple(tensor.shape)}")
         if tuple(self.n_init.shape) != shape[:2] or self.n_init.dtype != torch.int64:
             raise ValueError(f"n_init must be int64 {shape[:2]}, got {self.n_init.dtype} {tuple(self.n_init.shape)}")
+        counter = self.out_of_domain
+        if counter is not None and (tuple(counter.shape) != shape[:2] or counter.dtype != torch.int64):
+            raise ValueError(f"out_of_domain must be int64 {shape[:2]}, got {counter.dtype} {tuple(counter.shape)}")
         if self.members < 1:
             raise ValueError(f"members must be at least 1, got {self.members}")
         for name, values in self.variable_coords.items():
@@ -104,6 +110,11 @@ class AggregationState:
         shared = sorted(set(self.init_times) & set(other.init_times))
         if shared:
             raise ValueError(f"cannot merge states that share init times, e.g. {shared[0]} ({len(shared)} shared)")
+        if (self.out_of_domain is None) != (other.out_of_domain is None):
+            raise ValueError("cannot merge a state scored against point targets with one scored on the grid")
+        out_of_domain = None
+        if self.out_of_domain is not None:
+            out_of_domain = self.out_of_domain + other.out_of_domain.to(self.out_of_domain.device)
         return AggregationState(
             list(self.lead_times),
             list(self.bins),
@@ -116,6 +127,7 @@ class AggregationState:
             dict(self.variable_coords),
             sorted(set(self.init_times) | set(other.init_times)),
             dict(self.attrs),
+            out_of_domain,
         )
 
     def to(self, device: torch.device | str) -> AggregationState:
@@ -132,6 +144,7 @@ class AggregationState:
             dict(self.variable_coords),
             list(self.init_times),
             dict(self.attrs),
+            None if self.out_of_domain is None else self.out_of_domain.to(device),
         )
 
     def cpu(self) -> AggregationState:
@@ -145,30 +158,63 @@ class AggregationState:
         return to_xarray(self, metrics, attrs)
 
 
+def weight_matrix(weights: np.ndarray, masks: np.ndarray, device: torch.device | str | None = None) -> torch.Tensor:
+    """`W` (L, R) float64 on `device`: the weights (L,) of the L locations (nodes or points) times their region masks
+    (L, R)."""
+    weights = np.asarray(weights, dtype=np.float64)
+    masks = np.asarray(masks, dtype=bool)
+    if weights.ndim != 1 or masks.ndim != 2 or masks.shape[0] != weights.shape[0]:
+        raise ValueError(f"weights must be (L,) and masks (L, R), got {weights.shape} and {masks.shape}")
+    return torch.from_numpy(weights[:, None] * masks).to(device)
+
+
 class Aggregator:
-    """Accumulates node-weighted, region-masked statistics of frames into an AggregationState."""
+    """Accumulates node-weighted, region-masked statistics of frames into an AggregationState.
+
+    `for_points` makes one without a `W` of its own, for frames on observation points: each `add` then passes the `W`
+    of its point set (from `weight_matrix`), and its states count the points out of the operator's domain.
+    """
 
     def __init__(
         self,
-        weights: np.ndarray,
-        masks: np.ndarray,
+        weights: np.ndarray | None,
+        masks: np.ndarray | None,
         statistics: dict[str, Statistic],
         binning: Binning,
         device: torch.device | str | None = None,
+        n_regions: int | None = None,
     ) -> None:
-        weights = np.asarray(weights, dtype=np.float64)
-        masks = np.asarray(masks, dtype=bool)
-        if weights.ndim != 1 or masks.ndim != 2 or masks.shape[0] != weights.shape[0]:
-            raise ValueError(f"weights must be (N,) and masks (N, R), got {weights.shape} and {masks.shape}")
-        self.W = torch.from_numpy(weights[:, None] * masks).to(device)
+        """`weights` (N,) and `masks` (N, R) give the aggregator its `W`; both None, with `n_regions`, give one
+        without, which takes the `W` of each frame (`for_points`)."""
+        if weights is None and masks is None:
+            if n_regions is None or n_regions < 1:
+                raise ValueError("at least one region is required")
+            self.W = None
+        elif weights is None or masks is None or n_regions is not None:
+            raise ValueError("give weights and masks, or n_regions alone")
+        else:
+            self.W = weight_matrix(weights, masks, device)
+            n_regions = self.W.shape[1]
         self.statistics = dict(statistics)
         self.binning = binning
         self.device = device
+        self._n_regions = n_regions
+
+    @classmethod
+    def for_points(
+        cls,
+        n_regions: int,
+        statistics: dict[str, Statistic],
+        binning: Binning,
+        device: torch.device | str | None = None,
+    ) -> Aggregator:
+        """An aggregator for frames on observation points, whose `W` is passed to every `add`."""
+        return cls(None, None, statistics, binning, device, n_regions=n_regions)
 
     @property
     def n_regions(self) -> int:
         """Number of region masks."""
-        return self.W.shape[1]
+        return self._n_regions
 
     def new_state(
         self,
@@ -185,17 +231,35 @@ class Aggregator:
             lead_times, self.binning.coords, variables, regions, self.statistics, members, self.device, variable_coords
         )
         state.attrs.update(bin_kind=self.binning.kind, bin_by=self.binning.by)
+        if self.W is None:
+            state.out_of_domain = torch.zeros(state.n_init.shape, dtype=torch.int64, device=self.device)
         return state
 
     def add(
-        self, state: AggregationState, frame: Frame, target: torch.Tensor, aux: dict[str, torch.Tensor] | None = None
+        self,
+        state: AggregationState,
+        frame: Frame,
+        target: torch.Tensor,
+        aux: dict[str, torch.Tensor] | None = None,
+        W: torch.Tensor | None = None,
+        out_of_domain: int = 0,
     ) -> None:
         """Accumulate one frame; a node is excluded from every statistic where any member or the target is non-finite.
 
         `aux` holds per-frame fields handed to the statistics; the ensemble mean is added here and, when `aux` carries a
         (V, N) `climatology`, the float64 anomalies too. The climatology never touches the shared weights: the anomaly
         statistics zero themselves where it is non-finite. A statistic whose `aux` names a missing field raises.
+
+        On points (`for_points`), `W` is the (P, R) matrix of the frame's point set and `out_of_domain` the number of
+        its points the operator could not map, added to the state's counter (their NaN forecast already keeps them
+        out of every sum).
         """
+        if W is None:
+            if self.W is None:
+                raise ValueError("an aggregator for points needs the W of the frame's point set")
+            W = self.W
+        elif self.W is not None:
+            raise ValueError("this aggregator has its own W; only an aggregator for points takes one per frame")
         pred = frame.data
         if list(frame.variables) != state.variables:
             raise ValueError(f"frame variables {frame.variables} do not match the state's {state.variables}")
@@ -214,13 +278,15 @@ class Aggregator:
             forecast, truth, finite = anomalies(aux["ensemble_mean"], target[0], climatology)
             aux.update(forecast_anomaly=forecast, target_anomaly=truth, climatology_finite=finite)
         valid = torch.isfinite(pred).all(0) & torch.isfinite(target[0])
-        state.weights[lead, time_bin] += valid.double() @ self.W
+        state.weights[lead, time_bin] += valid.double() @ W
         for name, statistic in self.statistics.items():
             missing = [key for key in statistic.aux if key not in aux]
             if missing:
                 raise ValueError(f"statistic {name} needs {missing} in aux")
             values = torch.where(valid, statistic.compute(pred, target, aux), 0.0)
-            state.sums[name][lead, time_bin] += values.double() @ self.W
+            state.sums[name][lead, time_bin] += values.double() @ W
         state.n_init[lead, time_bin] += 1
         if frame.init_time not in state.init_times:
             state.init_times.append(frame.init_time)
+        if self.W is None:
+            state.out_of_domain[lead, time_bin] += int(out_of_domain)

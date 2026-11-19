@@ -2,7 +2,8 @@
 
 `ForecastSource` and `TargetSource` are the full contracts; `ForecastSourceBase` and `TargetSourceBase` implement
 the optional capabilities with defaults (no device preference, no checkpoint graph, no date check, ...), so a new
-source subclasses a base and overrides what it can provide.
+source subclasses a base and overrides what it can provide. `PointTargetSource` (base `PointTargetSourceBase`) is the
+target contract for observations at points rather than on the model grid; `is_point_target` tells the two apart.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import datetime
 import math
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 from typing import Protocol
 
@@ -18,6 +20,8 @@ import torch
 
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
+from anemoi.evaluation.points import PointSet
+from anemoi.evaluation.variables import variable_info
 
 
 class MissingTargetError(LookupError):
@@ -147,6 +151,74 @@ class TargetSource(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class Observations:
+    """What a point target source returns for one valid time: the `PointSet` and its values, float32 (1, V, P), NaN
+    where a record lacks a variable. Fields added later come with defaults, so a source written today keeps working."""
+
+    points: PointSet
+    values: torch.Tensor
+
+
+class PointTargetSource(Protocol):
+    """Observations at points: per valid time, an `Observations` of a `PointSet` and its values as float32 (1, V, P),
+    NaN where a record lacks a variable; P may change from one valid time to the next.
+
+    `fixed_points` is the point set when it is the same at every valid time (a station network on its own grid), None
+    when it varies; `max_points` bounds P when known (the fixed set's size), for the dry run's memory sizing;
+    `point_attributes` names the per-point attributes every returned `PointSet` carries, checked against the
+    operator's needs at construction.
+    """
+
+    variables: list[str]
+    point_attributes: tuple[str, ...]
+    fixed_points: PointSet | None
+    max_points: int | None
+
+    def observations(self, valid_time: datetime.datetime, variables: list[str], device: torch.device) -> Observations:
+        """The points and values (1, V, P) of `valid_time`, in one read; raises MissingTargetError when there is no
+        observation."""
+        ...
+
+    def available(self, valid_time: datetime.datetime) -> bool:
+        """Whether `observations` can deliver `valid_time`, when known without reading; True by default."""
+        ...
+
+    def prefetch(self, valid_times: list[datetime.datetime], variables: list[str]) -> None:
+        """Announce the valid times the driver will request next, in order, so a source can read ahead."""
+        ...
+
+    def prefetch_hint(self, frames_per_pass: int) -> None:
+        """Tell the source how many frames the forecast source delivers per model call, to size its read-ahead."""
+        ...
+
+    @property
+    def stats(self) -> dict:
+        """Read counters for the result attrs (`reads`, `read_seconds`, `cache_hits`); empty when none are kept."""
+        ...
+
+    def close(self) -> None:
+        """Release resources."""
+        ...
+
+    def variable_info(self, name: str) -> dict:
+        """`param` and `level` of a variable, None when unknown."""
+        ...
+
+    def to_config(self) -> dict:
+        """The `targets:` config block that rebuilds this source; raises when not serialisable."""
+        ...
+
+    def describe(self) -> dict:
+        """Facts about the source for a dry run and the result attrs; must not read observations."""
+        ...
+
+    def merge_identity(self) -> dict:
+        """What makes the observations what they are (the result's `point_targets` attr, which `merge` compares):
+        no execution settings such as prefetch or cache sizes; must not read observations."""
+        ...
+
+
 class ClimatologySource(Protocol):
     """Returns the climatology at a valid time as float32 (V, N) on the target grid, for the anomaly statistics."""
 
@@ -271,6 +343,63 @@ class TargetSourceBase:
         raise ValueError(f"{type(self).__name__} cannot be written to a config")
 
 
+class PointTargetSourceBase:
+    """Defaults for the optional capabilities of a point target source: a varying point set of unknown size, no
+    attributes, everything assumed available."""
+
+    point_attributes: tuple[str, ...] = ()
+    fixed_points: PointSet | None = None
+
+    @property
+    def max_points(self) -> int | None:
+        """The fixed set's size, else unknown."""
+        return None if self.fixed_points is None else len(self.fixed_points)
+
+    def available(self, valid_time: datetime.datetime) -> bool:
+        """Unknown until read, so assumed available."""
+        return True
+
+    def prefetch(self, valid_times: list[datetime.datetime], variables: list[str]) -> None:
+        """Nothing to read ahead."""
+
+    def prefetch_hint(self, frames_per_pass: int) -> None:
+        """Nothing to size."""
+
+    @property
+    def stats(self) -> dict:
+        """No counters."""
+        return {}
+
+    def close(self) -> None:
+        """Nothing to release."""
+
+    def variable_info(self, name: str) -> dict:
+        """Unknown."""
+        return variable_info(None)
+
+    def describe(self) -> dict:
+        """Class, variable count, whether the point set is fixed and its size when it is, the attribute names."""
+        return {
+            "source": type(self).__name__,
+            "variables": len(self.variables),
+            "points": "varying" if self.fixed_points is None else len(self.fixed_points),
+            "point_attributes": list(self.point_attributes),
+        }
+
+    def merge_identity(self) -> dict:
+        """The description."""
+        return self.describe()
+
+    def to_config(self) -> dict:
+        """Not serialisable."""
+        raise ValueError(f"{type(self).__name__} cannot be written to a config")
+
+
+def is_point_target(targets: object) -> bool:
+    """Whether `targets` serves observations at points (`PointTargetSource`) rather than fields on the grid."""
+    return callable(getattr(targets, "observations", None))
+
+
 class ClimatologySourceBase:
     """Defaults for the optional capabilities of a climatology source."""
 
@@ -295,13 +424,6 @@ def lead_time_steps(lead_time: datetime.timedelta, timestep: datetime.timedelta)
     if lead_time <= datetime.timedelta(0) or lead_time % timestep:
         raise ValueError(f"lead time {lead_time} is not a positive multiple of the timestep {timestep}")
     return [k * timestep for k in range(1, lead_time // timestep + 1)]
-
-
-def variable_info(variable: object | None) -> dict:
-    """`param` and `level` of an anemoi typed variable (anemoi-transform `Variable`); None when unknown."""
-    if variable is None:
-        return {"param": None, "level": None}
-    return {"param": getattr(variable, "param", None), "level": getattr(variable, "level", None)}
 
 
 def select_variables(requested: list[str], available: list[str]) -> list[int]:

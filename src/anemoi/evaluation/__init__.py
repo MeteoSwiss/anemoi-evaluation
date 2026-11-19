@@ -5,6 +5,7 @@ from importlib.metadata import version
 
 from anemoi.evaluation import binning
 from anemoi.evaluation import metrics
+from anemoi.evaluation import operators
 from anemoi.evaluation import regions
 from anemoi.evaluation import statistics
 from anemoi.evaluation import weights
@@ -18,13 +19,18 @@ from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.output import load_state
 from anemoi.evaluation.output import merge
 from anemoi.evaluation.output import to_xarray
+from anemoi.evaluation.points import PointSet
 from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
 from anemoi.evaluation.sources.anemoi_inference import DatasetForecast
 from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
 from anemoi.evaluation.sources.base import ClimatologySourceBase
 from anemoi.evaluation.sources.base import ForecastSourceBase
+from anemoi.evaluation.sources.base import MissingTargetError
+from anemoi.evaluation.sources.base import Observations
+from anemoi.evaluation.sources.base import PointTargetSourceBase
 from anemoi.evaluation.sources.base import TargetSourceBase
 from anemoi.evaluation.sources.climatology import ArrayClimatology
+from anemoi.evaluation.sources.fake import ArrayPointTargets
 from anemoi.evaluation.sources.fake import ArrayTargets
 from anemoi.evaluation.sources.fake import FakeForecastSource
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
@@ -39,6 +45,7 @@ __all__ = [
     "AggregationState",
     "Aggregator",
     "ArrayClimatology",
+    "ArrayPointTargets",
     "ArrayTargets",
     "ClimatologySourceBase",
     "DatasetForecast",
@@ -50,8 +57,12 @@ __all__ = [
     "Grid",
     "InferenceForecastSource",
     "LinearInterpolationForecastSource",
+    "MissingTargetError",
     "MultiEvaluation",
+    "Observations",
     "PersistenceForecastSource",
+    "PointSet",
+    "PointTargetSourceBase",
     "TargetSourceBase",
     "__version__",
     "binning",
@@ -59,6 +70,7 @@ __all__ = [
     "load_state",
     "merge",
     "metrics",
+    "operators",
     "regions",
     "statistics",
     "to_xarray",

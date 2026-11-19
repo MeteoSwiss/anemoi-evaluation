@@ -13,6 +13,7 @@ from anemoi.evaluation.__main__ import format_output_path
 from anemoi.evaluation.__main__ import main
 from anemoi.evaluation.__main__ import resolve_shard
 from anemoi.evaluation.aggregation import AggregationState
+from anemoi.evaluation.evaluate import PACKAGES
 from anemoi.evaluation.evaluate import STARTUP_SECONDS
 from anemoi.evaluation.evaluate import Evaluation
 from anemoi.evaluation.frame import Frame
@@ -179,7 +180,9 @@ def test_netcdf_round_trip_and_cli_merge(fake_sources, tmp_path):
     assert all(torch.equal(loaded.sums[name], state.sums[name]) for name in state.sums)
     assert torch.equal(loaded.weights, state.weights) and torch.equal(loaded.n_init, state.n_init)
     assert full["init_time"].values.tolist() == [np.datetime64(t, "ns").astype(int) for t in INITS]
-    assert json.loads(full.attrs["package_versions"])["anemoi-evaluation"]
+    versions = json.loads(full.attrs["package_versions"])
+    assert versions["anemoi-evaluation"] and list(versions) == list(PACKAGES)
+    assert {"anemoi-transform", "scipy"} <= set(PACKAGES)
 
     parts = [str(tmp_path / f"part{i}.nc") for i in range(len(INITS))]
     for init_time, part in zip(INITS, parts):
