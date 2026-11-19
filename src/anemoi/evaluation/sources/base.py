@@ -81,6 +81,16 @@ class ForecastSource(Protocol):
         """`param` and `level` of a variable, None when unknown."""
         ...
 
+    @property
+    def constant_variables(self) -> list[str]:
+        """Variables `constant_field` can serve without loading the model; empty when none."""
+        ...
+
+    def constant_field(self, name: str, date: datetime.datetime) -> np.ndarray:
+        """A constant field (N,) float64 on the grid, in the model's units, read at `date`; raises when the source
+        cannot serve it."""
+        ...
+
     def provenance(self) -> dict:
         """Result-file attrs identifying the model, e.g. the checkpoint path."""
         ...
@@ -278,6 +288,18 @@ class ForecastSourceBase:
     def variable_info(self, name: str) -> dict:
         """Unknown."""
         return variable_info(None)
+
+    @property
+    def constant_variables(self) -> list[str]:
+        """None."""
+        return []
+
+    def constant_field(self, name: str, date: datetime.datetime) -> np.ndarray:
+        """No constants."""
+        raise ValueError(
+            f"{type(self).__name__} cannot serve model constants such as {name!r}; pass constants="
+            "operators.DatasetConstants(...) to read them from a dataset"
+        )
 
     def provenance(self) -> dict:
         """Nothing to record."""

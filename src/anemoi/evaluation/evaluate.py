@@ -124,15 +124,16 @@ class Evaluation:
     Point targets (`PointTargetSource`, observations at points that may change from one valid time to the next) need
     an `observation_operator` (an operator or a `Chain`, from `anemoi.evaluation.operators`) mapping the gridded
     forecast to the points. When the operator needs model constants such as the orography, `constants` (a
-    `ConstantsProvider`, e.g. `operators.ArrayConstants`) serves them, and an operator that needs them is refused
-    without one. The operator is deep-copied, so one instance can serve several evaluations (a model and its
-    persistence baseline); the copy is bound to the forecast by `begin()`, `pairs()` and `attrs()`, while `plan()`
-    binds a throwaway copy on the CPU. The forecast is asked for the operator's inputs for the scored variables
-    (`forecast_variables`), and the scored variables are taken from the operator's output by name; a step passed
-    through for those variables needs no constants and no point attributes. On points, the default weights are
-    uniform per observation (so the `weight_sum` of a statistic is its count of finite pairs); weights and regions
-    are per point set, see `point_weights` and `point_regions`. Gridded targets take no operator, or an `Identity`,
-    which is the gridded path itself.
+    `ConstantsProvider`) serves them; without one, a `ForecastConstants` asks the forecast source at the first init
+    time (an inference checkpoint serves its retrieved constant forcings, e.g. the orography from `z`), and a source
+    that cannot (persistence) is refused: pass `operators.DatasetConstants`. The operator is deep-copied, so one
+    instance can serve several evaluations (a model and its persistence baseline); the copy is bound to the forecast
+    by `begin()`, `pairs()` and `attrs()`, while `plan()` binds a throwaway copy on the CPU. The forecast is asked for
+    the operator's inputs for the scored variables (`forecast_variables`), and the scored variables are taken from
+    the operator's output by name; a step passed through for those variables needs no constants and no point
+    attributes. On points, the default weights are uniform per observation (so the `weight_sum` of a statistic is its
+    count of finite pairs); weights and regions are per point set, see `point_weights` and `point_regions`. Gridded
+    targets take no operator, or an `Identity`, which is the gridded path itself.
     """
 
     def __init__(
@@ -187,7 +188,7 @@ class Evaluation:
                     f"forecast source has {list(forecast.variables)}"
                 )
             chain.check_attributes(targets.point_attributes, self.forecast_variables)
-            constants = resolve_constants(chain, constants, self.forecast_variables)
+            constants = resolve_constants(chain, constants, forecast, self.init_times, self.forecast_variables)
         self.constants = constants
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)

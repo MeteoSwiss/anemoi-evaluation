@@ -32,9 +32,9 @@ contents of the result file may still change between releases.
 * **Multi-dataset checkpoints**: a checkpoint trained on multiple datasets is scored as one
   evaluation per dataset sharing one rollout, each with its own grid, variables, targets, weights,
   regions and result file.
-* **Observations as targets**, from the Python API: observations at points, from a point target
-  source of your own, scored through an observation operator (nearest node, a lapse-rate height
-  correction, or your own).
+* **Observations as targets**, from the Python API: observations at points, such as a gridded station
+  dataset or a point target source of your own, scored through an observation operator (nearest node,
+  a lapse-rate height correction, or your own) with a unit conversion on the target side.
 * **Sharding** over init times (`--shard i/n`, or automatically from Slurm job steps and job
   arrays) with exact merging of the partial results.
 * **Bring your own sources**: forecast, target and climatology sources are small protocols; a
@@ -165,7 +165,7 @@ src/anemoi/evaluation/
     frame.py             Grid and Frame, the data model shared by sources and the aggregator
     points.py            PointSet, the observation points of one valid time
     point_scoring.py     the driver's point side: operator bind, plan and W cache, weights and regions
-    variables.py         typed-variable lookup, shared by sources and operators
+    variables.py         typed-variable lookup and the linear unit conversion, shared by sources and operators
     statistics.py        per-element statistics in float64
     aggregation.py       weighted, masked, binned sums over nodes and init times
     metrics.py           metrics as functions of mean statistics
@@ -181,6 +181,7 @@ src/anemoi/evaluation/
     sources/linear_interpolation.py  linear interpolation baseline of a temporal downscaler
     sources/temporal_downscaler.py   window, lead times and input state of a temporal downscaler
     sources/climatology.py        climatologies for the anomaly statistics
+    sources/stations.py           point targets from a gridded station dataset
     sources/fake.py               in-memory synthetic sources
 tests/                   CPU-only test suite on the in-memory fakes
 tools/                   validation, comparison and climatology scripts (not part of the package)

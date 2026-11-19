@@ -35,6 +35,7 @@ from anemoi.evaluation.sources.fake import ArrayTargets
 from anemoi.evaluation.sources.fake import FakeForecastSource
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
 from anemoi.evaluation.sources.persistence import PersistenceForecastSource
+from anemoi.evaluation.sources.stations import StationDatasetTargets
 
 try:
     __version__ = version("anemoi-evaluation")
@@ -63,6 +64,7 @@ __all__ = [
     "PersistenceForecastSource",
     "PointSet",
     "PointTargetSourceBase",
+    "StationDatasetTargets",
     "TargetSourceBase",
     "__version__",
     "binning",

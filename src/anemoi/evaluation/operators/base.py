@@ -166,12 +166,15 @@ class ConstantsProvider(Protocol):
         ...
 
 
-def constants_digest(constants: Mapping[str, Constant]) -> str:
-    """sha256 of the names, units and float64 values of `constants`."""
+def constants_digest(constants: Mapping[str, Constant], specs: Mapping[str, Any] | None = None) -> str:
+    """sha256 of the names, units and float64 values of `constants`, plus each one's entry of `specs` (how it was
+    made: source variable, scale, offset) when given."""
     digest = hashlib.sha256()
     for name in sorted(constants):
         constant = constants[name]
         digest.update(f"\0{name}\0{constant.units}\0".encode())
+        if specs is not None:
+            digest.update(f"{specs.get(name)!r}\0".encode())
         digest.update(np.ascontiguousarray(constant.values, dtype=np.float64).tobytes())
     return digest.hexdigest()
 
