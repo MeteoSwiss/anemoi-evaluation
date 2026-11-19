@@ -171,9 +171,9 @@ class Aggregator:
         return self.W.shape[1]
 
     def reduce(self, values: torch.Tensor) -> torch.Tensor:
-        """(V, N) -> (V, R) float64 weighted sums over the nodes of every region, one matrix-vector product per
-        variable, so a variable's sums do not depend on which other variables the frame holds; one product over all of
-        them may group the terms differently with the variable count, which changes the last bits."""
+        """(V, N) -> (V, R) float64 region sums, one product per variable so the other variables cannot change them."""
+        if values.shape[0] == 0:
+            return torch.zeros((0, self.n_regions), dtype=torch.float64, device=self.W.device)
         return torch.stack([row @ self.W for row in values.double()])
 
     def new_state(

@@ -108,7 +108,7 @@ def test_variable_subset_aggregates_like_the_matching_slice():
         return state
 
     full = aggregate(list(range(5)))
-    # the threshold map must name only variables of the subset: binding a subset of the run is not supported yet
+    # each subset binds its own variables, so the map names only `b`, which every subset holds
     for columns in ([1, 2], [1, 3, 4], [1]):
         part = aggregate(columns)
         assert torch.equal(part.weights, full.weights[:, :, columns])

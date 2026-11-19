@@ -270,9 +270,10 @@ states that share an init time, since a shard merged twice would double its weig
 
 `Aggregator` is built once per run from the node weights `w` and the region masks, folded into one
 float64 matrix `W = w[:, None] * masks` on the device. For each frame it computes the shared
-validity mask `isfinite(pred).all(0) & isfinite(target[0])`, adds `valid.double() @ W` to the
-weights, and for every statistic adds `where(valid, statistic.compute(...), 0) @ W` to its sums
-(FR-18, FR-19), one variable at a time (`Aggregator.reduce`). It computes the ensemble mean once per
+validity mask `isfinite(pred).all(0) & isfinite(target[0])`, adds `valid[v].double() @ W` to the
+weights of each variable `v`, and for every statistic adds `values[v] @ W` to its sums, with
+`values = where(valid, statistic.compute(...), 0)` (FR-18, FR-19): one matrix-vector product per
+variable (`Aggregator.reduce`). It computes the ensemble mean once per
 frame and, with a climatology, the two anomaly fields and the finite mask once, passing them to the
 statistics through `aux`; a statistic whose declared `aux` is missing raises rather than silently
 computing something else. `aux` is rebuilt for each frame and handed to every statistic of that
@@ -441,7 +442,10 @@ one operation and which TF32 cannot touch (NFR-1). One product over all the vari
 but BLAS may group its terms differently with the number of variables, so a variable's sums would
 change in the last bits with the other variables of the frame; per variable they do not, and a run
 scored on a subset of the variables gives the same sums as the full run. The package sets no global
-precision knob (NFR-7), and the cost is milliseconds against seconds of model time (NFR-9).
+precision knob (NFR-7). The reduction runs once per statistic and variable for every frame, so its
+cost grows with the statistic count, and that grows with `M`: the rank bins add `M + 1` statistics
+and every reliability label `2 (M + 1)`. With tens of statistics it is small against the model
+time; at large ensembles with those metrics it is not, and it is the first place to look (NFR-9).
 
 **One shared validity mask per frame.** The mask is computed from the members and the target
 together and drives both the statistic sums and the weight sum, so `sums / weights` is always a
