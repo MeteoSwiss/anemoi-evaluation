@@ -5,6 +5,7 @@ from importlib.metadata import version
 
 from anemoi.evaluation import binning
 from anemoi.evaluation import metrics
+from anemoi.evaluation import operators
 from anemoi.evaluation import regions
 from anemoi.evaluation import statistics
 from anemoi.evaluation import weights
@@ -18,6 +19,7 @@ from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.output import load_state
 from anemoi.evaluation.output import merge
 from anemoi.evaluation.output import to_xarray
+from anemoi.evaluation.points import PointSet
 from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
 from anemoi.evaluation.sources.anemoi_inference import DatasetForecast
 from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
@@ -52,6 +54,7 @@ __all__ = [
     "LinearInterpolationForecastSource",
     "MultiEvaluation",
     "PersistenceForecastSource",
+    "PointSet",
     "TargetSourceBase",
     "__version__",
     "binning",
@@ -59,6 +62,7 @@ __all__ = [
     "load_state",
     "merge",
     "metrics",
+    "operators",
     "regions",
     "statistics",
     "to_xarray",

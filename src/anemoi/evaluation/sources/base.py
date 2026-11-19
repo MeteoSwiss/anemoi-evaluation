@@ -18,6 +18,7 @@ import torch
 
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
+from anemoi.evaluation.variables import variable_info
 
 
 class MissingTargetError(LookupError):
@@ -295,13 +296,6 @@ def lead_time_steps(lead_time: datetime.timedelta, timestep: datetime.timedelta)
     if lead_time <= datetime.timedelta(0) or lead_time % timestep:
         raise ValueError(f"lead time {lead_time} is not a positive multiple of the timestep {timestep}")
     return [k * timestep for k in range(1, lead_time // timestep + 1)]
-
-
-def variable_info(variable: object | None) -> dict:
-    """`param` and `level` of an anemoi typed variable (anemoi-transform `Variable`); None when unknown."""
-    if variable is None:
-        return {"param": None, "level": None}
-    return {"param": getattr(variable, "param", None), "level": getattr(variable, "level", None)}
 
 
 def accumulation_periods(typed_variables: dict) -> dict[str, datetime.timedelta | None]:
