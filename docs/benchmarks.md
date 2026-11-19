@@ -16,6 +16,7 @@ upstream commits.
 - [8. Agreement with numpy float64](#8-agreement-with-numpy-float64)
 - [9. Operational findings](#9-operational-findings)
 - [10. Chunking and shared forcings](#10-chunking-and-shared-forcings)
+- [11. Member-parallel runs](#11-member-parallel-runs)
 
 ## 1. Environment
 
@@ -357,3 +358,30 @@ first campaign (2 init times x 48 h x 4 members, 7 variables, 2 regions, commit 
 The same configuration ran in 225.3 s of model time in the campaign's smoke run on the
 cluster's previous nodes; its result file is not bit-exact against the first variant here
 (7.5e-2 relative on the ensemble metrics), the GPU-model effect above.
+
+## 11. Member-parallel runs
+
+Measured on 2026-11-19 on `A100-SXM4-80GB` nodes (nid002832; nid002812 and nid002829 for two
+nodes), branch `feat/member-parallel` at `beb3a42`, on the ensemble dummy checkpoint (1,688,744
+nodes, 6 h, anemoi-core `ace6eb629`), 2 init times x 12 h = 2 model calls, mapper chunks 8, the
+metrics `rmse`, `crps`, `fair_crps`, `spread`, `rank_histogram`, `brier` and `reliability`, 5 regions
+at M = 8 and 1 at M = 32. Each
+split run's file is bit-exact against the unsplit run of the same config, also over two nodes
+(NCCL over the aws-ofi-nccl plugin) and for a job array of two member groups merged. The exchange
+is timed per frame after a barrier, so it excludes the wait for the slowest rank; the first exchange
+of a run also sets up the NCCL connections (45 to 290 ms) and is left out.
+
+| M, V | ranks | exchange per frame | `Aggregator.add` per frame | peak, plan / measured |
+|---|---|---|---|---|
+| 8, 7 | 1 | - | 71 ms | 14.1 / 26.1 GiB |
+| 8, 7 | 2, one node | 1.5-1.8 ms | 31-42 ms | 8.1 / 20.3 GiB |
+| 8, 7 | 8, two nodes (3 regions) | 3.0-4.1 ms | 2-10 ms | 3.6 / 15.8 GiB |
+| 32, 16 | 1 | - | 420 ms | 52.5 / 62.9 GiB |
+| 32, 16 | 4, one node | 4.3-4.4 ms | 109 ms | 15.5 / 26.5 GiB |
+
+`Aggregator.add` costs about 26 ms per variable per frame at M = 32 (10 ms at M = 8), whether
+split or not, so it divides by the number of ranks. The plan's `peak` leaves out the model's
+forward activations; the measured peak (`max_memory_allocated`) is 10 to 12 GiB above it in every
+row, the activations of one forward at mapper chunks 8. A rank that SIGKILLs itself entering an
+exchange under `srun --kill-on-bad-exit=1` ends the step 1.2 s later (`task 1: Killed`, the others
+`Terminated`), and no file is written.
