@@ -32,6 +32,9 @@ contents of the result file may still change between releases.
 * **Multi-dataset checkpoints**: a checkpoint trained on multiple datasets is scored as one
   evaluation per dataset sharing one rollout, each with its own grid, variables, targets, weights,
   regions and result file.
+* **Observations as targets**, from the Python API: observations at points, from a point target
+  source of your own, scored through an observation operator (nearest node, a lapse-rate height
+  correction, or your own).
 * **Sharding** over init times (`--shard i/n`, or automatically from Slurm job steps and job
   arrays) with exact merging of the partial results.
 * **Member-parallel runs** (`--member-group`) spread the members of every init time over the GPUs
@@ -57,7 +60,7 @@ pip install -e ./anemoi-evaluation
 
 Python 3.11 to 3.13. The dependencies are `anemoi-datasets`, `anemoi-graphs`,
 `anemoi-inference`, `anemoi-transform`, `anemoi-utils`, `torch`, `xarray`, `netcdf4`, `numpy`,
-`pydantic` and `pyyaml`. Installing gives the `anemoi-evaluation` command.
+`scipy`, `pydantic` and `pyyaml`. Installing gives the `anemoi-evaluation` command.
 
 ## Quick start
 
@@ -163,6 +166,9 @@ src/anemoi/evaluation/
     config.py            YAML config model (pydantic), base: inheritance, from_checkpoint
     evaluate.py          the driver: sources in, aggregation state out
     frame.py             Grid and Frame, the data model shared by sources and the aggregator
+    points.py            PointSet, the observation points of one valid time
+    point_scoring.py     the driver's point side: operator bind, plan and W cache, weights and regions
+    variables.py         typed-variable lookup, shared by sources and operators
     statistics.py        per-element statistics in float64
     aggregation.py       weighted, masked, binned sums over nodes and init times
     metrics.py           metrics as functions of mean statistics
@@ -171,6 +177,7 @@ src/anemoi/evaluation/
     regions.py           region masks
     output.py            xarray output, netcdf round trip, merging
     distributed.py       member groups: the member exchange, the gathered state, the group abort
+    operators/           observation operators: the contract and Chain, Nearest, LapseRate, model constants
     sources/base.py      source protocols and base classes
     sources/anemoi_inference.py   forecasts from an anemoi-inference runner
     sources/anemoi_dataset.py     targets from an anemoi-datasets zarr, prefetched
