@@ -25,8 +25,12 @@ from anemoi.evaluation.sources.anemoi_inference import DatasetForecast
 from anemoi.evaluation.sources.anemoi_inference import InferenceForecastSource
 from anemoi.evaluation.sources.base import ClimatologySourceBase
 from anemoi.evaluation.sources.base import ForecastSourceBase
+from anemoi.evaluation.sources.base import MissingTargetError
+from anemoi.evaluation.sources.base import Observations
+from anemoi.evaluation.sources.base import PointTargetSourceBase
 from anemoi.evaluation.sources.base import TargetSourceBase
 from anemoi.evaluation.sources.climatology import ArrayClimatology
+from anemoi.evaluation.sources.fake import ArrayPointTargets
 from anemoi.evaluation.sources.fake import ArrayTargets
 from anemoi.evaluation.sources.fake import FakeForecastSource
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
@@ -41,6 +45,7 @@ __all__ = [
     "AggregationState",
     "Aggregator",
     "ArrayClimatology",
+    "ArrayPointTargets",
     "ArrayTargets",
     "ClimatologySourceBase",
     "DatasetForecast",
@@ -52,9 +57,12 @@ __all__ = [
     "Grid",
     "InferenceForecastSource",
     "LinearInterpolationForecastSource",
+    "MissingTargetError",
     "MultiEvaluation",
+    "Observations",
     "PersistenceForecastSource",
     "PointSet",
+    "PointTargetSourceBase",
     "TargetSourceBase",
     "__version__",
     "binning",

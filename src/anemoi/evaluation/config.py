@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from typing import Literal
@@ -280,6 +281,22 @@ def build_region(spec: str | dict, grid: Grid, forecast: Any = None, targets: An
     if spec == "all":
         return regions.all(grid)
     return TypeAdapter(RegionConfig).validate_python(spec).build(grid, forecast, targets).astype(bool)
+
+
+def region_entries(
+    regions: dict | None, check_array: Callable[[np.ndarray, str], np.ndarray]
+) -> tuple[dict[str, str | dict | None], dict[str, str | dict | np.ndarray]]:
+    """The regions of an evaluation, `{"global": "all"}` by default: per name its spec or None for an array (what the
+    dry run and `to_config` show), and its spec or its array checked by `check_array(mask, what)`."""
+    regions = dict(regions or {"global": "all"})
+    if not regions:
+        raise ValueError("at least one region is required")
+    specs = {name: spec if isinstance(spec, (str, dict)) else None for name, spec in regions.items()}
+    entries = {
+        name: spec if isinstance(spec, (str, dict)) else check_array(np.asarray(spec, dtype=bool), f"region {name!r}")
+        for name, spec in regions.items()
+    }
+    return specs, entries
 
 
 class PerDataset(_Model):
