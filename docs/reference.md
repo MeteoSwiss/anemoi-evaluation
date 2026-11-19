@@ -32,7 +32,7 @@ Runs an evaluation from a YAML config and writes the results netcdf.
 |---|---|---|---|
 | `config` | path, positional, required | n/a | YAML config, loaded by `load_config` (`base:` chain and `from_checkpoint:` blocks resolved first). |
 | `--shard i/n` | string `i/n` | Slurm auto-detection, else `0/1` | Evaluate init times `i`, `i+n`, `i+2n`, ... and write `output.path` with `{shard}` / `{shards}` filled in. See [Sharding](#sharding). |
-| `--member-group [R]` | int, optional | unset | Split the members of every init time over the `R` tasks of the step, one GPU each, and write the result from rank 0; a bare `--member-group` takes `R` from the step's task count. The tasks are then not shards: only `--shard` and the job array shard. With `--dry-run`, plan rank 0 of `R` (`R` required). See [member-parallel runs](#member-parallel-runs). |
+| `--member-group [R]` | int, optional | unset | Split the members of every init time over the `R` tasks of the step, one GPU each, and write the result from rank 0; a bare `--member-group` takes `R` from the step's task count, and `R = 1` is the unsplit run. The tasks are then not shards: only `--shard` and the job array shard. With `--dry-run`, plan rank 0 of `R` (`R` required). See [member-parallel runs](#member-parallel-runs). |
 | `--dry-run` | flag | off | Resolve the config and the sources, check the dates, print the plan as YAML on stdout, and exit without loading a model or running it. |
 | `--step-time seconds` | float | unset | Seconds of model time per model call per member; adds the `time` block to the plan. Only valid with `--dry-run`. `docs/benchmarks.md` section 3 reports measured values; one call of a multi-step-output model produces several frames. |
 
@@ -90,8 +90,8 @@ merged file carries the same metric variables as its inputs. See
 | `SLURM_STEP_NUM_TASKS` | `resolve_shard`, `task_env` | Tasks per job step; the per-step shard count, or the size of a member group. Default 1. |
 | `SLURM_PROCID` | `resolve_shard`, `task_env` | Task rank within the step. Default 0. |
 | `SLURM_LOCALID` | `task_env` | Node-local task rank, the CUDA device of a member-group rank. Default 0. |
-| `RANK`, `WORLD_SIZE`, `LOCAL_RANK` | `task_env` | torchrun's rank, task count and local rank; when `RANK` and `WORLD_SIZE` are set they take precedence over the Slurm ones for a member group. |
-| `MASTER_ADDR`, `MASTER_PORT` | `rendezvous` | Rank 0's address and a free port, where a member group meets (`tcp://`). Unset, they come from Slurm as in anemoi-inference: the first host of `SLURM_JOB_NODELIST` (`scontrol show hostnames`) and `10000 + int(SLURM_JOB_ID[-4:])`; a job-array task has its own `SLURM_JOB_ID`. Required with `--member-group` outside Slurm. |
+| `RANK`, `WORLD_SIZE`, `LOCAL_RANK` | `task_env` | torchrun's rank, task count and local rank, read for a member group only when torchrun started the process (`TORCHELASTIC_RUN_ID` set); they then take precedence over the Slurm ones. |
+| `MASTER_ADDR`, `MASTER_PORT` | `rendezvous` | Rank 0's address and a free port, where a member group meets (`tcp://`). Each one unset comes from Slurm: the first host of `SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`, and `15000 + SLURM_JOB_ID % 10000`, below the ephemeral ports; a job-array task has its own `SLURM_JOB_ID`. Required with `--member-group` outside Slurm. |
 | `SLURM_ARRAY_TASK_ID` | `resolve_shard` | Job-array task id. Default 0. |
 | `SLURM_ARRAY_TASK_MIN` | `resolve_shard` | Lowest job-array id, subtracted from the task id. Default 0. |
 | `SLURM_ARRAY_TASK_COUNT` | `resolve_shard` | Number of job-array tasks. Default 1. |
@@ -766,7 +766,7 @@ Timing, in seconds:
 
 | Attr | Content |
 |---|---|
-| `time_model_s` | Wall time in the forecast source, CUDA-synchronised. |
+| `time_model_s` | Wall time in the forecast source, CUDA-synchronised; in a member group it includes the exchange of the frames and the wait for the other ranks there. |
 | `time_target_s` | The main thread's wait for targets. |
 | `time_statistics_s` | Wall time in the aggregator. |
 | `time_total_s` | Wall time of the init-time loop. |
@@ -939,7 +939,7 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 | `on_missing_target` | The setting. |
 | `climatology` | The climatology's `describe()`; present only with one. |
 | `frames` | `{total, with_targets, distinct_valid_times}`. |
-| `bytes` | `{target_to_device, target_rows_read, cache_for_all_rows, frame, aggregator_weights, statistics_temporaries}`, plus `checkpoint_bytes`, `per_member_state_bytes` and `member_states` (the lockstep members of this process times the per-member state) from an inference source, `ensemble_temporaries` with more than one member (four `(M, N)` float64 arrays, the peak of scoring one variable: the members, centred, and the sort's values and indices), `swap_peak` in a member group (the rank's frame of every variable and the copies it sends; `frame` is what it receives) and `climatology` when one is configured. In a member group the frame and the target rows are the rank's variable block. The terms that coexist on the device: `member_states` and `frame` throughout, `swap_peak` during the exchange only, `statistics_temporaries` and `ensemble_temporaries` while a frame is scored; the peak is about `member_states + frame + max(swap_peak, statistics_temporaries + ensemble_temporaries)`, plus the target rows and the checkpoint. |
+| `bytes` | `{target_to_device, target_rows_read, cache_for_all_rows, frame, aggregator_weights, statistics_temporaries}`, plus `checkpoint_bytes`, `per_member_state_bytes` and `member_states` (the lockstep members of this process times the per-member state) from an inference source, `ensemble_temporaries` with more than one member (four `(M, N)` float64 arrays, the peak of scoring one variable: the members, centred, and the sort's values and indices), `swap_peak` in a member group (the rank's frame of every variable and the copies it sends; `frame` is what it receives) and `climatology` when one is configured. In a member group the frame and the target rows are the rank's variable block. `peak` adds up what is on the device at once: `checkpoint_bytes`, `member_states` (and the predicted-only states), `frame`, one target row, `aggregator_weights` and `climatology` throughout, plus the larger of `swap_peak`, held during the exchange only, and `statistics_temporaries + ensemble_temporaries`, held while a frame is scored. The model's forward activations are not counted. |
 | `time` | Present only with `step_time`: `{step_time, model_per_init_s, shard: {model_s, wall_s}, run: {gpu_hours, wall_per_shard_s}, startup_s, note}`. In a member group `model_per_init_s` is a rank's, `calls x the rank's members x step_time`, and `gpu_hours` counts every rank. |
 | `member_group` | Present only in a member group: `{ranks, rank, members, variables}`, the rank's members count and variable names. |
 | `note` | Present only when the last model call computes past `lead_time`. |
@@ -1217,8 +1217,8 @@ fail at once. Over NCCL a rank already inside a collective waits for NCCL's time
 its abort for `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, so run the step with `srun --kill-on-bad-exit=1`.
 
 Refused, with a `SystemExit` from the CLI: a step whose task count is not `R`, one member, fewer members
-than ranks, a forecast source other than `anemoi_inference`, an indexed `device: cuda:N`, more tasks on a
-node than visible GPUs, no `MASTER_ADDR` or `MASTER_PORT` outside Slurm,
+than ranks, a forecast source other than `anemoi_inference`, a `device: cuda:N` other than the rank's GPU, more tasks on a
+node than visible GPUs (when a task sees several), no `MASTER_ADDR` or `MASTER_PORT` outside Slurm,
 and ranks on different GPU models.
 
 ## Seeding and reproducibility

@@ -884,12 +884,12 @@ srun --kill-on-bad-exit=1 anemoi-evaluation run config.yaml --member-group
 
 A bare `--member-group` makes all the tasks of the step one group; `--member-group R` must equal
 their number (`srun`'s, or `torchrun`'s `WORLD_SIZE`). The ranks meet at rank 0's node: under
-Slurm the first host of the job and port `10000` plus the last four digits of the job id, as
-anemoi-inference does, so the tasks of a job array, each a job of its own, meet on different ports
-even on one node. `MASTER_ADDR` and `MASTER_PORT` override both. With CUDA a task that sees one GPU
+Slurm the first host of the step and port `15000` plus the job id modulo 10000, so the tasks of a
+job array, each a job of its own, meet on different ports even on one node. `MASTER_ADDR` and
+`MASTER_PORT` override them; outside Slurm they are required. With CUDA a task that sees one GPU
 (`--gpus-per-task=1`) takes it, and tasks that share a node's GPUs take the GPU `SLURM_LOCALID`;
 more tasks on a node than GPUs are refused. Leave `device: cuda` in the inference block without an
-index (an index is refused); the ranks talk over NCCL, otherwise over gloo.
+index (an index other than the rank's GPU is refused); the ranks talk over NCCL, otherwise over gloo.
 `--kill-on-bad-exit=1` matters: a failing rank aborts the group, but a rank already waiting for it
 inside NCCL only notices when Slurm kills the step.
 
@@ -909,7 +909,8 @@ offset forecasters, temporal downscalers, multi-dataset checkpoints and `include
 work. `--dry-run --member-group R` plans rank 0, with the rank's members in the time estimate
 (`gpu_hours` counts every rank) and in the `bytes` block the lockstep members, the exchange
 buffers (about twice the rank's frame, beside the frame it receives) and the ensemble scoring
-temporaries. `--dry-run` needs the group size, `--member-group R`.
+temporaries, and their sum as `peak` (without the model's activations). `--dry-run` needs the group
+size, `--member-group R`; `--member-group 1` is the unsplit run.
 
 ## Reading the results
 

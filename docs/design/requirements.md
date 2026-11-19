@@ -362,7 +362,7 @@ holds one target prefetch buffer and one forcings cache per dataset. In a member
 ranks (FR-41) a rank holds its `ceil(M / R)` lockstep members, the exchange peak (its `(M_r, V, N)`
 frame, the copies it sends and the `(M, V_r, N)` frame it receives, about three times the frame),
 and the scoring temporaries of one variable at a time, four `(M, N)` float64 arrays, which grow
-with the whole ensemble and not with the rank's share (4.5 GiB each at M = 1040, N = 542k). The
+with the whole ensemble and not with the rank's share (4.2 GiB each at M = 1040, N = 542k). The
 dry-run plan sizes all three.
 *Evidence: 1.45 to 1.55 GiB per member for a 6-hourly 2-in/1-out model at 1.69M nodes, about
 6 GiB for an hourly 7-in/6-out one, linear to M = 24 (benchmarks 3 and 10).*

@@ -14,6 +14,7 @@ import datetime
 import json
 import logging
 import os
+import re
 from collections.abc import Iterator
 from collections.abc import Mapping
 
@@ -59,28 +60,30 @@ class MemberGroup:
 
 
 def task_env(env: Mapping[str, str] | None = None) -> tuple[int, int, int]:
-    """Rank, task count and node-local rank of this process: torchrun's `RANK`, `WORLD_SIZE` and `LOCAL_RANK`, else
-    srun's `SLURM_PROCID`, `SLURM_STEP_NUM_TASKS` and `SLURM_LOCALID`, else one task."""
+    """Rank, task count and node-local rank of this process: torchrun's `RANK`, `WORLD_SIZE` and `LOCAL_RANK` when
+    torchrun started it (`TORCHELASTIC_RUN_ID`), else srun's `SLURM_PROCID`, `SLURM_STEP_NUM_TASKS` and
+    `SLURM_LOCALID` in a job step, else one task. A stray `RANK` or `WORLD_SIZE` is ignored."""
     env = os.environ if env is None else env
-    for names in (("RANK", "WORLD_SIZE", "LOCAL_RANK"), ("SLURM_PROCID", "SLURM_STEP_NUM_TASKS", "SLURM_LOCALID")):
-        if names[0] in env and names[1] in env:
-            return int(env[names[0]]), int(env[names[1]]), int(env.get(names[2], 0))
+    if "TORCHELASTIC_RUN_ID" in env:
+        return int(env["RANK"]), int(env["WORLD_SIZE"]), int(env.get("LOCAL_RANK", 0))
+    if "SLURM_STEP_NUM_TASKS" in env:
+        return int(env.get("SLURM_PROCID", 0)), int(env["SLURM_STEP_NUM_TASKS"]), int(env.get("SLURM_LOCALID", 0))
     return 0, 1, 0
 
 
 def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
-    """Address and port of rank 0 where a member group meets: `MASTER_ADDR` and `MASTER_PORT` when set, else, as
-    anemoi-inference derives them under Slurm, the first host of `SLURM_JOB_NODELIST` and `10000` plus the last four
-    digits of `SLURM_JOB_ID`. A job-array task has a job id of its own, so groups of one array that share a node meet
-    on different ports."""
+    """Address and port of rank 0 where a member group meets: `MASTER_ADDR` and `MASTER_PORT` when set, each on its
+    own, else under Slurm the first host of the step (`SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`) and port
+    `15000 + SLURM_JOB_ID % 10000`, below the ephemeral ports. A job-array task has a job id of its own, so the groups
+    of one array that share a node meet on different ports. Outside Slurm both must be set."""
     env = os.environ if env is None else env
     address, port = env.get("MASTER_ADDR"), env.get("MASTER_PORT")
-    nodes = env.get("SLURM_JOB_NODELIST") or env.get("SLURM_NODELIST")
-    job = env.get("SLURM_JOB_ID") or env.get("SLURM_JOBID")
-    if not address and nodes:
-        address = _first_host(nodes)
+    nodes = env.get("SLURM_STEP_NODELIST") or env.get("SLURM_JOB_NODELIST")
+    job = env.get("SLURM_JOB_ID")
+    if not address and nodes and job:
+        address = first_host(nodes)
     if not port and job:
-        port = str(10000 + int(job[-4:]))
+        port = str(15000 + int(job) % 10000)
     if not address or not port:
         raise ValueError(
             "a member group needs MASTER_ADDR and MASTER_PORT in the environment, the address and a free port of "
@@ -89,12 +92,16 @@ def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
     return address, int(port)
 
 
-def _first_host(nodes: str) -> str:
-    import subprocess
-
-    return subprocess.run(
-        ["scontrol", "show", "hostnames", nodes], capture_output=True, text=True, check=True
-    ).stdout.split()[0]
+def first_host(nodes: str) -> str:
+    """The first host of a Slurm host list such as `nid[002812-002813,002900]` or `a1,b[3-4]`, as
+    `scontrol show hostnames` would print it first."""
+    depth = 0
+    for position, char in enumerate(nodes):
+        depth += {"[": 1, "]": -1}.get(char, 0)
+        if char == "," and depth == 0:
+            nodes = nodes[:position]
+            break
+    return re.sub(r"\[([^\]]*)\]", lambda match: match.group(1).split(",")[0].split("-")[0], nodes)
 
 
 def init_group(

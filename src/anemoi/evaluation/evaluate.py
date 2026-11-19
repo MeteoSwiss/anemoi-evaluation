@@ -370,8 +370,7 @@ class Evaluation:
                     else {}
                 ),
                 # the rank's frame of every variable and the copies it sends, beside `frame` (what it receives)
-                # during the exchange and freed before scoring: the peak is about member_states + frame +
-                # max(swap_peak, statistics_temporaries + ensemble_temporaries)
+                # during the exchange, and freed before the frame is scored
                 **(
                     {"swap_peak": local * v * n * 4 + local * (v - scored) * n * 4}
                     if self.member_group is not None
@@ -392,6 +391,8 @@ class Evaluation:
             },
             **({"time": self.time_estimate(step_time, len(init_times), shards)} if step_time is not None else {}),
         }
+        sizes = plan["bytes"]
+        sizes["peak"] = self._peak_bytes(sizes, row, local)
         if self.member_group is not None:
             plan["member_group"] = {
                 "ranks": self.member_group.size,
@@ -405,6 +406,16 @@ class Evaluation:
                 f"the outputs beyond {frequency_to_string(self.lead_time)} are computed and discarded"
             )
         return plan
+
+    @staticmethod
+    def _peak_bytes(sizes: dict, row: int, local: int) -> int:
+        """What is on the device at once: the checkpoint, the lockstep members' states, the frame, one target row,
+        the weights and the climatology throughout, and either the exchange buffers or the scoring temporaries. The
+        model's forward activations are not counted."""
+        held = sum(sizes.get(key, 0) for key in ("checkpoint_bytes", "member_states", "aggregator_weights"))
+        held += local * sizes.get("predicted_only_state_bytes", 0) + sizes["frame"] + row + sizes.get("climatology", 0)
+        scoring = sizes["statistics_temporaries"] + sizes.get("ensemble_temporaries", 0)
+        return held + max(sizes.get("swap_peak", 0), scoring)
 
     def _climatology_bytes(self) -> int:
         if self.climatology is None:

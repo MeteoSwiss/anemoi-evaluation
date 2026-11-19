@@ -647,10 +647,14 @@ class InferenceForecastSource(ForecastSourceBase):
                 f"{self.members} members cannot be split over {group.size} ranks: every rank needs a member"
             )
         device = self.run_config.get("device")
-        if device is not None and torch.device(str(device)).index is not None:
-            raise ValueError(
-                f"device {device!r} puts every rank on one GPU: set device: cuda, each rank then takes its own"
-            )
+        configured = None if device is None else torch.device(str(device))
+        if configured is not None and configured.type == "cuda" and configured.index is not None:
+            current = torch.cuda.current_device() if torch.cuda.is_available() else None
+            if configured.index != current:
+                raise ValueError(
+                    f"device {device!r} is not this rank's GPU (cuda:{current}): set device: cuda, each rank then "
+                    "takes its own"
+                )
         self.member_group = group
 
     def _member_indices(self) -> range:

@@ -91,7 +91,8 @@ def _headline(plan: dict, count: int) -> str:
 
 
 def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
-    """This task's rank of the ``--member-group`` (rank 0 for a dry run), its CUDA device set; None without it."""
+    """This task's rank of the ``--member-group`` (rank 0 for a dry run), its CUDA device set; None without it or for a
+    group of one, which is the unsplit run."""
     if args.member_group is None:
         return None
     from anemoi.evaluation.distributed import MemberGroup
@@ -103,13 +104,15 @@ def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
     elif args.member_group < 1:
         raise SystemExit(f"--member-group must be at least 1, got {args.member_group}")
     if args.dry_run:
-        return MemberGroup(0, args.member_group)
+        return MemberGroup(0, args.member_group) if args.member_group > 1 else None
     rank, tasks, local = task_env()
     if args.member_group not in (STEP_TASKS, tasks):
         raise SystemExit(
             f"--member-group {args.member_group} needs as many tasks in the step, this one has {tasks}: "
             "start one task per rank with srun (or torchrun)"
         )
+    if tasks == 1:  # a group of one is the unsplit run
+        return None
     import torch
 
     if torch.cuda.is_available():
@@ -130,6 +133,7 @@ def _run(args: argparse.Namespace) -> None:
         raise SystemExit("--step-time is only used by --dry-run")
     import torch
     import yaml
+    from anemoi.utils.humanize import bytes_to_human
     from anemoi.utils.humanize import compress_dates
 
     from anemoi.evaluation.config import load_config
@@ -168,7 +172,10 @@ def _run(args: argparse.Namespace) -> None:
         # the datasets of a multi-dataset run share the model call, so any one of them carries the run's cost
         summary = next(iter(plan["datasets"].values())) if "datasets" in plan else plan
         LOG.info(
-            "dry run: %s; model loaded: %s", _headline(summary, count), summary["forecast"].get("model_loaded", "n/a")
+            "dry run: %s; model loaded: %s; device memory about %s at the peak, without the model's activations",
+            _headline(summary, count),
+            summary["forecast"].get("model_loaded", "n/a"),
+            bytes_to_human(summary["bytes"]["peak"]),
         )
         evaluation.close()
         return
@@ -217,7 +224,7 @@ def _run_member_group(evaluation: object, group: "MemberGroup", init_times: list
         states = {name: gather_state(state) for name, state in local.items()}
     dist.destroy_process_group()
     if group.rank != 0:
-        LOG.info("the results were gathered on rank 0")
+        LOG.info("sent the results to rank 0")
         return None
     for state in states.values():
         state.attrs["member_ranks"] = group.size
