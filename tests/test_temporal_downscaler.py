@@ -95,9 +95,6 @@ def downscaler_source(
 ):
     """An `InferenceForecastSource` over a fixture downscaler checkpoint, driven by the real downscaler runner (or
     by `runner_class`, built like the fixture's forecaster runner); `patch` edits the metadata further."""
-    import anemoi.inference.runners as runners
-    from anemoi.inference.inputs.empty import EmptyInput
-    from anemoi.inference.runners.temporal_downscaler import TemporalDownscalerMultiOutRunner
 
     def patches(metadata):
         downscaler_patch(targets)(metadata)
@@ -105,6 +102,18 @@ def downscaler_source(
             patch(metadata)
 
     checkpoint = fixture.save_checkpoint(tmp_path / "td.ckpt", names, patch=patches)
+    patch_downscaler_runner(monkeypatch, checkpoint, names, noise, write_initial_state, runner_class)
+    return InferenceForecastSource(checkpoint=str(checkpoint), device="cpu", **options)
+
+
+def patch_downscaler_runner(
+    monkeypatch, checkpoint, names=("era5",), noise=0.0, write_initial_state=True, runner_class=None
+):
+    """Make `InferenceForecastSource` build the downscaler runner of `downscaler_source` over `checkpoint`."""
+    import anemoi.inference.runners as runners
+    from anemoi.inference.inputs.empty import EmptyInput
+    from anemoi.inference.runners.temporal_downscaler import TemporalDownscalerMultiOutRunner
+
     input_class = fixture._fixture_input_class()
 
     def create_runner(config):
@@ -125,7 +134,6 @@ def downscaler_source(
         return runner
 
     monkeypatch.setattr(runners, "create_runner", create_runner)
-    return InferenceForecastSource(checkpoint=str(checkpoint), device="cpu", **options)
 
 
 def test_a_downscaler_is_scored_one_window_per_init_time(monkeypatch, tmp_path):

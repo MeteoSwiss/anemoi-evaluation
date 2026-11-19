@@ -14,6 +14,7 @@ from functools import cached_property
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -51,6 +52,9 @@ from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.climatology import ArrayClimatology
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
 from anemoi.evaluation.sources.persistence import PersistenceForecastSource
+
+if TYPE_CHECKING:
+    from anemoi.evaluation.distributed import MemberGroup
 
 LOG = logging.getLogger(__name__)
 PHASES = ("model", "target", "statistics", "total")
@@ -183,7 +187,30 @@ class Evaluation:
         self.model_calls = 0
         self.climatology_nonfinite: dict[str, int] = {}
         self.peak_memory_bytes: int | None = None
+        self.member_group: MemberGroup | None = None
+        self._block = slice(None)
         self._config: EvaluationConfig | None = None
+
+    @property
+    def scored_variables(self) -> list[str]:
+        """The variables this process scores: all of them, or this rank's block in a member group."""
+        return self.variables[self._block]
+
+    def split_members(self, group: MemberGroup) -> None:
+        """Make this process rank `group.rank` of a member group: the forecast source runs the rank's block of the
+        members and yields every member of the rank's block of the variables, which is all the evaluation reads
+        targets and climatology for and aggregates. `run` then returns the rank's state; `gather_state` of
+        `anemoi.evaluation.distributed` concatenates the ranks' states on rank 0 into the unsplit run's."""
+        split = getattr(self.forecast, "split_members", None)
+        if split is None:
+            raise ValueError(
+                f"{type(self.forecast).__name__} cannot split its members over ranks, only an anemoi_inference "
+                "forecast can"
+            )
+        split(group)
+        self.member_group = group
+        self._block = group.block(len(self.variables))
+        self.__dict__.pop("aggregator", None)
 
     @cached_property
     def weights(self) -> np.ndarray:
@@ -217,6 +244,8 @@ class Evaluation:
         """The aggregator over the resolved weights and regions."""
         _, masks = regions_module.stack(self.regions, self.forecast.grid.n)
         statistics = metrics_module.unique_statistics(self.metrics)
+        if self.member_group is not None:
+            statistics = {name: statistic.restrict(self._block) for name, statistic in statistics.items()}
         return Aggregator(self.weights, masks, statistics, self.binning, self.device)
 
     def _resolve_variables(self, variables: list[str] | None) -> list[str]:
@@ -247,28 +276,39 @@ class Evaluation:
         """Model calls one init time needs and the lead time they compute, from the forecast source."""
         return self.forecast.model_calls(self.lead_time)
 
+    def _local_members(self) -> int:
+        """The members this process runs: all of them, or this rank's block in a member group."""
+        if self.member_group is None:
+            return self.forecast.members
+        block = self.member_group.block(self.forecast.members)
+        return block.stop - block.start
+
     def time_estimate(self, step_time: float, n_init: int, shards: int = 1) -> dict:
         """Model and wall seconds of a shard of `n_init` init times and of the whole run over `shards` shards, from
-        `step_time` seconds of model time per model call per member; wall adds `STARTUP_SECONDS` per shard."""
+        `step_time` seconds of model time per model call per member; wall adds `STARTUP_SECONDS` per shard. In a
+        member group the times are a rank's, which runs its block of the members, and `gpu_hours` counts every
+        rank."""
         if not (step_time > 0 and math.isfinite(step_time)):
             raise ValueError(f"step_time must be a positive number of seconds, got {step_time!r}")
         if shards < 1:
             raise ValueError(f"shards must be at least 1, got {shards}")
         calls, _ = self.model_calls_per_init()
-        per_init = calls * self.forecast.members * step_time
+        ranks = 1 if self.member_group is None else self.member_group.size
+        per_init = calls * self._local_members() * step_time
         largest = math.ceil(len(self.init_times) / shards)
         return {
             "step_time": step_time,
             "model_per_init_s": per_init,
             "shard": {"model_s": n_init * per_init, "wall_s": n_init * per_init + STARTUP_SECONDS},
             "run": {
-                "gpu_hours": round(len(self.init_times) * per_init / 3600, 2),
+                "gpu_hours": round(len(self.init_times) * per_init * ranks / 3600, 2),
                 "wall_per_shard_s": largest * per_init + STARTUP_SECONDS,
             },
             "startup_s": STARTUP_SECONDS,
-            "note": "model calls x members x step time, plus one process startup per shard; gpu_hours is model "
-            "time and the reserved budget is about shards x wall_per_shard_s. Target reads (assumed hidden by "
-            "prefetch), statistics, the lead-0 frame and writing the result are not counted.",
+            "note": "model calls x members (a rank's block in a member group) x step time, plus one process startup "
+            "per shard; gpu_hours is model time on every GPU and the reserved budget is about shards x "
+            "wall_per_shard_s per GPU. Target reads (assumed hidden by prefetch), statistics, the member exchange, "
+            "the lead-0 frame and writing the result are not counted.",
         }
 
     def shard(self, index: int, count: int) -> list[datetime.datetime]:
@@ -285,7 +325,8 @@ class Evaluation:
         init_times = list(self.init_times if init_times is None else init_times)
         valid_times = [init + lead for init in init_times for lead in self.lead_times]
         v, n, r = len(self.variables), self.forecast.grid.n, len(self._regions)
-        row = v * n * 4
+        scored, members, local = len(self.scored_variables), self.forecast.members, self._local_members()
+        row = scored * n * 4
         forecast, targets = self.forecast.describe(), self.targets.describe()
         calls, computed = self.model_calls_per_init()
         plan = {
@@ -318,9 +359,22 @@ class Evaluation:
                 "target_to_device": len(valid_times) * row,
                 "target_rows_read": len(valid_times) * targets.get("row_bytes", row),
                 "cache_for_all_rows": len(set(valid_times)) * row,
-                "frame": self.forecast.members * row,
+                "frame": members * row,
                 "aggregator_weights": n * r * 8,
-                "statistics_temporaries": 3 * v * n * 8,
+                "statistics_temporaries": 3 * scored * n * 8,
+                # one variable at a time: the float64 members, centred, and the sort's values and indices (pairs)
+                **({"ensemble_temporaries": 4 * members * n * 8} if members > 1 else {}),
+                **(
+                    {"member_states": local * forecast["per_member_state_bytes"]}
+                    if "per_member_state_bytes" in forecast
+                    else {}
+                ),
+                # the rank's frame of all the variables, the copies it sends and the frame it receives
+                **(
+                    {"swap_peak": local * v * n * 4 + local * (v - scored) * n * 4 + members * row}
+                    if self.member_group is not None
+                    else {}
+                ),
                 # `predicted_only_state_bytes` is the state of the datasets the run does not score: the runner
                 # holds one for every dataset of the checkpoint, scored or not
                 **{
@@ -336,6 +390,13 @@ class Evaluation:
             },
             **({"time": self.time_estimate(step_time, len(init_times), shards)} if step_time is not None else {}),
         }
+        if self.member_group is not None:
+            plan["member_group"] = {
+                "ranks": self.member_group.size,
+                "rank": self.member_group.rank,
+                "members": local,
+                "variables": list(self.scored_variables),
+            }
         if computed > self.lead_time:
             plan["note"] = (
                 f"the last of the {calls} model calls per init time computes up to {plan['computed_lead_time']}; "
@@ -351,7 +412,7 @@ class Evaluation:
     def _aux(self, frame: Frame) -> dict[str, torch.Tensor] | None:
         if self.climatology is None:
             return None
-        return {"climatology": self.climatology.frame(frame.valid_time, self.variables, self.device)}
+        return {"climatology": self.climatology.frame(frame.valid_time, self.scored_variables, self.device)}
 
     def run(self, init_times: list[datetime.datetime] | None = None) -> AggregationState:
         """Evaluate `init_times` (default: all) and return the state, with result attrs and timing totals."""
@@ -384,14 +445,15 @@ class Evaluation:
                 )
         self.timing = {}
         self.model_calls = 0
+        coords = {name: values[self._block] for name, values in self.variable_coords().items()}
         return self.aggregator.new_state(
-            self.lead_times, self.variables, list(self.regions), self.forecast.members, self.variable_coords()
+            self.lead_times, self.scored_variables, list(self.regions), self.forecast.members, coords
         )
 
     def frames(self, init_time: datetime.datetime) -> Iterator[Frame]:
         """The forecast frames of one init time, the lead-0 one first when it is scored; announces the valid times
         to the target source first."""
-        self.targets.prefetch([init_time + lead for lead in self.lead_times], self.variables)
+        self.targets.prefetch([init_time + lead for lead in self.lead_times], self.scored_variables)
         frames = self.forecast.frames(init_time, self.lead_time, self.variables, self.device)
         if self.include_lead_zero:
             frames = itertools.chain(self._initial_frames(init_time), frames)
@@ -467,7 +529,7 @@ class Evaluation:
 
     def _initial_frames(self, init_time: datetime.datetime) -> Iterator[Frame]:
         try:
-            yield self.forecast.initial_frame(init_time, self.variables, self.device)
+            yield self.forecast.initial_frame(init_time, self.scored_variables, self.device)
         except MissingTargetError as error:
             LOG.warning("%s: no lead-0 frame for init %s", error, init_time)
 
@@ -475,7 +537,7 @@ class Evaluation:
         """The target of `frame`, None when it is missing and missing targets are skipped."""
         timer.mark("model") if charge_model else timer.skip()
         try:
-            target = self.targets.frame(frame.valid_time, self.variables, self.device)
+            target = self.targets.frame(frame.valid_time, self.scored_variables, self.device)
         except MissingTargetError as error:
             if self.on_missing_target == "raise":
                 raise
@@ -618,6 +680,14 @@ class MultiEvaluation:
         """Init times of shard `index` of `count`, the same for every dataset."""
         return next(iter(self.evaluations.values())).shard(index, count)
 
+    def split_members(self, group: MemberGroup) -> None:
+        """Make this process rank `group.rank` of a member group, for every dataset (see `Evaluation.split_members`):
+        the rollout is split once, and every dataset scores its own block of its variables."""
+        if self.forecast is None:
+            raise ValueError("only an anemoi_inference forecast can split its members over ranks")
+        for evaluation in self.evaluations.values():
+            evaluation.split_members(group)
+
     def plan(
         self, init_times: list[datetime.datetime] | None = None, step_time: float | None = None, shards: int = 1
     ) -> dict:
@@ -683,7 +753,7 @@ class MultiEvaluation:
                 for name in names:
                     evaluation = self.evaluations[name]
                     evaluation.targets.prefetch(
-                        [init_time + lead for lead in evaluation.lead_times], evaluation.variables
+                        [init_time + lead for lead in evaluation.lead_times], evaluation.scored_variables
                     )
                     if evaluation.include_lead_zero:
                         for frame in evaluation._initial_frames(init_time):

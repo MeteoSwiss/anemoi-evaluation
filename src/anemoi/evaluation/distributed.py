@@ -1,4 +1,4 @@
-"""Member-parallel building blocks: the members of one init time spread over the ranks of a process group.
+"""Member-parallel evaluation: the members of one init time spread over the ranks of a process group.
 
 Rank `r` of `R` runs the member block `blocks(M, R)[r]` and scores the variable block `blocks(V, R)[r]` of every
 member, after `swap` has exchanged the frames. Each rank aggregates its variables with statistics bound to the full
@@ -9,9 +9,13 @@ unsplit run would have produced. Nothing here is imported by a run that does not
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import datetime
 import json
 import logging
+import os
 from collections.abc import Iterator
+from collections.abc import Mapping
 
 import torch
 import torch.distributed as dist
@@ -25,6 +29,7 @@ SUMMED_ATTRS = ("target_reads", "target_cache_hits")
 SUMMED_PREFIXES = ("forcings_",)
 IDENTITY_ATTRS = ("gpu", "checkpoint_uuid", "config", "package_versions")
 IDENTITY_PREFIXES = ("inference_chunks_",)
+GROUP_TIMEOUT = datetime.timedelta(minutes=30)
 
 
 def blocks(count: int, parts: int) -> list[slice]:
@@ -35,6 +40,55 @@ def blocks(count: int, parts: int) -> list[slice]:
     size, extra = divmod(count, parts)
     bounds = [part * size + min(part, extra) for part in range(parts + 1)]
     return [slice(start, stop) for start, stop in zip(bounds[:-1], bounds[1:])]
+
+
+@dataclasses.dataclass(frozen=True)
+class MemberGroup:
+    """Rank `rank` of a member group of `size` ranks, the world group of the run."""
+
+    rank: int
+    size: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.rank < self.size:
+            raise ValueError(f"rank {self.rank} is out of range for a member group of {self.size}")
+
+    def block(self, count: int) -> slice:
+        """This rank's block of `count` members or variables."""
+        return blocks(count, self.size)[self.rank]
+
+
+def task_env(env: Mapping[str, str] | None = None) -> tuple[int, int, int]:
+    """Rank, task count and node-local rank of this process: torchrun's `RANK`, `WORLD_SIZE` and `LOCAL_RANK`, else
+    srun's `SLURM_PROCID`, `SLURM_STEP_NUM_TASKS` and `SLURM_LOCALID`, else one task."""
+    env = os.environ if env is None else env
+    for names in (("RANK", "WORLD_SIZE", "LOCAL_RANK"), ("SLURM_PROCID", "SLURM_STEP_NUM_TASKS", "SLURM_LOCALID")):
+        if names[0] in env and names[1] in env:
+            return int(env[names[0]]), int(env[names[1]]), int(env.get(names[2], 0))
+    return 0, 1, 0
+
+
+def init_group(group: MemberGroup, device: torch.device, timeout: datetime.timedelta = GROUP_TIMEOUT) -> None:
+    """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise, rendezvous at `MASTER_ADDR` and
+    `MASTER_PORT`, then a barrier, so that every rank is up before the model loads and every later batch of sends and
+    receives may leave ranks out (NCCL needs all of them in the first one). With NCCL the CUDA device must be set
+    first."""
+    missing = [name for name in ("MASTER_ADDR", "MASTER_PORT") if not os.environ.get(name)]
+    if missing:
+        raise ValueError(
+            f"a member group needs {' and '.join(missing)} in the environment, the address and a free port of rank 0, "
+            "for example MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1) MASTER_PORT=29500"
+        )
+    nccl = device.type == "cuda"
+    dist.init_process_group(
+        "nccl" if nccl else "gloo",
+        init_method="env://",
+        rank=group.rank,
+        world_size=group.size,
+        timeout=timeout,
+        **({"device_id": torch.device("cuda", torch.cuda.current_device())} if nccl else {}),
+    )
+    dist.barrier()
 
 
 def _rank_and_size(group: dist.ProcessGroup | None) -> tuple[int, int]:

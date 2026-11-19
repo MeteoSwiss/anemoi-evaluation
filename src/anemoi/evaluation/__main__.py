@@ -1,20 +1,28 @@
-"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--dry-run [--step-time s]]``
-and ``anemoi-evaluation merge <nc>... -o <nc> [--partial]``."""
+"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group R] [--dry-run
+[--step-time s]]`` and ``anemoi-evaluation merge <nc>... -o <nc> [--partial]``."""
 
 import argparse
 import json
 import logging
 import os
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from anemoi.evaluation.distributed import MemberGroup
 
 LOG = logging.getLogger(__name__)
 
 
-def resolve_shard(shard: str | None, env: Mapping[str, str] | None = None) -> tuple[int, int]:
+def resolve_shard(
+    shard: str | None, env: Mapping[str, str] | None = None, member_group: bool = False
+) -> tuple[int, int]:
     """Shard index and count: ``--shard i/n``, else the Slurm job-array task times the job-step task, else 0 of 1.
 
     The task count comes from ``SLURM_STEP_NUM_TASKS`` (set by ``srun`` for every task of a step) rather than
     ``SLURM_NTASKS``, which a batch script also sees with ``SLURM_PROCID`` 0 and would silently evaluate one shard.
+    With `member_group` the tasks of the step are the ranks of one member group, not shards: only the job array
+    shards.
     """
     if shard is not None:
         try:
@@ -27,10 +35,10 @@ def resolve_shard(shard: str | None, env: Mapping[str, str] | None = None) -> tu
         def value(name: str, default: int) -> int:
             return int(env.get(name, default))
 
-        tasks = value("SLURM_STEP_NUM_TASKS", 1)
+        tasks = 1 if member_group else value("SLURM_STEP_NUM_TASKS", 1)
         array = value("SLURM_ARRAY_TASK_ID", 0) - value("SLURM_ARRAY_TASK_MIN", 0)
         count = value("SLURM_ARRAY_TASK_COUNT", 1) * tasks
-        index = array * tasks + value("SLURM_PROCID", 0)
+        index = array * tasks + (0 if member_group else value("SLURM_PROCID", 0))
     if not 0 <= index < count:
         raise ValueError(f"shard index {index} is out of range for {count} shards")
     return index, count
@@ -81,6 +89,30 @@ def _headline(plan: dict, count: int) -> str:
     )
 
 
+def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
+    """This task's rank of the ``--member-group`` (rank 0 for a dry run), its CUDA device set; None without it."""
+    if args.member_group is None:
+        return None
+    from anemoi.evaluation.distributed import MemberGroup
+    from anemoi.evaluation.distributed import task_env
+
+    if args.member_group < 1:
+        raise SystemExit(f"--member-group must be at least 1, got {args.member_group}")
+    if args.dry_run:
+        return MemberGroup(0, args.member_group)
+    rank, tasks, local = task_env()
+    if tasks != args.member_group:
+        raise SystemExit(
+            f"--member-group {args.member_group} needs as many tasks in the step, this one has {tasks}: "
+            "start one task per rank with srun (or torchrun)"
+        )
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local % torch.cuda.device_count())
+    return MemberGroup(rank, tasks)
+
+
 def _run(args: argparse.Namespace) -> None:
     if args.step_time is not None and not args.dry_run:
         raise SystemExit("--step-time is only used by --dry-run")
@@ -93,11 +125,19 @@ def _run(args: argparse.Namespace) -> None:
     from anemoi.evaluation.output import write
 
     config = load_config(args.config)
-    index, count = resolve_shard(args.shard)
+    group = _member_group(args)
+    index, count = resolve_shard(args.shard, member_group=group is not None)
     if config.output is None and not args.dry_run:
         raise SystemExit("the config needs output.path to run from the command line")
-    logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    label = f"rank {group.rank}/{group.size} " if group is not None and not args.dry_run else ""
+    logging.basicConfig(level=config.log_level, format=f"%(asctime)s {label}%(levelname)s %(name)s: %(message)s")
     evaluation = Evaluation.from_config(config)
+    if group is not None:
+        try:
+            evaluation.split_members(group)
+        except ValueError as error:
+            evaluation.close()
+            raise SystemExit(f"--member-group: {error}") from None
     datasets = getattr(evaluation, "dataset_names", None)  # None for a single-dataset run
     paths = (
         {name: format_output_path(config.output.path, index, count, name) for name in datasets or [None]}
@@ -125,16 +165,51 @@ def _run(args: argparse.Namespace) -> None:
         LOG.info("device %s: %s, %d visible", device, torch.cuda.get_device_name(device), torch.cuda.device_count())
     else:
         LOG.info("device %s", device)
-    try:
-        result = evaluation.run(init_times)
-    finally:
-        evaluation.close()
-    states = result if datasets else {None: result}
+    if group is None:
+        try:
+            result = evaluation.run(init_times)
+        finally:
+            evaluation.close()
+        states = result if datasets else {None: result}
+    else:
+        states = _run_member_group(evaluation, group, init_times, datasets)
+        if states is None:
+            return
     metrics = evaluation.metrics if datasets else {None: evaluation.metrics}
     for name, state in states.items():
         state.attrs["shard"] = f"{index}/{count}"
         write(state.to_xarray(metrics[name]), paths[name])
         LOG.info("wrote %s", paths[name])
+
+
+def _run_member_group(evaluation: object, group: "MemberGroup", init_times: list, datasets: list | None) -> dict | None:
+    """Run this rank's share and gather every dataset's state on rank 0, which gets them (with the `member_ranks`
+    attr), the other ranks None; any error aborts the group, so that no rank waits for a failed one."""
+    import torch.distributed as dist
+
+    from anemoi.evaluation.distributed import abort_on_error
+    from anemoi.evaluation.distributed import gather_state
+    from anemoi.evaluation.distributed import init_group
+
+    try:
+        init_group(group, evaluation.device)
+    except ValueError as error:
+        evaluation.close()
+        raise SystemExit(f"--member-group: {error}") from None
+    with abort_on_error():
+        try:
+            result = evaluation.run(init_times)
+        finally:
+            evaluation.close()
+        local = result if datasets else {None: result}
+        states = {name: gather_state(state) for name, state in local.items()}
+    dist.destroy_process_group()
+    if group.rank != 0:
+        LOG.info("the results were gathered on rank 0")
+        return None
+    for state in states.values():
+        state.attrs["member_ranks"] = group.size
+    return states
 
 
 def _merge(args: argparse.Namespace) -> None:
@@ -159,6 +234,14 @@ def main(argv: list[str] | None = None) -> None:
         metavar="i/n",
         help="Evaluate every n-th init time starting at i and write output.path with {shard} filled in; "
         "without it, Slurm job-array and job-step variables shard automatically (0/1 disables that).",
+    )
+    run.add_argument(
+        "--member-group",
+        metavar="R",
+        type=int,
+        help="Split the members of every init time over the R tasks of the srun (or torchrun) step, one GPU each, "
+        "and write one result per shard from rank 0; the tasks are then not shards, init times are sharded by "
+        "--shard or a job array only. With --dry-run, plan rank 0 of R ranks.",
     )
     run.add_argument(
         "--dry-run",
