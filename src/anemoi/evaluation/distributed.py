@@ -1,4 +1,4 @@
-"""Member-parallel evaluation: the members of one init time spread over the ranks of a process group.
+"""Member-parallel evaluation: the members of one init time spread over the ranks of the world process group.
 
 Rank `r` of `R` runs the member block `blocks(M, R)[r]` and scores the variable block `blocks(V, R)[r]` of every
 member, after `swap` has exchanged the frames. Each rank aggregates its variables with statistics bound to the full
@@ -29,7 +29,7 @@ SUMMED_ATTRS = ("target_reads", "target_cache_hits")
 SUMMED_PREFIXES = ("forcings_",)
 IDENTITY_ATTRS = ("gpu", "checkpoint_uuid", "config", "package_versions")
 IDENTITY_PREFIXES = ("inference_chunks_",)
-GROUP_TIMEOUT = datetime.timedelta(minutes=30)
+GROUP_TIMEOUT = datetime.timedelta(minutes=10)
 
 
 def blocks(count: int, parts: int) -> list[slice]:
@@ -68,56 +68,78 @@ def task_env(env: Mapping[str, str] | None = None) -> tuple[int, int, int]:
     return 0, 1, 0
 
 
-def init_group(group: MemberGroup, device: torch.device, timeout: datetime.timedelta = GROUP_TIMEOUT) -> None:
-    """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise, rendezvous at `MASTER_ADDR` and
-    `MASTER_PORT`, then a collective over every rank, so that every rank is up before the model loads and every later
+def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
+    """Address and port of rank 0 where a member group meets: `MASTER_ADDR` and `MASTER_PORT` when set, else, as
+    anemoi-inference derives them under Slurm, the first host of `SLURM_JOB_NODELIST` and `10000` plus the last four
+    digits of `SLURM_JOB_ID`. A job-array task has a job id of its own, so groups of one array that share a node meet
+    on different ports."""
+    env = os.environ if env is None else env
+    address, port = env.get("MASTER_ADDR"), env.get("MASTER_PORT")
+    nodes = env.get("SLURM_JOB_NODELIST") or env.get("SLURM_NODELIST")
+    job = env.get("SLURM_JOB_ID") or env.get("SLURM_JOBID")
+    if not address and nodes:
+        address = _first_host(nodes)
+    if not port and job:
+        port = str(10000 + int(job[-4:]))
+    if not address or not port:
+        raise ValueError(
+            "a member group needs MASTER_ADDR and MASTER_PORT in the environment, the address and a free port of "
+            "rank 0, unless it runs under Slurm, which gives them"
+        )
+    return address, int(port)
+
+
+def _first_host(nodes: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["scontrol", "show", "hostnames", nodes], capture_output=True, text=True, check=True
+    ).stdout.split()[0]
+
+
+def init_group(
+    group: MemberGroup,
+    device: torch.device,
+    timeout: datetime.timedelta = GROUP_TIMEOUT,
+    backend: str | None = None,
+) -> None:
+    """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise (or `backend`), rendezvous at
+    `rendezvous()`, then a collective over every rank, so that every rank is up before the model loads and every later
     batch of sends and receives may leave ranks out (NCCL needs all of them in the first one). The collective gathers
     the device names, and ranks on different GPU models are refused there rather than after the run. With NCCL the
     CUDA device must be set first."""
-    missing = [name for name in ("MASTER_ADDR", "MASTER_PORT") if not os.environ.get(name)]
-    if missing:
-        raise ValueError(
-            f"a member group needs {' and '.join(missing)} in the environment, the address and a free port of rank 0, "
-            "for example MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1) MASTER_PORT=29500"
-        )
-    nccl = device.type == "cuda"
+    address, port = rendezvous()
+    backend = backend or ("nccl" if device.type == "cuda" else "gloo")
+    nccl = backend == "nccl"
     dist.init_process_group(
-        "nccl" if nccl else "gloo",
-        init_method="env://",
+        backend,
+        init_method=f"tcp://{address}:{port}",
         rank=group.rank,
         world_size=group.size,
         timeout=timeout,
         **({"device_id": torch.device("cuda", torch.cuda.current_device())} if nccl else {}),
     )
     names = [None] * group.size
-    dist.all_gather_object(names, torch.cuda.get_device_name() if nccl else device.type)
+    dist.all_gather_object(names, torch.cuda.get_device_name(device) if device.type == "cuda" else device.type)
     if len(set(names)) > 1:
         dist.destroy_process_group()
         raise ValueError(f"the ranks run on different GPU models {sorted(set(names))}, a member group needs one")
 
 
-def _rank_and_size(group: dist.ProcessGroup | None) -> tuple[int, int]:
-    return dist.get_rank(group), dist.get_world_size(group)
-
-
-def _global(group: dist.ProcessGroup | None, rank: int) -> int:
-    return rank if group is None else dist.get_global_rank(group, rank)
-
-
-def swap(data: torch.Tensor, members: int, group: dist.ProcessGroup | None = None) -> torch.Tensor:
+def swap(data: torch.Tensor, members: int) -> torch.Tensor:
     """This rank's (M_r, V, N) member block -> the (M, V_r, N) variable block of every member, in global member order.
 
-    The members of rank `r` are `blocks(members, R)[r]` and its variables `blocks(V, R)[r]`. Every rank of `group` must
-    call it with the same `members`, `V` and `N`, including the ranks whose member or variable block is empty; the
-    blocks are derived from them, so ranks that disagree exchange messages of the wrong size. It is one batch of
-    point-to-point sends and receives, which gloo and NCCL both run (gloo has no list all-to-all and NCCL serialises
-    unbatched ones); with NCCL the current CUDA device must be set, and the first operation on the group must involve
-    all its ranks, which a rank with neither members nor variables would skip.
+    The members of rank `r` of the world group are `blocks(members, R)[r]` and its variables `blocks(V, R)[r]`. Every
+    rank must call it with the same `members`, `V` and `N`, including the ranks whose member or variable block is
+    empty; the blocks are derived from them, so ranks that disagree exchange messages of the wrong size. It is one
+    batch of point-to-point sends and receives, which gloo and NCCL both run (gloo has no list all-to-all and NCCL
+    serialises unbatched ones); with NCCL the current CUDA device must be set, and the first operation on the group
+    must involve all its ranks, which a rank with neither members nor variables would skip.
 
     The peak memory is the input, the contiguous copies sent to the other ranks and the output, about three times the
     (M_r, V, N) frame when the blocks are even.
     """
-    rank, size = _rank_and_size(group)
+    rank, size = dist.get_rank(), dist.get_world_size()
     member_blocks, variable_blocks = blocks(members, size), blocks(data.shape[1], size)
     mine = member_blocks[rank]
     if data.shape[0] != mine.stop - mine.start:
@@ -134,10 +156,10 @@ def swap(data: torch.Tensor, members: int, group: dist.ProcessGroup | None = Non
             continue
         outgoing = data[:, variable_blocks[peer]].contiguous()
         if outgoing.numel():
-            ops.append(dist.P2POp(dist.isend, outgoing, _global(group, peer), group))
+            ops.append(dist.P2POp(dist.isend, outgoing, peer))
         incoming = out[member_blocks[peer]]
         if incoming.numel():
-            ops.append(dist.P2POp(dist.irecv, incoming, _global(group, peer), group))
+            ops.append(dist.P2POp(dist.irecv, incoming, peer))
     if ops:
         for work in dist.batch_isend_irecv(ops):
             work.wait()
@@ -216,19 +238,18 @@ def concat_states(states: list[AggregationState]) -> AggregationState:
     )
 
 
-def gather_state(state: AggregationState, group: dist.ProcessGroup | None = None) -> AggregationState | None:
-    """Rank 0 of `group` gets the states of all its ranks concatenated by `concat_states`, on the CPU; the others get
-    None. The states travel pickled (`gather_object`), so with NCCL the current CUDA device must be set."""
-    rank, size = _rank_and_size(group)
+def gather_state(state: AggregationState) -> AggregationState | None:
+    """Rank 0 gets the states of all the ranks concatenated by `concat_states`, on the CPU; the others get None. The
+    states travel pickled (`gather_object`), so with NCCL the current CUDA device must be set."""
+    rank, size = dist.get_rank(), dist.get_world_size()
     gathered = [None] * size if rank == 0 else None
-    dist.gather_object(state.cpu(), gathered, dst=_global(group, 0), group=group)
+    dist.gather_object(state.cpu(), gathered, dst=0)
     return concat_states(gathered) if rank == 0 else None
 
 
 def abort() -> None:
-    """Tear down the world group, and every group made from it, without waiting for the other ranks: NCCL
-    communicators are aborted, any other backend is destroyed; a failure to do so (a group already gone) is logged in
-    one line, not raised."""
+    """Tear down the world group without waiting for the other ranks: NCCL communicators are aborted, any other
+    backend is destroyed; a failure to do so (a group already gone) is logged in one line, not raised."""
     try:
         if "nccl" in str(dist.get_backend()) and hasattr(dist.distributed_c10d, "_abort_process_group"):
             dist.distributed_c10d._abort_process_group()
@@ -243,7 +264,6 @@ def abort_on_error() -> Iterator[None]:
     """Abort the world group and re-raise when the block raises, so the other ranks fail instead of waiting for this
     one.
 
-    Only the world group: destroying a gloo subgroup does not unblock its peers, they wait until this process exits.
     With gloo the other ranks see the connections close and raise in their next or current operation. With NCCL the
     abort frees only this rank's communicators: a rank already inside a collective waits for NCCL's timeout, and
     torch's abort is meant to run with `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, since otherwise NCCL's watchdog may abort

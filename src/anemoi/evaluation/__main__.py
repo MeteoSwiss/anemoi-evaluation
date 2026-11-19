@@ -1,4 +1,4 @@
-"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group R] [--dry-run
+"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group [R]] [--dry-run
 [--step-time s]]`` and ``anemoi-evaluation merge <nc>... -o <nc> [--partial]``."""
 
 import argparse
@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from anemoi.evaluation.distributed import MemberGroup
 
 LOG = logging.getLogger(__name__)
+STEP_TASKS = object()  # a bare --member-group: as many ranks as the step has tasks (argparse converts a str const)
 
 
 def resolve_shard(
@@ -96,12 +97,15 @@ def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
     from anemoi.evaluation.distributed import MemberGroup
     from anemoi.evaluation.distributed import task_env
 
-    if args.member_group < 1:
+    if args.member_group is STEP_TASKS:
+        if args.dry_run:
+            raise SystemExit("--dry-run plans a member group of a given size: pass --member-group R")
+    elif args.member_group < 1:
         raise SystemExit(f"--member-group must be at least 1, got {args.member_group}")
     if args.dry_run:
         return MemberGroup(0, args.member_group)
     rank, tasks, local = task_env()
-    if tasks != args.member_group:
+    if args.member_group not in (STEP_TASKS, tasks):
         raise SystemExit(
             f"--member-group {args.member_group} needs as many tasks in the step, this one has {tasks}: "
             "start one task per rank with srun (or torchrun)"
@@ -109,7 +113,15 @@ def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
     import torch
 
     if torch.cuda.is_available():
-        torch.cuda.set_device(local % torch.cuda.device_count())
+        visible = torch.cuda.device_count()
+        # one visible GPU is the task's own (srun --gpus-per-task=1); several are shared by the tasks of the node
+        if visible > 1:
+            if local >= visible:
+                raise SystemExit(
+                    f"--member-group: task {local} of this node has no GPU of its own, {visible} are visible: start "
+                    "at most one task per GPU on a node"
+                )
+            torch.cuda.set_device(local)
     return MemberGroup(rank, tasks)
 
 
@@ -239,9 +251,12 @@ def main(argv: list[str] | None = None) -> None:
         "--member-group",
         metavar="R",
         type=int,
+        nargs="?",
+        const=STEP_TASKS,
         help="Split the members of every init time over the R tasks of the srun (or torchrun) step, one GPU each, "
-        "and write one result per shard from rank 0; the tasks are then not shards, init times are sharded by "
-        "--shard or a job array only. With --dry-run, plan rank 0 of R ranks.",
+        "and write one result per shard from rank 0; without R, as many ranks as the step has tasks. The tasks are "
+        "then not shards, init times are sharded by --shard or a job array only. With --dry-run, plan rank 0 of R "
+        "ranks (R required).",
     )
     run.add_argument(
         "--dry-run",

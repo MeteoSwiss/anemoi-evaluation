@@ -646,6 +646,11 @@ class InferenceForecastSource(ForecastSourceBase):
             raise ValueError(
                 f"{self.members} members cannot be split over {group.size} ranks: every rank needs a member"
             )
+        device = self.run_config.get("device")
+        if device is not None and torch.device(str(device)).index is not None:
+            raise ValueError(
+                f"device {device!r} puts every rank on one GPU: set device: cuda, each rank then takes its own"
+            )
         self.member_group = group
 
     def _member_indices(self) -> range:
@@ -653,23 +658,32 @@ class InferenceForecastSource(ForecastSourceBase):
         block = slice(0, self.members) if self.member_group is None else self.member_group.block(self.members)
         return range(block.start, block.stop)
 
-    def _frame(
+    def _frames(
         self,
         init_time: datetime.datetime,
         step: datetime.timedelta,
         date: datetime.datetime,
-        columns: list[str],
-        data: torch.Tensor,
+        variables: Mapping[str, list[str]],
+        outputs: list[dict],
         device: torch.device,
-    ) -> Frame:
-        """The frame of this process's members, or, in a member group, every member's of this rank's variables."""
-        data = data.to(device)
-        if self.member_group is not None:
-            from anemoi.evaluation.distributed import swap
+    ) -> dict[str, Frame]:
+        """One frame per dataset of `variables` from the members' `outputs` (tensors, or numpy arrays from a
+        temporal downscaler), copied into a new tensor. In a member group it is every member's frame of this rank's
+        variables, and the rank's frame of every variable is freed here, before the frames are scored."""
+        frames = {}
+        for name, columns in variables.items():
+            columns = list(columns)
+            data = torch.stack(
+                [torch.stack([torch.as_tensor(output[name]["fields"][v]) for v in columns]) for output in outputs]
+            )
+            data = data.float().to(device)
+            if self.member_group is not None:
+                from anemoi.evaluation.distributed import swap
 
-            data = swap(data, self.members)
-            columns = columns[self.member_group.block(len(columns))]
-        return Frame(init_time, step, date, columns, data)
+                data = swap(data, self.members)
+                columns = columns[self.member_group.block(len(columns))]
+            frames[name] = Frame(init_time, step, date, columns, data)
+        return frames
 
     def lead_times(self, lead_time: datetime.timedelta) -> list[datetime.timedelta]:
         """Lead times of the model's outputs up to `lead_time` (see `rollout_schedule`); warns when the model's last
@@ -789,14 +803,7 @@ class InferenceForecastSource(ForecastSourceBase):
                         raise RuntimeError(f"the runner yielded more outputs than scheduled at {init_time} + {step}")
                     if step != lead:
                         raise RuntimeError(f"the runner yielded step {step} at {init_time}, lead time {lead} was due")
-                    frames = {}
-                    for name in names:
-                        columns = list(variables[name])
-                        data = torch.stack(
-                            [torch.stack([output[name]["fields"][v] for v in columns]) for output in outputs]
-                        ).float()
-                        frames[name] = self._frame(init_time, step, date, columns, data, device)
-                    yield frames
+                    yield self._frames(init_time, step, date, variables, outputs, device)
             finally:
                 for generator in generators:
                     generator.close()
@@ -895,17 +902,7 @@ class InferenceForecastSource(ForecastSourceBase):
                     if step not in leads:
                         raise RuntimeError(f"the runner yielded {step} at {init_time}, not a lead of the window")
                     yielded.append(step)
-                    frames = {}
-                    for name in names:
-                        columns = list(variables[name])
-                        data = torch.stack(
-                            [
-                                torch.stack([torch.as_tensor(output[name]["fields"][v]) for v in columns])
-                                for output in outputs
-                            ]
-                        ).float()
-                        frames[name] = self._frame(init_time, step, date, columns, data, device)
-                    yield frames
+                    yield self._frames(init_time, step, date, variables, outputs, device)
             finally:
                 for generator in generators:
                     generator.close()

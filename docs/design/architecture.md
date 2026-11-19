@@ -394,11 +394,12 @@ so `resolve_shard()` then counts only the job array.
 ### 3.13 Member groups: `distributed.py`
 
 A member group (FR-41) is the `R` tasks of one job step, the world process group: NCCL on CUDA, gloo
-otherwise, joined at `MASTER_ADDR:MASTER_PORT` with an explicit timeout and a collective right after,
-which gathers the device names and refuses a group on mixed GPU models (NFR-6). The collective makes
+otherwise, joined at `MASTER_ADDR:MASTER_PORT` (derived from Slurm when unset) with an explicit
+timeout and a collective right after, which gathers the device names and refuses a group on mixed
+GPU models (NFR-6). The collective makes
 every rank come up before the model loads and satisfies NCCL's rule that every rank takes part in the
 first batched send and receive of a group. Rank `r` of `R` owns the contiguous
-member block `blocks(M, R)[r]` and the contiguous variable block `blocks(V, R)[r]`; `M >= R` is
+member block `blocks(M, R)[r]` and the contiguous variable block `blocks(V, R)[r]`; `M < R` is
 refused, since a rank without members has nothing to run.
 
 The exchange lives in the forecast source. `InferenceForecastSource.split_members` makes it run the

@@ -142,12 +142,9 @@ def _check_merged_attrs(merged: dict, case: dict, size: int, label: str) -> None
 
 def _split_worker(rank: int, size: int, store: str, out: str) -> None:
     _init(rank, size, store)
-    pair = dist.new_group([1, 2])
     # the last case leaves rank 2 with neither members nor variables
-    for group, members, n_variables in ((None, 7, 5), (pair, 7, 5), (None, 5, 2), (None, 2, 2)):
-        if dist.get_rank(group) < 0:
-            continue
-        group_rank, group_size = dist.get_rank(group), dist.get_world_size(group)
+    for members, n_variables in ((7, 5), (5, 2), (2, 2)):
+        group_rank, group_size = rank, size
         label = f"M={members} V={n_variables} R={group_size}"
         case = _case(members, n_variables)
         built = metrics.build(SPECS, case["variables"], members)
@@ -160,12 +157,12 @@ def _split_worker(rank: int, size: int, store: str, out: str) -> None:
             frames = []
             for frame_init, lead, pred, target in case["frames"]:
                 if frame_init == init:
-                    swapped = swap(pred[mine].contiguous(), members, group)
+                    swapped = swap(pred[mine].contiguous(), members)
                     assert _identical(swapped, pred[:, block].contiguous()), f"{label} rank {group_rank}"
                     frames.append((frame_init, lead, swapped, target))
             state = _aggregate(case, restricted, block, frames)
             state.attrs = _rank_attrs(group_rank, case, block)
-            gathered.append(gather_state(state, group))
+            gathered.append(gather_state(state))
         if group_rank != 0:
             assert gathered == [None, None]
             continue
@@ -187,10 +184,10 @@ def _split_worker(rank: int, size: int, store: str, out: str) -> None:
 
 
 def test_member_split_scores_like_the_unsplit_run(tmp_path):
-    """Members split over 3 ranks and over a 2-rank subgroup, swapped to variable blocks, scored with restricted
-    statistics and gathered give the unsplit state bit for bit, also after a netcdf round trip and `merge`, and the
-    attrs merged by the rules of `merge_attrs`; with `V < R` one rank scores no variable, with `M, V < R` one rank has
-    neither members nor variables, and every rank but one lacks the threshold variable in some case."""
+    """Members split over 3 ranks, swapped to variable blocks, scored with restricted statistics and gathered give
+    the unsplit state bit for bit, also after a netcdf round trip and `merge`, and the attrs merged by the rules of
+    `merge_attrs`; with `V < R` one rank scores no variable, with `M, V < R` one rank has neither members nor
+    variables, and every rank but one lacks the threshold variable in some case."""
     _spawn(_split_worker, 3, str(tmp_path / "store"), str(tmp_path))
 
 
@@ -323,15 +320,26 @@ def _noisy_runners(monkeypatch, checkpoint, names) -> None:
 
 
 def _patch(monkeypatch, case: dict) -> None:
+    import _multi_dataset as fixture
+
     if case["kind"] == "downscaler":
         from test_temporal_downscaler import patch_downscaler_runner
 
         patch_downscaler_runner(monkeypatch, case["checkpoint"], noise=1.0)
-        import _multi_dataset as fixture
-
         fixture.patch_targets_from_forecast(monkeypatch)
     else:
         _noisy_runners(monkeypatch, case["checkpoint"], case["names"])
+    if case.get("missing"):
+        from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
+
+        serve = DatasetTargets.from_forecast
+
+        def with_missing(*args, **kwargs):
+            targets = serve(*args, **kwargs)
+            targets._missing.add(targets._index[datetime.datetime.fromisoformat(case["missing"])])
+            return targets
+
+        monkeypatch.setattr(DatasetTargets, "from_forecast", staticmethod(with_missing))
 
 
 def _cli_worker(rank: int, size: int, cases: list[dict]) -> None:
@@ -403,8 +411,8 @@ def _config(tmp_path, label: str, checkpoint, members: int, **overrides) -> dict
 def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch):
     """`run --member-group R` on R spawned gloo ranks writes the file of the unsplit run of the same config, bit
     for bit apart from the summed counters: a forecaster at R = 3 with the lead-0 frame, a climatology and a
-    threshold, with `V < R` (a rank scores no variable), over two datasets (`V < R` in one), a temporal downscaler at
-    R = 2, and a shard of a member group (R = 2) merges with the other shard of an unsplit run."""
+    threshold, with `V < R` (a rank scores no variable), with a missing target date skipped, over two datasets
+    (`V < R` in one), a temporal downscaler at R = 2, and a shard of a member group (R = 2) merges with the other shard of an unsplit run."""
     import _multi_dataset as fixture
     import xarray as xr
     import yaml
@@ -432,6 +440,7 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
     configs = {
         "era5": (_config(tmp_path, "era5", era5, 5, **thorough), "forecaster", era5, ("era5",)),
         "narrow": (_config(tmp_path, "narrow", era5, 4, variables=["tp", "2t"]), "forecaster", era5, ("era5",)),
+        "skip": (_config(tmp_path, "skip", era5, 4, on_missing_target="skip"), "forecaster", era5, ("era5",)),
         "both": (
             _config(
                 tmp_path,
@@ -462,6 +471,8 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
         for name, content in ((label, config), (f"{label}-unsplit", unsplit)):
             (tmp_path / f"{name}.yaml").write_text(yaml.safe_dump(content))
         case = {"kind": kind, "checkpoint": str(checkpoint), "names": names}
+        if label == "skip":
+            case["missing"] = (fixture.init_times()[0] + 6 * HOUR).isoformat()
         _patch(monkeypatch, case)
         for args in (["--shard", "0/1"], ["--shard", "1/2"]) if label == "era5" else [[]]:
             main(["run", str(tmp_path / f"{label}-unsplit.yaml"), *args])
@@ -487,6 +498,9 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
                 str(tmp_path / f"{label}-unsplit-{middle}0-1.nc"),
                 ranks,
             )
+    with xr.open_dataset(tmp_path / "skip-unsplit-0-1.nc", decode_timedelta=True) as skipped:
+        counts = skipped["n_init"].values
+    assert counts.min() < counts.max()  # the missing target date was skipped
     with xr.open_dataset(tmp_path / "era5-unsplit-0-1.nc", decode_timedelta=True) as reference:
         assert (reference["spread"].isel(lead_time=slice(1, None)).values > 0.5).all()  # the members differ
         assert reference["acc"].notnull().any() and reference.sizes["variable"] == 7
@@ -510,7 +524,9 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
 
     checkpoint = fixture.save_checkpoint(tmp_path / "era5.ckpt", ("era5",))
     _noisy_runners(monkeypatch, checkpoint, ("era5",))
-    for name in ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+    for name in ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "SLURM_JOB_NODELIST", "SLURM_NODELIST"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("SLURM_JOB_ID", "SLURM_JOBID", "SLURM_LOCALID"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SLURM_PROCID", "0")
     monkeypatch.setenv("SLURM_STEP_NUM_TASKS", "1")
@@ -529,7 +545,7 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
     assert plan["time"]["run"]["gpu_hours"] == round(2 * calls * 3 * 2.0 * 2 / 3600, 2)
     sizes = plan["bytes"]
     assert sizes["frame"] == 5 * 4 * n * 4 and sizes["ensemble_temporaries"] == 4 * 5 * n * 8
-    assert sizes["swap_peak"] == 3 * 7 * n * 4 + 3 * 3 * n * 4 + 5 * 4 * n * 4
+    assert sizes["swap_peak"] == 3 * 7 * n * 4 + 3 * 3 * n * 4
     assert sizes["member_states"] == 3 * plan["forecast"]["per_member_state_bytes"]
     main(["run", path(5), "--member-group", "2", "--dry-run", "--step-time", "1"])
     assert "member_group:" in capsys.readouterr().out
@@ -546,7 +562,63 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
         main(["run", path(5), "--member-group", "2"])
     with pytest.raises(SystemExit, match="MASTER_ADDR and MASTER_PORT"):
         main(["run", path(5), "--member-group", "1"])
+    with pytest.raises(SystemExit, match="MASTER_ADDR and MASTER_PORT"):
+        main(["run", path(5), "--member-group"])  # bare: the step's one task
+    with pytest.raises(SystemExit, match="pass --member-group R"):
+        main(["run", path(5), "--member-group", "--dry-run"])
+    indexed = Evaluation.from_config(path(5))
+    indexed.forecast.run_config["device"] = "cuda:1"
+    with pytest.raises(ValueError, match="every rank on one GPU"):
+        indexed.split_members(MemberGroup(0, 2))
+    indexed.close()
+
+    # the CUDA device of a task: its own when it sees one, else its local rank, refused beyond the visible ones
+    chosen = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_device", chosen.append)
+    monkeypatch.setenv("SLURM_STEP_NUM_TASKS", "3")
+    for visible, local in ((2, 1), (1, 2), (2, 2)):
+        monkeypatch.setattr(torch.cuda, "device_count", lambda visible=visible: visible)
+        monkeypatch.setenv("SLURM_LOCALID", str(local))
+        with pytest.raises(SystemExit, match="MASTER_ADDR" if local < visible or visible == 1 else "GPU of its own"):
+            main(["run", path(5), "--member-group", "3"])
+    assert chosen == [1]
     targets = fixture.make_targets("era5")
     persistence = Evaluation(PersistenceForecastSource(targets, "6h", 2), targets, fixture.init_times(), "6h", ["rmse"])
     with pytest.raises(ValueError, match="PersistenceForecastSource cannot split its members"):
         persistence.split_members(MemberGroup(0, 2))
+
+
+def test_rendezvous_from_slurm(monkeypatch):
+    """Without `MASTER_ADDR` and `MASTER_PORT` a member group meets at the first host of the job and port 10000 plus
+    the last four digits of the job id, the job-array task's own; set, they win, each on its own."""
+    from anemoi.evaluation import distributed
+    from anemoi.evaluation.distributed import rendezvous
+
+    monkeypatch.setattr(distributed, "_first_host", {"nid[002812-002813]": "nid002812"}.__getitem__)
+    job = {"SLURM_JOB_NODELIST": "nid[002812-002813]", "SLURM_JOB_ID": "426031"}
+    assert rendezvous(job) == ("nid002812", 16031)
+    task = {**job, "SLURM_JOB_ID": "426033", "SLURM_ARRAY_JOB_ID": "426031", "SLURM_ARRAY_TASK_ID": "2"}
+    assert rendezvous(task) == ("nid002812", 16033)
+    assert rendezvous({**job, "MASTER_ADDR": "10.0.0.1", "MASTER_PORT": "29500"}) == ("10.0.0.1", 29500)
+    assert rendezvous({**job, "MASTER_PORT": "29500"}) == ("nid002812", 29500)
+    with pytest.raises(ValueError, match="MASTER_ADDR and MASTER_PORT"):
+        rendezvous({"SLURM_JOB_ID": "426031"})
+    with pytest.raises(ValueError, match="MASTER_ADDR and MASTER_PORT"):
+        rendezvous({})
+
+
+def _models_worker(rank: int, size: int, port: int) -> None:
+    from anemoi.evaluation.distributed import MemberGroup
+    from anemoi.evaluation.distributed import init_group
+
+    torch.cuda.get_device_name = lambda device=None: ("NVIDIA A100-SXM4-80GB", "NVIDIA PG506-232")[rank]
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    with pytest.raises(ValueError, match="different GPU models"):
+        init_group(MemberGroup(rank, size), torch.device("cuda"), datetime.timedelta(seconds=30), backend="gloo")
+    assert not dist.is_initialized()
+
+
+def test_mixed_gpu_models_are_refused_at_startup():
+    """Ranks on an A100 and a PG506 (Balfrin mixes them) are refused by the first collective, on every rank."""
+    _spawn(_models_worker, 2, _free_port())

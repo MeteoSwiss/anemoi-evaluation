@@ -6,7 +6,7 @@
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.
-* `run --member-group R` spreads the members of every init time over the `R` tasks of a job step, one
+* `run --member-group` spreads the members of every init time over the tasks of a job step, one
   GPU each, and rank 0 writes the file the unsplit run would write, with a `member_ranks` attr and the
   timings and counters summed over the ranks. The tasks form one member group, not shards: init times are
   sharded by `--shard` or a job array, and a member-group shard merges like any other.
@@ -15,9 +15,8 @@
 
 ### Changes
 
-* The node reduction and the ensemble mean are taken one variable at a time, so a variable's sums no
-  longer depend on the other variables of the run. Results differ from 0.4.0 in the last float64 bits,
-  and files of both versions still merge.
+* The node reduction and the ensemble mean are taken one variable at a time. Results differ from 0.4.0
+  in the last float64 bits, and files of both versions still merge.
 
 ## 0.4.0 — 2026-11-18
 

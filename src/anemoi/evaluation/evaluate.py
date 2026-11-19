@@ -369,9 +369,11 @@ class Evaluation:
                     if "per_member_state_bytes" in forecast
                     else {}
                 ),
-                # the rank's frame of all the variables, the copies it sends and the frame it receives
+                # the rank's frame of every variable and the copies it sends, beside `frame` (what it receives)
+                # during the exchange and freed before scoring: the peak is about member_states + frame +
+                # max(swap_peak, statistics_temporaries + ensemble_temporaries)
                 **(
-                    {"swap_peak": local * v * n * 4 + local * (v - scored) * n * 4 + members * row}
+                    {"swap_peak": local * v * n * 4 + local * (v - scored) * n * 4}
                     if self.member_group is not None
                     else {}
                 ),

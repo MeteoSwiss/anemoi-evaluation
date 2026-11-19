@@ -879,15 +879,17 @@ on one GPU model. The other ranks write nothing.
 #SBATCH --gpus-per-task=1
 #SBATCH --time=01:00:00
 
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=29500
-srun --kill-on-bad-exit=1 anemoi-evaluation run config.yaml --member-group "$SLURM_NTASKS"
+srun --kill-on-bad-exit=1 anemoi-evaluation run config.yaml --member-group
 ```
 
-`--member-group R` must equal the number of tasks of the step (`srun`'s, or `torchrun`'s
-`WORLD_SIZE`), and `MASTER_ADDR` and `MASTER_PORT` must name rank 0's node and a free port. With
-CUDA each task takes the GPU `SLURM_LOCALID` (modulo the visible ones), so leave `device: cuda` in
-the inference block without an index; the ranks talk over NCCL, otherwise over gloo.
+A bare `--member-group` makes all the tasks of the step one group; `--member-group R` must equal
+their number (`srun`'s, or `torchrun`'s `WORLD_SIZE`). The ranks meet at rank 0's node: under
+Slurm the first host of the job and port `10000` plus the last four digits of the job id, as
+anemoi-inference does, so the tasks of a job array, each a job of its own, meet on different ports
+even on one node. `MASTER_ADDR` and `MASTER_PORT` override both. With CUDA a task that sees one GPU
+(`--gpus-per-task=1`) takes it, and tasks that share a node's GPUs take the GPU `SLURM_LOCALID`;
+more tasks on a node than GPUs are refused. Leave `device: cuda` in the inference block without an
+index (an index is refused); the ranks talk over NCCL, otherwise over gloo.
 `--kill-on-bad-exit=1` matters: a failing rank aborts the group, but a rank already waiting for it
 inside NCCL only notices when Slurm kills the step.
 
@@ -905,8 +907,9 @@ Every rank needs at least one member, `M >= R`, and an ensemble: one member is r
 any forecast source other than `anemoi_inference` (persistence and linear interpolation). Forecasters,
 offset forecasters, temporal downscalers, multi-dataset checkpoints and `include_lead_zero` all
 work. `--dry-run --member-group R` plans rank 0, with the rank's members in the time estimate
-(`gpu_hours` counts every rank) and in the `bytes` block the lockstep members, the exchange peak
-(about three times the frame) and the ensemble scoring temporaries.
+(`gpu_hours` counts every rank) and in the `bytes` block the lockstep members, the exchange
+buffers (about twice the rank's frame, beside the frame it receives) and the ensemble scoring
+temporaries. `--dry-run` needs the group size, `--member-group R`.
 
 ## Reading the results
 
@@ -1073,7 +1076,7 @@ Dates, grids, variables and merging:
 | `cannot merge states that share init times`, `duplicate shards of n` | the same result would be counted twice |
 | `cannot merge states with different coordinates or statistics` | the inputs came from different configs |
 | `--member-group R needs as many tasks in the step` | start the run with `srun` (or `torchrun`) and `R` tasks, `--member-group "$SLURM_NTASKS"` |
-| `a member group needs MASTER_ADDR and MASTER_PORT in the environment` | export rank 0's host and a free port before `srun`, as in [member-parallel runs](#member-parallel-runs) |
+| `a member group needs MASTER_ADDR and MASTER_PORT in the environment` | outside Slurm, export rank 0's host and a free port, as in [member-parallel runs](#member-parallel-runs) |
 | `the ranks run on different GPU models [...]` | the group spans GPU models (mixed nodes), whose members are not bit-identical; constrain the job to one GPU model |
 
 Behaviour that is not an error:
