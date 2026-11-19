@@ -460,6 +460,15 @@ class DatasetForecast:
         """`param` and `level` of a variable of this dataset."""
         return variable_info(self.typed_variables.get(name))
 
+    @property
+    def constant_variables(self) -> list[str]:
+        """This dataset's retrieved constant forcings."""
+        return self.source.dataset_constant_variables(self.name)
+
+    def constant_field(self, name: str, date: datetime.datetime) -> np.ndarray:
+        """A constant forcing of this dataset."""
+        return self.source.constant_field(name, date, dataset=self.name)
+
     def describe(self) -> dict:
         """What the parent reports for this dataset."""
         return self.source.describe(dataset=self.name)
@@ -507,6 +516,7 @@ class InferenceForecastSource(ForecastSourceBase):
         self.quiet = quiet
         self.forcings_cache_bytes = forcings_cache_bytes
         self._initial: dict[str, tuple[datetime.datetime, dict]] = {}
+        self._constant_fields: dict[tuple[str, datetime.datetime], dict] = {}
         with self._quiet():
             config = RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"})
             # before the runner is built: the `auto` runner raises on a task it has no runner for
@@ -959,6 +969,41 @@ class InferenceForecastSource(ForecastSourceBase):
         """`param` and `level` of a variable from the checkpoint's typed variables; None when unknown."""
         return variable_info(self.typed_variables.get(name))
 
+    @property
+    def constant_variables(self) -> list[str]:
+        """The variables the checkpoint takes as retrieved constant forcings (single-dataset checkpoints)."""
+        return self.dataset_constant_variables(None)
+
+    def dataset_constant_variables(self, dataset: str | None = None) -> list[str]:
+        """The variables `dataset` takes as retrieved constant forcings (anemoi-inference's `constant+forcing`
+        category, neither computed nor prognostic or diagnostic: `z`, `lsm`, ... when the model reads them): what
+        `constant_field` can serve. Computed forcings (`cos_latitude`, ...) are not among them."""
+        source = self.runner.constant_forcings_inputs[self._resolve_dataset(dataset)]
+        return list(getattr(source, "variables", None) or [])
+
+    def constant_field(self, name: str, date: datetime.datetime, dataset: str | None = None) -> np.ndarray:
+        """The retrieved constant forcing `name` of `dataset` (N,) float64 on the checkpoint's grid, in the units the
+        model reads it in (`z` is a geopotential, m**2 s**-2), from the runner's constant-forcings input at `date`.
+
+        The runner is built at construction and the input reads the dataset, so this loads no model; the input state
+        of each date read is kept (the input reads every constant forcing at once), until `close()`."""
+        chosen = self._resolve_dataset(dataset)
+        available = self.dataset_constant_variables(chosen)
+        if name not in available:
+            raise ValueError(
+                f"{name!r} is not a constant forcing the checkpoint retrieves for {chosen!r} (it retrieves "
+                f"{available}); pass constants=operators.DatasetConstants(...) to read it from a dataset"
+            )
+        cache = self._constant_fields
+        if (chosen, date) not in cache:
+            source = self.runner.constant_forcings_inputs[chosen]
+            with self._quiet():
+                fields = create_input_state(source, date, [datetime.timedelta(0)])["fields"]
+            cache[(chosen, date)] = fields
+        values = np.asarray(cache[(chosen, date)][name], dtype=np.float64)
+        values = values[-1] if values.ndim > 1 else values
+        return self.datasets[chosen].grid.check_shape(np.array(values, copy=True), f"constant forcing {name!r}")
+
     def provenance(self) -> dict:
         """Result-file attrs identifying the checkpoint: its path, uuid and training run id; once the model is loaded,
         also the GPU model and the inference chunk counts, which are part of a run's numerical identity."""
@@ -1085,6 +1130,7 @@ class InferenceForecastSource(ForecastSourceBase):
     def close(self) -> None:
         """Release the runner and the model."""
         self._initial = {}
+        self._constant_fields = {}
         if self.temporal_downscaling:
             self._window_constants = {}
         self.runner = None
