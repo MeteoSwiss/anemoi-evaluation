@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from anemoi.evaluation.points import PointSet
+
 
 @dataclass(frozen=True)
 class Grid:
@@ -52,13 +54,15 @@ class Grid:
 
 @dataclass(frozen=True)
 class Frame:
-    """One forecast step: `data` is float32 (M members, V variables, N nodes)."""
+    """One forecast step: `data` is float32 (M members, V variables, N nodes), or P points once an observation
+    operator has mapped it; the driver then sets `points`, the `PointSet` of the last axis (None on the grid)."""
 
     init_time: datetime.datetime
     lead_time: datetime.timedelta
     valid_time: datetime.datetime
     variables: list[str]
     data: torch.Tensor
+    points: PointSet | None = None
 
     def __post_init__(self) -> None:
         if self.data.ndim != 3:
@@ -67,6 +71,8 @@ class Frame:
             raise ValueError(f"frame data must be float32, got {self.data.dtype}")
         if self.data.shape[1] != len(self.variables):
             raise ValueError(f"frame has {self.data.shape[1]} variable columns for {len(self.variables)} names")
+        if self.points is not None and self.data.shape[-1] != len(self.points):
+            raise ValueError(f"frame data has {self.data.shape[-1]} points, its point set {len(self.points)}")
         if self.valid_time != self.init_time + self.lead_time:
             raise ValueError(f"valid_time {self.valid_time} != init_time {self.init_time} + lead_time {self.lead_time}")
 

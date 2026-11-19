@@ -10,8 +10,11 @@ import torch
 
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
+from anemoi.evaluation.points import PointSet
 from anemoi.evaluation.sources.base import ForecastSourceBase
 from anemoi.evaluation.sources.base import MissingTargetError
+from anemoi.evaluation.sources.base import Observations
+from anemoi.evaluation.sources.base import PointTargetSourceBase
 from anemoi.evaluation.sources.base import TargetSourceBase
 from anemoi.evaluation.sources.base import lead_time_steps
 from anemoi.evaluation.sources.base import select_variables
@@ -34,6 +37,52 @@ class ArrayTargets(TargetSourceBase):
             raise MissingTargetError(f"no target for {valid_time}")
         idx = select_variables(variables, self.variables)
         return torch.from_numpy(np.ascontiguousarray(self.fields[valid_time][idx], dtype=np.float32)).to(device)[None]
+
+
+class ArrayPointTargets(PointTargetSourceBase):
+    """Observations from a dict of valid time -> (`PointSet`, float32 (V, P) array), the point set varying from one
+    valid time to the next; `fixed` builds one whose every valid time has the same set. A valid time absent from the
+    dict raises MissingTargetError. `point_attributes` defaults to the attributes every point set carries.
+    """
+
+    def __init__(
+        self,
+        variables: list[str],
+        observations: dict[datetime.datetime, tuple[PointSet, np.ndarray]],
+        point_attributes: tuple[str, ...] | None = None,
+    ) -> None:
+        self.variables = list(variables)
+        self.data = {}
+        for date, (points, values) in observations.items():
+            values = np.asarray(values, dtype=np.float32)
+            if values.shape != (len(self.variables), len(points)):
+                raise ValueError(
+                    f"values at {date} have shape {values.shape}, expected {(len(variables), len(points))}"
+                )
+            self.data[date] = (points, values)
+        if point_attributes is None:
+            sets = [set(points.attributes) for points, _ in self.data.values()]
+            point_attributes = tuple(sorted(set.intersection(*sets))) if sets else ()
+        self.point_attributes = tuple(point_attributes)
+        self.reads = 0
+
+    @classmethod
+    def fixed(
+        cls, points: PointSet, variables: list[str], fields: dict[datetime.datetime, np.ndarray]
+    ) -> ArrayPointTargets:
+        """A fixed point set: the same `points` at every valid time of `fields` (valid time -> (V, P))."""
+        source = cls(variables, {date: (points, values) for date, values in fields.items()}, tuple(points.attributes))
+        source.fixed_points = points
+        return source
+
+    def observations(self, valid_time: datetime.datetime, variables: list[str], device: torch.device) -> Observations:
+        """The point set and values (1, V, P) at `valid_time`."""
+        if valid_time not in self.data:
+            raise MissingTargetError(f"no observations at {valid_time}")
+        self.reads += 1
+        points, values = self.data[valid_time]
+        idx = select_variables(variables, self.variables)
+        return Observations(points, torch.from_numpy(np.ascontiguousarray(values[idx])).to(device)[None])
 
 
 class FakeForecastSource(ForecastSourceBase):
