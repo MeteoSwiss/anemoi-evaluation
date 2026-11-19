@@ -59,7 +59,9 @@ a checkpoint (NFR-21).
 `frame` alone; `aggregation` depends on `frame`, `statistics` and `binning`; `output` depends on
 `aggregation` and `metrics`; `evaluate` depends on all of them and on `config`; `__main__` depends
 only on `evaluate`, `config`, `output` and `metrics`, the last for rebuilding the metric objects
-when merging. Nothing under `sources/` imports the driver.
+when merging. Nothing under `sources/` imports the driver. `distributed` depends on `aggregation`
+and `output`; the inference source, the driver and `__main__` import it only when a run splits its
+members.
 
 ## 3. Components
 
@@ -386,6 +388,45 @@ and would then silently evaluate one shard of n under the full output name.
 scores one. A shard of such a run writes one file per dataset; merging is then per dataset, and `merge()`
 refuses inputs whose `dataset` attributes differ (FR-30). The
 module imports torch and the package lazily inside the command functions, so `--help` is cheap.
+`--member-group R` makes the tasks of the step one member group (section 3.13) instead of shards,
+so `resolve_shard()` then counts only the job array.
+
+### 3.13 Member groups: `distributed.py`
+
+A member group (FR-41) is the `R` tasks of one job step, the world process group: NCCL on CUDA, gloo
+otherwise, joined at `MASTER_ADDR:MASTER_PORT` with an explicit timeout and a collective right after,
+which gathers the device names and refuses a group on mixed GPU models (NFR-6). The collective makes
+every rank come up before the model loads and satisfies NCCL's rule that every rank takes part in the
+first batched send and receive of a group. Rank `r` of `R` owns the contiguous
+member block `blocks(M, R)[r]` and the contiguous variable block `blocks(V, R)[r]`; `M >= R` is
+refused, since a rank without members has nothing to run.
+
+The exchange lives in the forecast source. `InferenceForecastSource.split_members` makes it run the
+rank's members in lockstep, reseeded with their index in the whole ensemble (the seeding already
+depends on nothing else), and pass every frame of every dataset through `swap`: one
+`batch_isend_irecv` with a send and a receive per peer, which turns the rank's `(M_r, V, N)` into
+the `(M, V_r, N)` of every member, in global order. gloo has no list all-to-all and NCCL serialises
+unbatched sends, hence the batch. Swapping in the source, before the driver decides whether a frame
+has a target, keeps the ranks in step: a missing target is decided by date alone, so every rank
+skips the same frames. The lead-0 frame is the same for every member and each rank builds it for its
+variables without an exchange.
+
+`Evaluation.split_members` restricts everything after the source to the block: the target and
+climatology reads, the aggregator's statistics (`Statistic.restrict` slices the bound threshold maps,
+bound on the full variable list so no rank sees a threshold error) and the state. The rest stays the
+whole ensemble's: `members`, the rank bins, the reliability levels, `metrics.build`, the config. Every
+statistic, the validity mask and the node reduction are per variable (sections 3.6 and 3.7), so a
+rank's state is the slice of the unsplit state bit for bit, and rank 0 concatenating the blocks
+(`gather_state`, `concat_states`) gives the unsplit state. `finish` runs on every rank first, since
+the attrs it sets are merged by rule (`merge_attrs`): timings and read counters summed, the peak
+memory the maximum, the non-finite climatology maps unioned, the rest rank 0's, and a group whose
+ranks disagree on the GPU model, the chunk counts, the checkpoint, the config or the package
+versions refused. Rank 0 writes; its file is an ordinary shard.
+
+A failing rank aborts the world group and re-raises (`abort_on_error`). Over gloo the peers fail at
+once; over NCCL a peer already inside a collective waits for the timeout, which is why the user
+guide runs the step with `srun --kill-on-bad-exit=1`. Only the world group is aborted: destroying a
+gloo subgroup does not unblock its peers.
 
 ## 4. Data flow of a run
 
@@ -575,7 +616,9 @@ provider lists, and building a temporal downscaler's window input state
 
 Three designs were worked out against the current code and not built. The sketches are kept
 because the analysis, not the conclusion, is the expensive part; the decisions themselves are in
-[`requirements.md`](requirements.md) section 5.
+[`requirements.md`](requirements.md) section 5. A fourth, member-parallel evaluation, is no longer
+deferred: it is built as the member groups of section 3.13, with every rank running its own model
+rather than one model sharded over the ranks.
 
 **Sequential members with a host buffer**, if lockstep memory (NFR-13) ever becomes binding. Run
 one `run()` generator at a time, so the device peak is the M = 1 peak whatever M, copy each step's
@@ -587,7 +630,9 @@ and a prefetch covering every lead time of an init time, since the frames then a
 **Data-parallel evaluation in one job.** Rank `r` evaluates `shard(r, world)` and the tiny states
 are gathered to rank 0, which merges and writes. It needs no `all_reduce`: a sum reduction would
 only be exact where every element is non-zero on one rank, whereas a gather keeps the merge
-semantics of FR-32.
+semantics of FR-32. Combined with member groups it would be `world = shards x R` in one step, a
+member group per shard on subgroups; a job array of member groups does the same without the
+subgroups, whose gloo teardown does not unblock peers.
 
 **Model-parallel evaluation** through anemoi-inference's parallel runner: every rank runs the same
 init times and members in the same order, each model call being a collective, with rank 0

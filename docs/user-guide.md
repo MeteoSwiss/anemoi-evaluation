@@ -21,6 +21,7 @@ in the [reference](reference.md); the reasons behind the design are in the
 - [Temporal downscalers](#temporal-downscalers)
 - [Persistence and the other included sources](#persistence-and-the-other-included-sources)
 - [Sharding and merging](#sharding-and-merging)
+- [Member-parallel runs](#member-parallel-runs)
 - [Reading the results](#reading-the-results)
 - [Bringing your own source](#bringing-your-own-source)
 - [Performance](#performance)
@@ -271,7 +272,8 @@ INFO ...: dry run: about 0.14 GPU-hours of model time, about 10 minutes 9 second
 The estimate is `model calls x members x step time` plus 105 s of process startup per shard, so
 the same run with `--shard 0/4` reports about 3 minutes 51 seconds per shard over 4 shards. It
 counts neither target reads (assumed hidden by prefetch) nor statistics. `--step-time` without
-`--dry-run` is an error.
+`--dry-run` is an error. With `--member-group R`, `members` is the members of one rank and
+`gpu_hours` counts all `R` GPUs ([member-parallel runs](#member-parallel-runs)).
 
 ## Ensembles
 
@@ -309,7 +311,9 @@ logs a warning and produces identical members, so `spread` is zero and `crps` eq
 
 Model time and memory both grow linearly with members: four lockstep members cost four times one,
 and an extra member costs about 1.45 GiB on a 6-hourly 2-in/1-out 1 km checkpoint, about 6 GiB on
-an hourly 7-in/6-out one ([benchmarks](benchmarks.md#3-model-step-time-and-gpu-memory)).
+an hourly 7-in/6-out one ([benchmarks](benchmarks.md#3-model-step-time-and-gpu-memory)). An
+ensemble that does not fit one GPU is spread over several with a
+[member-parallel run](#member-parallel-runs).
 
 ## Multi-step-output models, offset forecasters and lead 0
 
@@ -858,6 +862,52 @@ state = ae.load_state("results/run-0.nc")                  # the raw state of on
 merged = ae.merge(["results/run-0.nc", "results/run-2.nc"], partial=True)
 ```
 
+## Member-parallel runs
+
+Sharding splits the init times; a member-parallel run splits the members of every init time over
+the `R` tasks of one `srun` step, one GPU each, for an ensemble too large for one GPU. Rank `r`
+runs a contiguous block of the members, seeded by their index in the whole ensemble, so they are
+the members an unsplit run would produce. After every frame the ranks exchange their members, so
+that each one holds every member of a contiguous block of the variables, which it scores. At the
+end rank 0 gathers the blocks and writes the file the unsplit run would have written, bit for bit
+on one GPU model. The other ranks write nothing.
+
+```bash
+#!/bin/bash
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-task=1
+#SBATCH --time=01:00:00
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=29500
+srun --kill-on-bad-exit=1 anemoi-evaluation run config.yaml --member-group "$SLURM_NTASKS"
+```
+
+`--member-group R` must equal the number of tasks of the step (`srun`'s, or `torchrun`'s
+`WORLD_SIZE`), and `MASTER_ADDR` and `MASTER_PORT` must name rank 0's node and a free port. With
+CUDA each task takes the GPU `SLURM_LOCALID` (modulo the visible ones), so leave `device: cuda` in
+the inference block without an index; the ranks talk over NCCL, otherwise over gloo.
+`--kill-on-bad-exit=1` matters: a failing rank aborts the group, but a rank already waiting for it
+inside NCCL only notices when Slurm kills the step.
+
+The tasks of the step are one member group, not shards. Shard init times as before with `--shard`
+or a job array, one group per shard: `#SBATCH --array=0-3` and the same `srun` line give four
+groups, each writing its shard. A member-group shard is an ordinary shard: it merges with the
+others, and with the shards of an unsplit run of the same config.
+
+The file records the group size as `member_ranks`. Its timings and read counters are summed over
+the ranks, so `time_model_s` is GPU-seconds, `target_reads` is `R` times the unsplit count (every
+rank reads every row), and `forcings_computed` is `R` times too (every rank computes the forcings
+of its own members); see the [reference](reference.md#member-parallel-runs).
+
+Every rank needs at least one member, `M >= R`, and an ensemble: one member is refused, and so is
+any forecast source other than `anemoi_inference` (persistence and linear interpolation). Forecasters,
+offset forecasters, temporal downscalers, multi-dataset checkpoints and `include_lead_zero` all
+work. `--dry-run --member-group R` plans rank 0, with the rank's members in the time estimate
+(`gpu_hours` counts every rank) and in the `bytes` block the lockstep members, the exchange peak
+(about three times the frame) and the ensemble scoring temporaries.
+
 ## Reading the results
 
 One netcdf holds both the metrics and the raw sums they came from.
@@ -1022,6 +1072,9 @@ Dates, grids, variables and merging:
 | `N of the M shards of the run were given, missing ...` | rerun the shard, or merge with `--partial` |
 | `cannot merge states that share init times`, `duplicate shards of n` | the same result would be counted twice |
 | `cannot merge states with different coordinates or statistics` | the inputs came from different configs |
+| `--member-group R needs as many tasks in the step` | start the run with `srun` (or `torchrun`) and `R` tasks, `--member-group "$SLURM_NTASKS"` |
+| `a member group needs MASTER_ADDR and MASTER_PORT in the environment` | export rank 0's host and a free port before `srun`, as in [member-parallel runs](#member-parallel-runs) |
+| `the ranks run on different GPU models [...]` | the group spans GPU models (mixed nodes), whose members are not bit-identical; constrain the job to one GPU model |
 
 Behaviour that is not an error:
 
@@ -1032,4 +1085,5 @@ Behaviour that is not an error:
 - **A low `n_init`**: targets were missing and skipped. Set `on_missing_target: raise` to find out,
   or read `n_init` per lead in the result file.
 - **GPU out of memory**: lower `members`, raise `ANEMOI_INFERENCE_NUM_CHUNKS`, or evaluate fewer
-  `variables` (the statistics temporaries are proportional to them).
+  `variables` (the statistics temporaries are proportional to them). An ensemble that does not fit
+  one GPU can be spread over several with a [member-parallel run](#member-parallel-runs).
