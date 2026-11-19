@@ -66,7 +66,7 @@ def test_metrics_match_closed_form(fake_sources):
         "crps": skill - pairs / 9,
         "fair_crps": skill - pairs / 6,
         "crps_0p5": skill - (0.5 / 6 + 0.5 / 9) * pairs,
-        "spread_skill": spread / np.abs(d),
+        "spread_skill": spread / np.sqrt(d**2 - spread**2 / 3),
         "member_rmse": np.sqrt(d**2 + 2 * spread**2 / 3),
         "member_mae": skill,
     }

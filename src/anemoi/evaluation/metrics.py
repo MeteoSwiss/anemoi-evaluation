@@ -135,7 +135,14 @@ class Spread(Metric):
 
 
 class SpreadSkill(Metric):
-    """Spread divided by RMSE."""
+    """Spread divided by the unbiased RMSE of the ensemble mean, `sqrt(var / (mse - var / M))`.
+
+    For `M` members drawn from the predictive distribution the squared error of the ensemble mean exceeds the
+    predictive variance by a factor `1 + 1 / M`; subtracting `ensemble_variance / M` (linear, so it applies to the
+    means) removes that bias, and a calibrated ensemble gives 1 for every `M` (WeatherBench-X
+    `UnbiasedSpreadSkillRatio`). Where the pooled `mse - var / M` is not positive, which needs very few samples, the
+    value is NaN, or inf for exactly zero.
+    """
 
     name = "spread_skill"
 
@@ -143,7 +150,8 @@ class SpreadSkill(Metric):
         self.statistics = {"ensemble_variance": st.EnsembleVariance(), "squared_error": st.SquaredError()}
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        return (means["ensemble_variance"] / means["squared_error"]).sqrt()
+        unbiased_mse = means["squared_error"] - means["ensemble_variance"] / members
+        return (means["ensemble_variance"] / unbiased_mse).sqrt()
 
 
 class MemberRMSE(Metric):
