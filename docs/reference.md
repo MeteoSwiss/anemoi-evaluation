@@ -225,6 +225,9 @@ Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
 
+Observations at points have no config form yet: they are given from Python, see
+[`Evaluation`](#evaluation) and [observation operators](#observation-operators).
+
 ### Multi-dataset checkpoints
 
 A checkpoint trained on multiple datasets is scored as one evaluation per dataset, sharing one runner and
@@ -335,7 +338,8 @@ any other user of the anomaly statistics; an `acc` metric without it raises at c
 
 The framework accumulates per-element **statistics** and derives **metrics** from their weighted means.
 A statistic maps an `(M, V, N)` float32 prediction and a `(1, V, N)` target to a `(V, N)` float64 array,
-where `M` is the ensemble size, `V` the variables and `N` the nodes.
+where `M` is the ensemble size, `V` the variables and `N` the nodes. On point targets `N` is the `P`
+observation points of the frame's valid time, and everything below holds with points for nodes.
 
 ### Element masking and accumulated sums
 
@@ -345,7 +349,8 @@ For each frame, a node is *valid* for a variable when every member and the targe
 shared by all statistics of a frame, so every metric of a run covers exactly the same elements.
 
 With node weights `w` (float64, shape `(N,)`) and region masks `mask` (bool, `(N, R)`), write
-`W = w[:, None] * mask`. For every frame, for statistic `s`:
+`W = w[:, None] * mask`; on point targets `W` is `(P, R)`, built from the weights and masks of the
+frame's point set. For every frame, for statistic `s`:
 
 ```
 sums[s][lead, bin, v, r] += (valid[v] * s[v]) @ W[:, r]
@@ -685,6 +690,7 @@ The state holds float64 sums over the four axes `(lead_time, bin, variable, regi
 | `variable_coords` | dict name to list | Per-variable labels (`param`, `level`). |
 | `init_times` | list of datetime | Init times whose frames were added. |
 | `attrs` | dict | Result-file attributes. |
+| `out_of_domain` | int64 tensor `(L, B)` or `None` | Point targets only: the points the observation operator could not map, summed over the frames. `None` on the grid. |
 
 Shapes and dtypes are validated in `__post_init__`.
 
@@ -719,6 +725,8 @@ Data variables:
 | `state_sum_<statistic>` | `(lead_time, state_bin, variable, region)` | The raw float64 sums, one per statistic, for example `state_sum_correct_negative_<label>` when `pofd`, `sedi`, `odds_ratio` or `orss` asks for it. |
 | `state_weights` | `(lead_time, state_bin, variable, region)` | The raw weight sums. |
 | `state_n_init` | `(lead_time, state_bin)` | The raw frame counts. |
+| `out_of_domain` | `(lead_time, bin)` | Point targets only: points the operator's spatial step (`grid -> points`) could not map (no model node within `max_distance_km` for `Nearest`), counted once per frame, so a station outside the domain counts `n_init` times; with the `all` bin summed. These points have a NaN forecast and no weight. |
+| `state_out_of_domain` | `(lead_time, state_bin)` | Point targets only: the raw counter, read back by `load_state` and summed by `merge`. |
 
 The `all` bin is the elementwise sum over the stored bins, so its metrics are computed from the pooled
 sums, never by averaging per-bin metrics. `state_*` variables are the exact state and are what
@@ -745,8 +753,20 @@ Provenance:
 | `gpu`, `inference_chunks_processor`, `inference_chunks_mapper` | Recorded once the model is loaded; part of a run's numerical identity. |
 | `forecast` | `persistence` or `linear_interpolation`, from the baseline sources. |
 | `config` | The run's config as YAML; omitted when the objects cannot be serialised. |
-| `package_versions` | JSON of the installed `anemoi-evaluation`, `anemoi-inference`, `anemoi-models`, `anemoi-graphs`, `anemoi-datasets` and `torch` versions (null when absent). |
+| `package_versions` | JSON of the installed `anemoi-evaluation`, `anemoi-inference`, `anemoi-models`, `anemoi-graphs`, `anemoi-datasets`, `anemoi-transform`, `scipy` and `torch` versions (null when absent). |
 | `climatology`, `climatology_nonfinite_nodes` | JSON of `climatology.describe()` and of the non-finite node count per variable. |
+
+Point targets, written only by a run with an observation operator (they are recorded outside
+`config`, which such a run does not have):
+
+| Attr | Content |
+|---|---|
+| `observation_operator` | Canonical JSON (below) of the chain's `merge_identity()`: `{"steps": [...]}`, one entry per step (its `merge_identity()`: class, space, declarations and `parameters`), plus `constants`, the provider's `merge_identity()` (for `ArrayConstants`, the names and units and a sha256 of their names, units and values), when a step needs constants. Compared by `merge`. |
+| `point_targets` | Canonical JSON (below) of the targets' `merge_identity()`: what makes the observations what they are, without execution settings such as prefetch or cache sizes. `PointTargetSourceBase` returns its `describe()`, the class, the sizes and the attribute names only, so a source of your own should return what identifies its data. Compared by `merge`. |
+| `point_targets_description` | JSON of the targets' full `describe()`, for information; not compared. |
+| `observation_diagnostics` | Fixed point sets only: JSON of the chain's `diagnostics()` of the set, e.g. `{"nearest_node_max_km": ...}`, the largest distance in km from a point in the domain to its nearest node. For information: not compared by `merge`, which keeps the first input's. |
+
+`observation_operator` and `point_targets` are written by `output.identity_json`; see [what a merge identity may contain](#what-a-merge-identity-may-contain).
 
 Timing, in seconds:
 
@@ -801,6 +821,10 @@ unsharded control; that is a measurement of one configuration, not a guarantee.
 - overlapping `init_times` (the same init time counted twice);
 - inputs whose `dataset` attrs are not all the same (a multi-dataset run writes one file per dataset per
   shard, and each dataset merges on its own); results of a single-dataset checkpoint carry no `dataset` attr;
+- inputs that differ in `observation_operator` or `point_targets`, or carry one of them in some inputs
+  only (`output.IDENTITY_ATTRS`): they are part of what the numbers mean. Each is parsed and written
+  again by `identity_json` before the comparison, so key order and whitespace do not count;
+- a state scored against point targets with one scored on the grid;
 - a set of `shard` attrs that is neither all absent nor exactly the `0..n-1` of one run: a missing shard,
   a duplicate, disagreeing shard counts, a mix of tagged and untagged inputs, or a malformed tag. Inputs
   that all carry no tag (states built from the Python API, already-merged files) skip the check.
@@ -810,12 +834,38 @@ unsharded control; that is a measurement of one configuration, not a guarantee.
 Attributes of the merged state come from the first input, except: the timing attrs and the counters are
 summed, `peak_gpu_memory_bytes` is the maximum, `init_times` is the compressed union, `config` becomes
 `{"merge": [...]}` of every input's config, `merged_from` lists the input paths, and `shard` is dropped
-when the set is complete. Inputs carrying different `config` attrs produce a warning, not an error.
+when the set is complete. `point_targets_description` and `observation_diagnostics` are the first input's,
+and `out_of_domain` is summed. Inputs carrying different `config` attrs produce a warning, not an error.
+
+#### What a merge identity may contain
+
+An operator's `parameters()` and `merge_identity()`, a point target source's `merge_identity()` and a
+constants provider's `merge_identity()` become the `observation_operator` and `point_targets` attrs
+through `output.identity_json`, which sorts keys and writes values exactly. Allowed:
+
+- dicts with `str` keys, lists and tuples (as lists);
+- `None`, `bool`, `int`, `float`, `str`, numpy numbers and 0-d arrays or tensors (non-finite floats as
+  `NaN`, `Infinity`, `-Infinity`);
+- numpy arrays and tensors of bool, int, uint, float up to 64 bits or str, as `{"array": dtype, "shape":
+  [...], "values": [...]}`; above 64 elements (`output.IDENTITY_ARRAY_VALUES`), `"sha256"` replaces
+  `"values"`: the digest of the values' bytes in C order, little-endian;
+- paths as `{"__path__": as_posix()}`, `datetime` and `date` as `{"__datetime__": iso}` and
+  `{"__date__": iso}`, `timedelta` as `{"__timedelta__": [nanoseconds, "ns"]}` (pandas' timestamps and
+  durations keep their nanoseconds), `np.datetime64` and `np.timedelta64` as `{"__datetime64__": [text,
+  unit]}` and `{"__timedelta64__": [count, unit]}`.
+
+Dtype and shape count: `2` and `2.0`, a list and an array, float32 and float64, or `1 s` and `1000 ms`
+as `timedelta64` differ, which refuses a merge but never accepts a wrong one. The six tag keys, and a dict
+of exactly `array`, `shape` and `values` or `sha256`, are reserved: a dict written that way equals the
+value it imitates. Anything else (a set, an object, a masked array, a complex, object or datetime array,
+a non-`str` key) raises a `TypeError` naming where it is, when the operator is bound (the start of
+`run()`) and in `plan()`, before any frame is read; the operator is left unbound, so a second `run()`
+fails the same way. The identities encoded at bind are the ones the run writes.
 
 ## Python API
 
-`anemoi.evaluation.__all__` holds 26 names and is the public surface. Five of them are modules
-(`metrics`, `statistics`, `binning`, `weights`, `regions`), whose contents are public too. Every name not
+`anemoi.evaluation.__all__` holds 33 names and is the public surface. Six of them are modules
+(`metrics`, `statistics`, `binning`, `weights`, `regions`, `operators`), whose contents are public too. Every name not
 listed in this section is internal and may change without notice.
 
 ### Public surface
@@ -825,12 +875,45 @@ listed in this section is internal and may change without notice.
 ```python
 Evaluation(forecast, targets, init_times, lead_time, metrics, variables=None, weights=None,
            regions=None, bins=None, device=None, on_missing_target="skip",
-           include_lead_zero=False, climatology=None)
+           include_lead_zero=False, climatology=None, dataset=None,
+           observation_operator=None, constants=None)
 ```
 
 The object behind the config. Construction validates the arguments, checks the grids for compatibility,
 resolves the variables and calls `forecast.check_init_times(init_times, lead_time)`; it loads no model.
 Weights and regions given as specs are resolved on first use.
+
+**Point targets.** When `targets` is a [point target source](#source-protocols-and-base-classes),
+`observation_operator` is required: an [observation operator](#observation-operators) or a `Chain` that
+maps the gridded forecast to the points. Construction then:
+
+- wraps a deep copy of it in a `Chain` (so one instance can serve several evaluations) and refuses one bound
+  before, one that does not start on the grid and end on points, and one with a stencil other than
+  `valid_time`;
+- resolves the variables through the operator: by default the operator's outputs for the forecast's
+  variables that the targets have; `forecast_variables`, what the forecast is asked for, is
+  `input_variables(variables)` of the chain and must be among the forecast's variables;
+- refuses an operator needing a point attribute the targets' `point_attributes` lack. Only the steps that
+  run for the `forecast_variables` count: a step passed through (a `LapseRate("2t")` when `2t` is not
+  scored) needs no point attribute and no constant;
+- when a step that runs needs model constants: takes `constants` (a `ConstantsProvider`), which is then
+  required. It refuses a missing provider, a provider whose `names` lack a constant the operator needs,
+  and `constants` given to an operator none of whose steps needs constants;
+- parses the weights and regions once against the point targets: weights `uniform` (the default), `file`
+  or an array, the last two on a fixed point set only, shape-checked against it; regions `all`, `bbox` (on
+  the point coordinates), `graph_attribute` (read at each point's nearest node, any distance, never
+  interpolated), `file` or an array (fixed point set only); per-model-node specs (`graph_attribute` and
+  `spherical_voronoi` weights, `grid` regions) are refused;
+- refuses anomaly metrics and a climatology.
+
+`constants` without an operator is refused, and so is an operator other than `Identity` (alone or in a
+chain of identities, which is the gridded path itself) on gridded targets.
+
+The operator is bound to the forecast once, explicitly, by `begin()` (so by `run()`), `pairs()` and
+`attrs()`, so a constant of the wrong units, shape or grid fails there, before any model call, and
+`attrs()["observation_operator"]` is the same before and after a run. `plan()` binds a throwaway deep copy
+on the CPU instead: the same checks, the evaluation stays unbound, and a dry run of a `device="cuda"`
+evaluation works on a node without a GPU.
 
 | Method | Returns |
 |---|---|
@@ -842,12 +925,20 @@ Weights and regions given as specs are resolved on first use.
 | `model_calls_per_init()` | `tuple[int, timedelta]`: calls per init time and the lead time they compute. |
 | `variable_coords()` | `dict[str, list]`: `param` and `level` per variable. |
 | `attrs(init_times=None, timing=None)` | `dict` of result-file attributes. |
-| `to_config()` | `dict`, YAML-ready; raises when weights or regions were given as arrays. |
+| `to_config()` | `dict`, YAML-ready; raises when weights or regions were given as arrays, and with an observation operator (not yet in YAML). |
+| `point_weights(points)` | Point targets: `(P,)` float64 weights of a `PointSet`. |
+| `point_regions(points)` | Point targets: `dict[str, np.ndarray]` of `(P,)` bool masks of a `PointSet`. |
 | `close()` | `None`; releases the forecast, target and climatology sources. |
 | `Evaluation.from_config(config, forecast=None, targets=None, climatology=None)` | classmethod; a path, a dict or an `EvaluationConfig`, with the source arguments overriding the configured ones. Returns a `MultiEvaluation` when the run scores multiple datasets, and an `Evaluation` when the config's `datasets:` key selects one; `targets` and `climatology` may then be `{name: source}`. |
 
 Cached properties, resolved on first use: `weights -> np.ndarray`, `regions -> dict[str, np.ndarray]`,
-`aggregator -> Aggregator`.
+`aggregator -> Aggregator`. On point targets `weights` and `regions` are those of the fixed point set,
+`(P,)`, and raise on a varying one (use `point_weights` and `point_regions`); `aggregator` is
+`Aggregator.for_points`. `observation_operator` (a property, not cached) is the run's `Chain`, unbound
+until one of the calls above binds it, and `None` on the gridded path.
+
+`pairs()` on point targets yields the operator's output reduced to the scored variables, `(M, V, P)`
+with its `PointSet` in `frame.points`, and the observations `(1, V, P)` float32.
 
 `begin()`, `frames(init_time)`, `add_frame(state, frame, timer)`, `charge(...)` and `finish(...)` are the
 halves of `run()`, for a driver that feeds the frames itself; `MultiEvaluation` uses them.
@@ -865,6 +956,10 @@ halves of `run()`, for a driver that feeds the frames itself; `MultiEvaluation` 
 | `device` | `torch.device` | The resolved device. |
 | `on_missing_target`, `include_lead_zero` | str, bool | As configured. |
 | `timing`, `model_calls`, `peak_memory_bytes`, `climatology_nonfinite` | dict, int, int or `None`, dict | Set by `run()`. |
+| `dataset` | str or `None` | The dataset of a multi-dataset checkpoint this evaluation scores. |
+| `on_points` | bool | Whether the targets are a point target source. |
+| `forecast_variables` | `list[str]` | What the forecast is asked for: `variables` on the grid, the operator's inputs on points. |
+| `constants` | provider or `None` | The constants provider the operator reads, as given; `None` when none is given. |
 
 #### `MultiEvaluation`
 
@@ -922,22 +1017,48 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 | `bytes` | `{target_to_device, target_rows_read, cache_for_all_rows, frame, aggregator_weights, statistics_temporaries}`, plus `checkpoint_bytes` and `per_member_state_bytes` from an inference source and `climatology` when one is configured. |
 | `time` | Present only with `step_time`: `{step_time, model_per_init_s, shard: {model_s, wall_s}, run: {gpu_hours, wall_per_shard_s}, startup_s, note}`. |
 | `note` | Present only when the last model call computes past `lead_time`. |
+| `points` | Point targets only: `{fixed, max_points}`, plus, for a fixed set, `out_of_domain` (its point count outside the operator's domain) and `diagnostics` (the operator's `diagnostics()`, e.g. `nearest_node_max_km`); `note` when the point count is unknown. |
+| `observation_operator` | Point targets only: the `describe()` of a throwaway copy of the chain bound on the CPU, with the constants provider's `describe()`. |
+| `forecast_variables` | Point targets only: the variables the forecast is asked for. |
 | `shard` | `{index, count, output}`, added by the CLI, not by `plan()`. |
+
+On point targets the `bytes` sizes that scale with the points use the fixed set's size, else the source's
+`max_points`; with neither they are left out. `frame` stays the forecast frame on the grid, with the
+`forecast_variables`. Weights and regions are not resolved, on points as on the grid.
 
 #### Data model
 
 - `Grid(latitudes, longitudes)`, frozen dataclass; coordinates in degrees, flattened to float64 `(N,)`.
   `n`, `latlons_rad() -> (N, 2)` radians, `check_shape(array, what)`,
   `check_compatible(other, tolerance=1e-5)`.
-- `Frame(init_time, lead_time, valid_time, variables, data)`, frozen dataclass, `members` property.
-  `data` must be float32 `(M, V, N)` with one column per variable, and
-  `valid_time == init_time + lead_time`. The lead time is not checked for sign.
+- `Frame(init_time, lead_time, valid_time, variables, data, points=None)`, frozen dataclass, `members`
+  property. `data` must be float32 `(M, V, N)` with one column per variable, and
+  `valid_time == init_time + lead_time`. The lead time is not checked for sign. A frame mapped to
+  observation points has `(M, V, P)` data and its `PointSet` in `points`, whose size must match.
+- `PointSet(latitudes, longitudes, timedeltas=None, attributes={}, key=None)`, frozen dataclass: the `P`
+  observation points of one valid time. Coordinates in degrees, float64 `(P,)`, finite, latitudes in
+  `[-90, 90]`, any longitude convention; `timedeltas` float32 seconds `(P,)`, signed, relative to the
+  valid time, zeros by default; `attributes` a mapping of name to `(P,)` array (an elevation, an
+  observation type). Every array is copied and read-only. `n` and `len()`, `attribute(name)` (raises
+  naming the attributes present), and `identity`: `key` when given, else a sha256 of the coordinates,
+  timedeltas and attributes. Point sets with one identity share the driver's cached plan and `W`, so a
+  source passing an explicit `key` vouches that sets with that key are the same; the driver compares the
+  coordinates, timedeltas and attributes on reuse and raises when they differ. Non-zero `timedeltas` are
+  refused by the driver for now, any of them, float noise included: scoring a time offset needs a time
+  stencil, which the driver does not run yet. Leave `timedeltas` out, or zero, to score the points at the
+  valid time. The names follow anemoi-core's tabular payload keys.
 
 #### Aggregation
 
-- `Aggregator(weights, masks, statistics, binning, device=None)`: `n_regions`,
+- `Aggregator(weights, masks, statistics, binning, device=None, n_regions=None)`: `n_regions`,
   `new_state(lead_times, variables, regions, members, variable_coords=None) -> AggregationState`,
-  `add(state, frame, target, aux=None) -> None`.
+  `add(state, frame, target, aux=None, W=None, out_of_domain=0) -> None`.
+  `Aggregator.for_points(n_regions, statistics, binning, device=None)`, the same as `Aggregator(None,
+  None, statistics, binning, device, n_regions=n_regions)`, has no `W` of its own: each `add`
+  passes the `(P, R)` `W` of its frame's point set and the number of its points out of the operator's
+  domain, and its states carry `out_of_domain`. An aggregator with its own `W` refuses one per frame.
+- `aggregation.weight_matrix(weights, masks, device=None)`: `W = weights[:, None] * masks`, `(L, R)`
+  float64, for `L` nodes or points.
 - `AggregationState`: the dataclass of the [state table](#aggregationstate), plus
   `AggregationState.zeros(...)` (classmethod), `coords`, `lead_index(lead_time)`, `means()`,
   `merge(other)`, `to(device)`, `cpu()` and `to_xarray(metrics, attrs=None)`.
@@ -1022,6 +1143,10 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 - `ArrayTargets(grid, variables, fields)` and `FakeForecastSource(targets, timestep, members=1,
   drift=0.0, spread=0.0, frames_per_pass=1, device=None)`: in-memory synthetic sources for tests and
   notebooks.
+- `ArrayPointTargets(variables, observations, point_attributes=None)`: in-memory point targets from a
+  dict of valid time to `(PointSet, (V, P) array)`, the set varying; `ArrayPointTargets.fixed(points,
+  variables, fields)` one with the same `points` at every valid time. A valid time absent from the dict
+  raises `MissingTargetError`. `point_attributes` defaults to the attributes every point set carries.
 
 #### Other
 
@@ -1030,7 +1155,8 @@ uninstalled source tree).
 
 ### Source protocols and base classes
 
-Defined in `anemoi.evaluation.sources.base`. `MissingTargetError` is a `LookupError`.
+Defined in `anemoi.evaluation.sources.base`. `MissingTargetError` is a `LookupError`; it and `Observations`
+are also exported from the package root.
 
 `ForecastSource`: attributes `grid: Grid`, `variables: list[str]`, `members: int`,
 `device: torch.device | str | None`, `grid_indices`, `has_graph: bool`, `frames_per_pass: int`,
@@ -1078,13 +1204,224 @@ to_config() -> dict
 close() -> None
 ```
 
-`ForecastSourceBase`, `TargetSourceBase` and `ClimatologySourceBase` implement the optional capabilities
-with defaults: no device preference, no graph, no date check, no sub-grids, no lead-0 frame,
-`frames_per_pass = 1`, `model_calls` counting `frames_per_pass` evenly spaced lead times per call, empty
-`stats` and `provenance`, unknown `variable_info`, and `to_config()` raising.
-Their `describe()` reports the class name, the node count and the variable count, and the forecast base
-adds `members`. Helpers: `lead_time_steps(lead_time, timestep)`, `variable_info(variable)`,
+`PointTargetSource`: observations at points. Attributes `variables`, `point_attributes` (the per-point
+attributes every returned `PointSet` carries, checked against the operator's needs at construction),
+`fixed_points` (the `PointSet` when it is the same at every valid time, else `None`), `max_points` (the
+largest `P` when known, for the dry run's sizes), and:
+
+```python
+observations(valid_time: datetime, variables: list[str], device: torch.device) -> Observations
+    # Observations(points, values): values (1, V, P) float32, NaN where a record lacks a variable; one read;
+    # MissingTargetError when none
+available(valid_time: datetime) -> bool
+prefetch(valid_times: list[datetime], variables: list[str]) -> None
+prefetch_hint(frames_per_pass: int) -> None
+stats -> dict            # property
+close() -> None
+variable_info(name: str) -> dict
+to_config() -> dict
+describe() -> dict       # must not read observations
+merge_identity() -> dict # the result's point_targets attr: no execution settings; must not read observations
+```
+
+`Observations(points, values)` is a frozen dataclass; fields added later (an observation error, say) come
+with defaults, so a source written today keeps working. The driver checks every read: an `Observations`,
+values float32 `(1, V, P)`, the declared fixed set's identity when there is one, and no time offsets (a
+fixed set with time offsets is refused at construction); an empty `PointSet` counts as a missing target.
+`is_point_target(targets)` tells the two target kinds apart by an `observations` method.
+
+`ForecastSourceBase`, `TargetSourceBase`, `PointTargetSourceBase` and `ClimatologySourceBase` implement the
+optional capabilities with defaults: no device preference, no graph, no date check, no sub-grids, no
+lead-0 frame, `frames_per_pass = 1`, `model_calls` counting `frames_per_pass` evenly spaced lead times per call, empty
+`stats` and `provenance`, unknown `variable_info`, and `to_config()` raising; for point targets a varying
+set (`fixed_points = None`, `max_points` the fixed set's size else `None`), no attributes, everything
+available, and `merge_identity()` returning `describe()` ([what a merge identity may contain](#what-a-merge-identity-may-contain)). Their `describe()` reports the class name, the
+node count and the variable count, and the forecast base adds `members`; the point target base reports
+the variable count, `points` (the fixed set's size or `"varying"`) and `point_attributes`. Helpers:
+`lead_time_steps(lead_time, timestep)`, `variable_info(variable)` (defined in `anemoi.evaluation.variables`),
 `select_variables(requested, available)`.
+
+### Observation operators
+
+Defined in `anemoi.evaluation.operators` (the contract in `operators.base`). An observation operator maps
+gridded forecast frames to what was observed at the points of a `PointSet`. It is given to `Evaluation`
+as `observation_operator`, for point targets only.
+
+#### The contract
+
+Three phases, one per cache lifetime:
+
+```python
+bind(model: ModelSide) -> None
+    # once per run: what does not depend on the points (a KD-tree, constants on the device)
+prepare(points: PointSet, constants: Mapping[str, Constant]) -> plan
+    # once per point set: the driver keeps the plan, reused while PointSet.identity is the same
+apply(frames: Sequence[Frame], plan, valid_time: datetime) -> Frame
+    # per valid time: (M, V, N) frames to one (M, V', P) frame at valid_time, with output_variables(...)
+```
+
+`Chain` and the driver call `prepare`, `apply` and `map_constant` by keyword, so the parameter names above
+are part of the contract.
+
+`apply` is deterministic, works in float64 inside and returns float32, and never mixes members. A step
+receives the frame of the valid time only (the `valid_time` stencil). `prepare` gets the observation
+points whatever the step's space, and, for a `points -> points` step, its declared constants already
+mapped to the points. Declarations, attributes of the class or the instance:
+
+| Declaration | Default (`ObservationOperatorBase`) | Meaning |
+|---|---|---|
+| `input_space`, `output_space` | `points`, `points` | `grid -> grid`, `grid -> points` (a spatial step) or `points -> points`, the names `GRID` and `POINTS`. |
+| `reads` | `()` | Variables needed unchanged. |
+| `produces` | `()` | Variables added; a name the frames already hold raises. |
+| `touches` | `()` | Variables modified in place. Every variable not declared passes through, and a spatial step maps it. |
+| `stencil` | `"valid_time"` | `"bracketing"` declares the frames around each point's `valid_time + timedelta`; `Chain` supports it (tested on throwaway operators), the driver refuses it for now. The names are `VALID_TIME` and `BRACKETING`. Provisional: the stencil names and `time_window` may change when a driver buffers frames. |
+| `point_attributes` | `()` | Per-point attributes it reads from the `PointSet` (`elevation`). |
+| `constants` | `()` | `ConstantNeed(name, units)` entries: the model constants it needs, in those units. |
+
+A step that produces or touches something is needed only when one of those variables is: otherwise its
+reads are not asked for and it passes the frame through. A step that produces and touches nothing acts on
+every variable and always needs its reads.
+
+The other methods, with the base defaults:
+
+| Method | Default | Meaning |
+|---|---|---|
+| `map_constant(values, plan)` | kept for `grid -> grid`, raises otherwise | A spatial step maps an `(N,)` constant to `(P,)` as it maps a field. |
+| `out_of_domain(plan)` | `None` | `(P,)` bool of the points it cannot map (they must get a NaN forecast); `None` when it maps all. A `Chain` reads it from its spatial step only and refuses another dtype or shape. |
+| `diagnostics(plan)` | `{}` | Facts for the dry run and the `observation_diagnostics` attr of a fixed set (`nearest_node_max_km`); informational, never compared. |
+| `input_variables(outputs)`, `output_variables(inputs)` | from the declarations | The variables needed for `outputs`, and those of the output frame for `inputs`. |
+| `time_window(points)` | `(0, 0)` | Seconds relative to the valid time the frames must cover; provisional, as `stencil`. |
+| `parameters()` | the public scalar attributes | The constructor parameters: the instance attributes not starting with `_` that are int, float, str, bool, None (numpy numbers and 0-d tensors as Python scalars) or tuples or lists of them (as lists), without the declarations; once bound by a `Chain`, their values just before the bind, so state built in `bind` never counts. `Chain.bind` refuses any other public attribute (an array, a dict) of a step that keeps this default. Override it when a parameter is kept otherwise; an override may also return arrays and tensors ([what a merge identity may contain](#what-a-merge-identity-may-contain)). |
+| `describe()` | class, space, the declarations and `parameters` | For the dry run. |
+| `merge_identity()` | `describe()` with `parameters` | The result's `observation_operator` entry, which `merge` compares: everything that changes the mapped numbers ([what a merge identity may contain](#what-a-merge-identity-may-contain)). |
+| `to_config()` | raises | The YAML form, provisional: nothing reads it yet (operators are Python-only), so the shapes of the shipped operators may change when the YAML schema is designed. |
+| `output_frame(frames, valid_time, variables, data)` | static helper | A `Frame` at `valid_time` of the forecast the frames come from. |
+
+The contract grows without breaking operators: new inputs come as keyword arguments with defaults, and new
+return fields as dataclass fields with defaults (as `Observations`).
+
+The space and stencil names `GRID`, `POINTS`, `VALID_TIME` and `BRACKETING` are exported from
+`anemoi.evaluation.operators`. `ObservationOperator` is the protocol and `ObservationOperatorBase` the
+base class; `bind` of the base keeps the model side as `self.model`. `ModelSide(space, variables,
+grid=None, constants=None, variable_info=..., device="cpu")` is what a step is bound to: the space its
+input frames are in, the variables they can hold, the grid (grid space only), a `ConstantsProvider`
+serving exactly the step's declared constants (grid space only), the forecast's typed-variable lookup and
+the device.
+
+#### `Chain`
+
+`Chain(steps)` applies operators in order and is itself an operator; nested chains are flattened. The
+driver always wraps the given operator in one. Rules, checked at construction and at `bind`:
+
+- spaces connect step after step, so there is at most one `grid -> points` step (there is no way back),
+  and `grid -> grid` steps may come before it; on a gridded forecast the chain must start on the grid;
+- a produced name must be new along the chain; reads are resolved backwards through `input_variables`,
+  skipping the steps whose products are not needed;
+- constants: one units per name across the steps; the chain fetches those of the steps that run on
+  `ModelSide.variables` from the provider at `bind` (after `check_grid(grid)` when the provider has it),
+  checks their units against the `ConstantNeed` and their shape against the grid, and the spatial step
+  maps them to the points for the steps after it, so a `points -> points` step never sees the `(N,)`
+  field; a chain needing constants on a forecast in points space is refused;
+- a step passed through for the bound variables imposes nothing: it is not bound or prepared (its plan
+  is `None`), and its constants and point attributes are not asked for; frames on which it would run
+  after all raise;
+- at most one step has a stencil wider than the valid time;
+- every step's output is checked: the expected variables, the members, the valid time and the number of
+  points (or nodes, in grid space);
+- one instance, one model: `bind` refuses a chain or a step bound before, a deep copy of a bound one
+  included. `Evaluation` deep-copies the operator it is given before binding.
+
+Beyond the operator methods: `steps`, `bound`, `running(variables=None)` (per step, whether it runs on
+frames holding `variables`; without them, the bind's, or every step before it), `needs(variables=None)`
+(the point attributes and `ConstantNeed`s of the steps that run), `check_attributes(names,
+variables=None)` (raises unless the attributes `names` cover the needs of the steps that run),
+`prepare(points)` returning a `ChainPlan(points, plans, constants, out_of_domain)` (the points out of
+the domain of the spatial step; later steps give NaN where they cannot compute and are not counted),
+`diagnostics` merged over the steps that run, `merge_identity()`
+(`{"steps": [...], "constants": ...}`, the steps' `merge_identity()` and, only when a step that runs
+needs constants, the provider's) and
+`to_config()`, the list of the steps' configs (provisional).
+
+#### Shipped operators
+
+- `Identity()`: `grid -> grid`, returns the frame. Alone, or in a chain of identities, it is the gridded
+  path itself.
+- `Nearest(*, max_distance_km)`: `grid -> points`, the value of the nearest model node at each point, an
+  exact gather. `max_distance_km` is required and keyword-only: a point with no node within that
+  great-circle distance gets a NaN forecast and is in `out_of_domain()`; `None` maps every point, for a
+  global model. `diagnostics()` gives `nearest_node_max_km` over the points in the domain. The search is
+  `NearestNodes(grid)`, a KD-tree on unit-sphere coordinates built once at `bind`, with `query(points,
+  max_distance_km) -> (nodes, distance_km, in_domain)` (node 0 and distance infinity where out of the
+  domain); the Earth radius is anemoi-graphs' `EARTH_RADIUS`, 6371 km.
+- `LapseRate(variable="2t", *, rate=0.0065, elevation="elevation", orography="orography")`: `points ->
+  points`, `variable - rate * (elevation - orography)` in float64, `rate` in K/m. It touches `variable`
+  only, reads the point attribute `elevation` (metres, numeric) and needs the constant `orography` in
+  `m`, mapped by the spatial step before it. A non-finite elevation, or a point out of the domain, gives a
+  NaN forecast.
+
+#### Model constants
+
+A `Constant(name, values, units=None)` is a one-dimensional float64 array: `(N,)` on the model grid,
+`(P,)` once mapped. A `ConstantsProvider` serves them by name with `constant(name)` and `describe()`, and
+optionally `names` (checked against the operator's needs at construction), `check_grid(grid)` and
+`merge_identity()` (its entry in the `observation_operator` attr, `describe()` when absent; [what a merge identity may contain](#what-a-merge-identity-may-contain)). Serving a
+constant must not need the model loaded: the dry run binds the operator.
+
+- `ArrayConstants({name: Constant or (values, units)})`: in-memory arrays; `describe()` and
+  `merge_identity()` carry the names, the units and a sha256 of their names, units and values.
+
+`Evaluation` takes the provider as `constants`, required when a step that runs needs constants.
+
+#### Writing an operator
+
+Subclass `ObservationOperatorBase`, declare what the step reads and produces, and implement `apply`.
+A wind speed at the points, from the components `Nearest` has mapped there:
+
+```python
+import torch
+
+from anemoi.evaluation.operators import Chain, Nearest, ObservationOperatorBase
+
+
+class WindSpeed(ObservationOperatorBase):
+    """Wind speed `ws` at the points, from the `10u` and `10v` mapped there."""
+
+    reads = ("10u", "10v")
+    produces = ("ws",)  # points -> points, the base class default
+
+    def apply(self, frames, plan, valid_time):
+        frame = frames[0]
+        u, v = (frame.data[:, frame.variables.index(name)].double() for name in self.reads)
+        speed = torch.sqrt(u * u + v * v).float()
+        data = torch.cat([frame.data, speed[:, None]], dim=1)
+        return self.output_frame(frames, valid_time, self.output_variables(frame.variables), data)
+
+
+operator = Chain([Nearest(max_distance_km=5.0), WindSpeed()])
+```
+
+Scoring `ws` against point targets that have it asks the forecast for `10u` and `10v` only. What else to
+know:
+
+- whatever depends on the points goes in `prepare`, which returns the plan `apply` receives; whatever
+  depends on the model only goes in `bind` (call `super().bind(model)`);
+- a parameter that changes the numbers is kept as a public attribute set in `__init__` (`self.rate =
+  rate`), a scalar (numpy scalars count) or a tuple or list of them, so `parameters()`, and with it
+  `merge_identity()`, which `merge` compares, carries it; otherwise override `parameters()`, since
+  `Chain.bind` refuses any other public attribute (an array, a dict) of a step that does not. An
+  override may return arrays and tensors, and a table above 64 elements is recorded by its sha256
+  ([what a merge identity may contain](#what-a-merge-identity-may-contain)). Public
+  scalars set in `__init__` that are not parameters (a device string, a path) enter the identity too, so
+  prefix them with `_`. State built in `bind` is left out; give it a leading underscore all the same, so
+  that a step bound outside a `Chain` keeps it out too;
+- shipped constructors take their parameters by keyword (`LapseRate` takes the variable positionally);
+  do the same, so a parameter can be added later without breaking callers;
+- a spatial step (`grid -> points`) also implements `map_constant()` and, when some points cannot be
+  mapped, `out_of_domain()`, giving those points a NaN forecast;
+- the `Chain` checks the output's variables, members, valid time and size, so a step implements its own
+  logic only;
+- it stays Python-only: `to_config()` raises, so the result has no `config` attr and the operator is
+  recorded in `observation_operator` only.
 
 ### Internals (no compatibility promise)
 
@@ -1103,6 +1440,12 @@ Useful when reading the code or writing a tool against it, but not part of the p
 - The spec models `GraphAttributeSpec`, `SphericalVoronoiSpec`, `UniformSpec`, `FileSpec`, `BboxSpec`,
   `GridSpec`: one per weight and region spec.
 - `output.write(dataset, path)`: netcdf4 writer used by the CLI, creating parent directories.
+- `output.IDENTITY_ATTRS`: the attrs `merge` requires to be equal (`observation_operator`, `point_targets`);
+  `output.identity_json(value, what)` writes them, and `output.IDENTITY_ARRAY_VALUES` is its array threshold.
+- `point_scoring.PointScoring`: the point-target half of `Evaluation` (the chain and its bind, the plan
+  and `W` cache, weights and regions on points); `config.region_entries(regions, check_array)`: the
+  region parsing both paths share.
+- `operators.base.constants_digest(constants)`: the sha256 of the constants providers.
 - `evaluate.package_versions(packages=PACKAGES)`: the versions recorded in a result.
 - `evaluate.PhaseTimer(device=None)`: per-phase wall time with a CUDA synchronisation at each `mark`.
 - `evaluate.PHASES`, `evaluate.PACKAGES`: the phase and package name tuples.
@@ -1218,7 +1561,21 @@ Constraints the code enforces, with the message or behaviour:
   cost GPU memory linearly.
 - **Target datasets must have one member** (`shape[2] == 1`).
 - **Grids must match.** `Grid.check_compatible` raises unless forecast, target and climatology grids have
-  the same nodes within `1e-5` degrees.
+  the same nodes within `1e-5` degrees. Point targets are not on the grid and are not checked.
+- **Point targets, for now.** From the Python API only, through a `valid_time`-stencil operator that starts
+  on the grid and ends on points, on a gridded forecast. The contract expresses more than the driver runs:
+  it refuses bracketing stencils and, on gridded targets, any operator other than `Identity` (a
+  `grid -> grid` step before the spatial step on point targets is driven), and gives no point-space
+  `ModelSide`; `Chain` supports these and they are tested on throwaway operators only. Operator `to_config()` shapes are provisional. Not
+  yet: YAML for observations, tabular datasets, point-native forecast sources, ACC at points (anomaly
+  metrics and a climatology are refused at construction), time offsets (non-zero `timedeltas` are
+  refused), and per-station scores.
+- **The out-of-domain set depends on the model.** Two models on different limited-area domains score
+  different points through `Nearest` unless a region restricts both to the same ones; `out_of_domain`
+  says how many were missed.
+- **A varying point set builds its plan and `W` per point set.** The driver keeps `len(lead_times) + 1`
+  of them, which keeps every set until a later init time reuses its valid time; the memory is
+  `(L + 1) * P * R * 8` bytes of `W`.
 - **`lead_time` must be positive and fit the source's lead times**, as [lead times](#lead-times)
   says: a multiple of the timestep for a forecaster and the persistence source, at least the first
   output offset for an offset forecaster. One that ends before the model's last call does is allowed,
@@ -1276,8 +1633,9 @@ Constraints the code enforces, with the message or behaviour:
   raises `at least one region is required`.
 - **Serialisation.** `to_config()` raises for weights or regions given as arrays, for a target source
   opened with positional arguments other than a single mapping, for an in-memory climatology, and for any
-  source that does not implement it (`ArrayTargets`, `FakeForecastSource`). `Evaluation.attrs` then simply
-  omits the `config` attr.
+  source that does not implement it (`ArrayTargets`, `FakeForecastSource`), and for any evaluation with an
+  observation operator. `Evaluation.attrs` then simply omits the `config` attr; the operator and the point
+  targets have their own attrs.
 - **`merge` rules** are strict by design; see [merging](#merging). Merging results produced by different
   configs is possible (the shard tags allow it) but only warns.
 - **Empty shards** are legal: a warning is logged and a state of zeros is written, whose means are NaN.

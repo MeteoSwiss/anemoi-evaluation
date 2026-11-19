@@ -6,6 +6,20 @@
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.
+* Scoring against observations at points, from the Python API: point targets and an
+  `observation_operator` that maps the forecast to the points, through the same metrics, bins, sharding
+  and merging. Weights default to one per observation, and regions take boxes, graph attributes at the
+  nearest node and files. Point sets with time offsets are refused for now.
+* New `operators` module (the operator contract, its space and stencil names, `Chain`, `Nearest`,
+  `LapseRate` and the in-memory model constants provider `ArrayConstants`), the `PointTargetSourceBase`
+  and `ArrayPointTargets` point target sources, `Observations` and `PointSet`. `MissingTargetError` is
+  exported from the package root. `scipy` is a new dependency.
+* Results scored on points carry an `out_of_domain` counter, the points the spatial step cannot map,
+  and their operator, targets and diagnostics in their own attrs. `merge` refuses inputs that differ in
+  the operator's or the point targets' `merge_identity()`, which for an operator includes its
+  `parameters()`, compared as canonical JSON; an identity that cannot be recorded exactly is refused
+  when the operator is bound.
+* `package_versions` also records `anemoi-transform` and `scipy`.
 
 ## 0.4.0 — 2026-11-18
 
