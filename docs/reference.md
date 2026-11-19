@@ -535,7 +535,7 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | `crps` | `crps` or `{crps: {alpha: a}}` | `skill`, `pairs` | `mean(skill) - c(alpha, M) * mean(pairs)` | 2 |
 | `fair_crps` | `fair_crps` | `skill`, `pairs` | the same with `alpha = 1` | 2 |
 | `spread` | `spread` | `ensemble_variance` | `sqrt(mean(ensemble_variance))` | 2 |
-| `spread_skill` | `spread_skill` | `ensemble_variance`, `squared_error` | `sqrt(mean(ensemble_variance) / mean(squared_error))` | 2 |
+| `spread_skill` | `spread_skill` | `ensemble_variance`, `squared_error` | `sqrt(mean(ensemble_variance) / (mean(squared_error) - mean(ensemble_variance) / M))` | 2 |
 | `member_rmse` | `member_rmse` | `member_squared_error` | `sqrt(mean(member_squared_error))` | 1 |
 | `member_mae` | `member_mae` | `skill` | `mean(skill)` | 1 |
 | `acc` | `acc` | the three anomaly statistics | `mean(ap) / sqrt(mean(fas) * mean(tas))` | 1 |
@@ -582,6 +582,16 @@ Ensemble conventions: `bias`, `mae`, `rmse`, `spread_skill` and `acc` score the 
 `member_rmse` and `member_mae` score a randomly drawn member in expectation; `member_rmse` is never
 below `rmse`. A deterministic model is `M = 1`, where `member_squared_error` equals `squared_error` and
 the metrics needing 2 members are rejected at construction (`the metrics need at least N members`).
+
+`spread_skill` divides the spread by the **unbiased** RMSE of the ensemble mean: the squared error of the mean of
+`M` members drawn from the predictive distribution is `sigma^2 (1 + 1 / M)`, so `mean(ensemble_variance) / M` is
+subtracted from `mean(squared_error)` before the root (the WeatherBench-X `UnbiasedSpreadSkillRatio`; the mean is
+linear, so this needs no extra statistic). A calibrated ensemble gives 1 for any `M`, below 1 is under-dispersive
+and above 1 over-dispersive. `rmse` stays the plain RMSE of the ensemble mean, so `spread_skill` is not
+`spread / rmse`. Where the pooled `mean(squared_error) - mean(ensemble_variance) / M` is not positive, which happens
+with few samples or a strongly over-dispersive ensemble, the value is NaN, or inf when it is exactly zero. A merge
+recomputes every metric from the stored sums, so merging result files written before this change gives the new
+values; files that are only read keep their stored ones.
 
 For an ensemble, the twelve contingency scores (`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`,
 `pofd`, `sedi`, `odds_ratio`, `orss`, `f1`) and the cells they come from binarise the **ensemble mean** and
@@ -1255,7 +1265,8 @@ Constraints the code enforces, with the message or behaviour:
 - **`include_lead_zero` needs `supports_lead_zero`**, otherwise construction raises. A per-init-time
   `MissingTargetError` from `initial_frame` is caught and logged, and only that lead-0 frame is dropped.
   For an inference checkpoint, diagnostic variables are NaN at lead 0 and therefore excluded there by the
-  finiteness mask; `spread_skill` at lead 0 is NaN (0/0) for a perfect initial state.
+  finiteness mask; `spread_skill` at lead 0 is NaN (0/0) for a perfect initial state, as the unbiased denominator
+  `0 - 0 / M` is 0 too.
 - **Thresholds.** A threshold naming a variable the run does not have raises at `Evaluation` construction,
   where the variables are known; a run variable the map omits is not an error but reads as NaN in every
   threshold statistic and metric. A label must be non-empty and match `[A-Za-z0-9_]+`, a threshold value must

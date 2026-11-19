@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking
+
+* `spread_skill` now uses the unbiased RMSE of the ensemble mean (the WeatherBench-X `UnbiasedSpreadSkillRatio`). Merging older result files recomputes it with the new formula.
+
 ### Features
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the

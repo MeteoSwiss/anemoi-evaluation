@@ -333,7 +333,7 @@ for step, date, arrays in steps:
                     ref[key] = (w * crps).sum() / w.sum()
                 var = m.var(0, ddof=1)
                 ref["spread"] = np.sqrt((w * var).sum() / w.sum())
-                ref["spread_skill"] = ref["spread"] / ref["rmse"]
+                ref["spread_skill"] = ref["spread"] / np.sqrt(ref["rmse"] ** 2 - ref["spread"] ** 2 / M)
             if c is not None:
                 okc = ok & np.isfinite(c[j])
                 wc = weights[okc]
