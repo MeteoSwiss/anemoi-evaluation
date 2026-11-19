@@ -140,8 +140,8 @@ class SpreadSkill(Metric):
     For `M` members drawn from the predictive distribution the squared error of the ensemble mean exceeds the
     predictive variance by a factor `1 + 1 / M`; subtracting `ensemble_variance / M` (linear, so it applies to the
     means) removes that bias, and a calibrated ensemble gives 1 for every `M` (WeatherBench-X
-    `UnbiasedSpreadSkillRatio`). Where the pooled `mse - var / M` is not positive, which needs very few samples, the
-    value is NaN, or inf for exactly zero.
+    `UnbiasedSpreadSkillRatio`). Where the pooled `mse - var / M` is not positive, which happens with few samples or a
+    strongly over-dispersive ensemble, the value is NaN, or inf for exactly zero.
     """
 
     name = "spread_skill"

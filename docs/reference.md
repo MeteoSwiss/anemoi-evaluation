@@ -588,10 +588,11 @@ the metrics needing 2 members are rejected at construction (`the metrics need at
 subtracted from `mean(squared_error)` before the root (the WeatherBench-X `UnbiasedSpreadSkillRatio`; the mean is
 linear, so this needs no extra statistic). A calibrated ensemble gives 1 for any `M`, below 1 is under-dispersive
 and above 1 over-dispersive. `rmse` stays the plain RMSE of the ensemble mean, so `spread_skill` is not
-`spread / rmse`. Where the pooled `mean(squared_error) - mean(ensemble_variance) / M` is not positive, which needs
-very few samples (one init time and few nodes), the value is NaN, or inf when it is exactly zero; pooled over a
-bin it is positive in practice. A merge recomputes every metric from the stored sums, so merging result files written
-before this change gives the new values; files that are only read keep their stored ones.
+`spread / rmse`. Where the pooled `mean(squared_error) - mean(ensemble_variance) / M` is not positive, which happens
+with few samples or a strongly over-dispersive ensemble, the value is NaN, or inf when it is exactly zero. A merge
+recomputes every metric from the stored sums, so merging result files written before this change gives the new
+values; files that are only read keep their stored ones.
+
 For an ensemble, the twelve contingency scores (`pod`, `far`, `csi`, `ets`, `frequency_bias`, `hss`, `pss`,
 `pofd`, `sedi`, `odds_ratio`, `orss`, `f1`) and the cells they come from binarise the **ensemble mean** and
 therefore score it as a point forecast. That is not the same event as the deterministic sibling's: the mean

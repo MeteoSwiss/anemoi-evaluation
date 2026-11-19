@@ -4,12 +4,7 @@
 
 ### Breaking
 
-* `spread_skill` is now the spread over the unbiased RMSE of the ensemble mean,
-  `sqrt(mean(ensemble_variance) / (mean(squared_error) - mean(ensemble_variance) / M))` (the WeatherBench-X
-  `UnbiasedSpreadSkillRatio`). The former `spread / rmse` read `sqrt(M / (M + 1))`, not 1, for a perfectly
-  calibrated ensemble of `M` members; the new value is 1 for any `M`, so values rise by about `sqrt((M + 1) / M)`.
-  Result files written earlier keep their stored values, but merging them recomputes the metric with the new
-  formula. The layout of the result file is unchanged.
+* `spread_skill` now uses the unbiased RMSE of the ensemble mean (the WeatherBench-X `UnbiasedSpreadSkillRatio`). Merging older result files recomputes it with the new formula.
 
 ### Features
 
