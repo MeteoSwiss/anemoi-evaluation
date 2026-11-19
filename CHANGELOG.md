@@ -30,9 +30,10 @@
   nearest node and files. Point sets with time offsets and member groups are refused for now, and the
   variable metadata check skips point targets.
 * New `operators` module (the operator contract, its space and stencil names, `Chain`, `Nearest`,
-  `LapseRate` and the in-memory model constants provider `ArrayConstants`), the `PointTargetSourceBase`
-  and `ArrayPointTargets` point target sources, `Observations` and `PointSet`. `MissingTargetError` is
-  exported from the package root. `scipy` is a new dependency.
+  `LapseRate` and the model constants providers), `StationDatasetTargets` for a gridded station dataset
+  with unit conversion, the `PointTargetSourceBase` and `ArrayPointTargets` point target sources,
+  `Observations` and `PointSet`; the inference source serves its constant forcings, such as `z`, without
+  loading the model. `MissingTargetError` is exported from the package root. `scipy` is a new dependency.
 * Results scored on points carry an `out_of_domain` counter, the points the spatial step cannot map,
   and their operator, targets and diagnostics in their own attrs. `merge` refuses inputs that differ in
   the operator's or the point targets' `merge_identity()`, which for an operator includes its
