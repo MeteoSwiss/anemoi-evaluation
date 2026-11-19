@@ -13,6 +13,7 @@ import datetime
 import json
 from collections import OrderedDict
 from collections.abc import Hashable
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
@@ -41,6 +42,7 @@ from anemoi.evaluation.operators.base import ConstantsProvider
 from anemoi.evaluation.operators.base import Identity
 from anemoi.evaluation.operators.base import ModelSide
 from anemoi.evaluation.operators.base import ObservationOperator
+from anemoi.evaluation.operators.constants import ForecastConstants
 from anemoi.evaluation.operators.nearest import NearestNodes
 from anemoi.evaluation.output import identity_json
 from anemoi.evaluation.points import PointSet
@@ -121,10 +123,15 @@ def check_timedeltas(points: PointSet, where: str) -> None:
 
 
 def resolve_constants(
-    chain: Chain, constants: ConstantsProvider | None, forecast_variables: list[str]
+    chain: Chain,
+    constants: ConstantsProvider | None,
+    forecast: Any,
+    init_times: Sequence[datetime.datetime],
+    forecast_variables: list[str],
 ) -> ConstantsProvider | None:
-    """The constants provider of the run: `constants`, required when the steps that run need constants; refused when
-    no step of the operator needs any.
+    """The constants provider of the run: `constants`, or a `ForecastConstants` of the forecast at the first init
+    time when the steps that run need constants and none are given (a `ForecastConstants` given without a date is
+    replaced by a copy at that date); refused when no step of the operator needs any.
     The steps that run are those on frames holding `forecast_variables`: a step passed through needs nothing."""
     if not chain.constants:
         if constants is not None:
@@ -137,10 +144,11 @@ def resolve_constants(
     if not needed:
         return constants
     if constants is None:
-        raise ValueError(
-            f"the observation operator needs the model constants {[need.name for need in needed]}; pass "
-            "constants= with a provider that serves them, e.g. operators.ArrayConstants"
-        )
+        constants = ForecastConstants(forecast)
+    if isinstance(constants, ForecastConstants) and constants.date is None:
+        if not init_times:
+            raise ValueError("the forecast's model constants are read at the first init time, and there is none")
+        constants = constants.with_date(min(init_times))
     served = getattr(constants, "names", None)
     missing = [need.name for need in needed if served is not None and need.name not in served]
     if missing:
