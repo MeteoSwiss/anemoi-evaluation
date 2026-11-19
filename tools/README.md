@@ -6,7 +6,7 @@ Every path they touch is an argument; each script's module docstring says what i
 
 | script | what it does | GPU |
 |---|---|---|
-| `validate.py` | Scores one init time both through the framework and through a direct `runner.run()` loop (`runner.execute()`, one window, for a temporal downscaler) reduced in numpy float64, and reports the relative difference per metric, threshold metrics, the rank histogram and the reliability levels included. The reference for exactness. | yes |
+| `validate.py` | Scores one init time both through the framework and through a direct `runner.run()` loop (`runner.execute()`, one window, for a temporal downscaler) reduced in numpy float64, and reports the relative difference per metric, threshold metrics, the rank histogram and the reliability levels included. The reference for exactness. With `--stations`, scores against a gridded station dataset through `Nearest` (+ `LapseRate`) instead: mapped frames, sums (uniform and non-dyadic weights), counts, out-of-domain points and lead 0 against persistence are checked, and plausibility (lead-0 RMSE, station mean against elevation, outliers, gross values) is reported as `WARN` lines. | yes |
 | `ab_prefetch.py` | Runs the same config several times with different target prefetch depths, cache sizes and blosc settings, and reports the timing of each and whether the results are bit-identical. | yes |
 | `make_climatology.py` | Builds an hour-of-day (or month / day-of-year / constant) climatology netcdf from a config's target dataset, for the `acc` metric. | no |
 | `inspect_results.py` | Checks the mechanics of a results file (weights, exclusions, metric inequalities, lead 0, the threshold labels and their contingency identities, the rank histogram and its sum-to-one identity, the reliability diagram and the Brier decomposition identity, the ROC curve and the economic value) and prints its headline numbers. | no |
@@ -24,6 +24,8 @@ to 8 unless the environment already sets it.
 ```bash
 python tools/validate.py config.yaml --init 2024-01-02T00 --steps 2 --members 1 4
 python tools/validate.py config.yaml --init 2024-01-02T00 --lead 9h --lead-zero
+python tools/validate.py config.yaml --init 2024-03-01T00,2024-08-15T12 --lead 48h --stations stations.zarr \
+    --station-file stations.csv --obs-variable tre200s0=2t:offset=273.15 --lapse-rate
 python tools/ab_prefetch.py config.yaml --variants p2 p6 p6c2 p12 p6t
 python tools/make_climatology.py config.yaml --start 2024-01-01 --end 2024-01-31T18 -o climatology.nc
 python tools/inspect_results.py results.nc

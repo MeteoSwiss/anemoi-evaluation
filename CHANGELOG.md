@@ -40,6 +40,8 @@
   `parameters()`, compared as canonical JSON; an identity that cannot be recorded exactly is refused
   when the operator is bound.
 * `package_versions` also records `anemoi-transform` and `scipy`.
+* `tools/validate.py --stations` validates station targets through `Nearest` and `LapseRate` against
+  numpy.
 
 ### Changes
 
