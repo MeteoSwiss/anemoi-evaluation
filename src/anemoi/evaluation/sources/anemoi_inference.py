@@ -649,10 +649,11 @@ class InferenceForecastSource(ForecastSourceBase):
         device = self.run_config.get("device")
         configured = None if device is None else torch.device(str(device))
         if configured is not None and configured.type == "cuda" and configured.index is not None:
-            current = torch.cuda.current_device() if torch.cuda.is_available() else None
-            if configured.index != current:
+            # the same answer on every rank: only a task that sees just its own GPU may name it, as cuda:0
+            visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            if visible != 1 or configured.index != 0:
                 raise ValueError(
-                    f"device {device!r} is not this rank's GPU (cuda:{current}): set device: cuda, each rank then "
+                    f"device {device!r} names a GPU, and this task sees {visible}: set device: cuda, each rank then "
                     "takes its own"
                 )
         self.member_group = group

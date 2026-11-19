@@ -434,8 +434,9 @@ def _config(tmp_path, label: str, checkpoint, members: int, **overrides) -> dict
 def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch):
     """`run --member-group R` on R spawned gloo ranks writes the file of the unsplit run of the same config, bit
     for bit apart from the summed counters: a forecaster at R = 3 with the lead-0 frame, a climatology and a
-    threshold, with `V < R` (a rank scores no variable), with a missing target date skipped, over two datasets
-    (`V < R` in one), a temporal downscaler at R = 2, and a shard of a member group (R = 2) merges with the other shard of an unsplit run."""
+    threshold, with a missing target date skipped, over two datasets (`V < R` in one, so a rank scores none of its
+    variables), a temporal downscaler at R = 2, and a shard of a member group (R = 2) merges with the other shard of
+    an unsplit run."""
     import _multi_dataset as fixture
     import xarray as xr
     import yaml
@@ -464,7 +465,6 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
     }
     configs = {
         "era5": (_config(tmp_path, "era5", era5, 5, **thorough), "forecaster", era5, ("era5",)),
-        "narrow": (_config(tmp_path, "narrow", era5, 4, variables=["tp", "2t"]), "forecaster", era5, ("era5",)),
         "skip": (_config(tmp_path, "skip", era5, 4, on_missing_target="skip"), "forecaster", era5, ("era5",)),
         "both": (
             _config(
@@ -539,6 +539,7 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
 def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
     """The plan of rank 0 of a member group, the shards of a member-group step, and what a member group refuses."""
     import _multi_dataset as fixture
+    import xarray as xr
     import yaml
 
     from anemoi.evaluation.__main__ import main
@@ -588,17 +589,38 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
         main(["run", path(5), "--member-group", "2"])
     main(["run", path(5), "--member-group", "1", "--dry-run"])  # a group of one is the unsplit run
     assert "member_group:" not in capsys.readouterr().out
-    main(["run", path(5), "--member-group"])  # bare, in a step of one task: unsplit, no rendezvous
-    assert (tmp_path / "m5-0-1.nc").exists()
+    # bare, in a step of one task (srun forgotten): refused, before the flag or after the config
+    for argv in (["run", path(5), "--member-group"], ["run", "--member-group", path(5)]):
+        with pytest.raises(SystemExit, match=r"srun.*--member-group 1 to run unsplit"):
+            main(argv)
+    main(["run", path(5), "--member-group", "1"])  # explicit: the unsplit run, no rendezvous
+    with xr.open_dataset(tmp_path / "m5-0-1.nc") as written:
+        assert "member_ranks" not in written.attrs
     with pytest.raises(SystemExit, match="pass --member-group R"):
         main(["run", path(5), "--member-group", "--dry-run"])
+    monkeypatch.setenv("TORCHELASTIC_RUN_ID", "x")
+    with pytest.raises(SystemExit, match="RANK and WORLD_SIZE not"):
+        main(["run", path(5), "--member-group", "2"])
+    monkeypatch.delenv("TORCHELASTIC_RUN_ID")
+
+    # a device index is refused alike on every rank, unless the task sees only its own GPU and names it cuda:0
     indexed = Evaluation.from_config(path(5))
-    indexed.forecast.run_config["device"] = "cuda:1"
-    with pytest.raises(ValueError, match="is not this rank's GPU"):
-        indexed.split_members(MemberGroup(0, 2))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
-    indexed.split_members(MemberGroup(0, 2))  # the rank's own GPU, named
+    for device, visible, refused in (
+        ("cuda:0", 4, True),
+        ("cuda:1", 4, True),
+        ("cuda:1", 1, True),
+        ("cuda:0", 1, False),
+    ):
+        indexed.forecast.run_config["device"] = device
+        monkeypatch.setattr(torch.cuda, "device_count", lambda visible=visible: visible)
+        for rank in range(2):
+            monkeypatch.setattr(torch.cuda, "current_device", lambda rank=rank: rank)
+            if refused:
+                with pytest.raises(ValueError, match=f"names a GPU, and this task sees {visible}"):
+                    indexed.split_members(MemberGroup(rank, 2))
+            else:
+                indexed.split_members(MemberGroup(rank, 2))
     indexed.close()
 
     # the CUDA device of a task: its own when it sees one, else its local rank, refused beyond the visible ones
@@ -622,8 +644,9 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
 
 def test_task_env_and_rendezvous_from_slurm():
     """The launcher of the process gives its rank: torchrun when it started it, else srun; without `MASTER_ADDR` and
-    `MASTER_PORT` a member group meets at the first host of the step and port 15000 plus the job id modulo 10000, the
-    job-array task's own; set, they win, each on its own."""
+    `MASTER_PORT` a member group meets at the first host of the step and a port below the ephemeral range from the job
+    id (a job-array task's own) and the step id, so concurrent steps of a job meet apart; set, they win, each on its
+    own."""
     from anemoi.evaluation.distributed import first_host
     from anemoi.evaluation.distributed import rendezvous
     from anemoi.evaluation.distributed import task_env
@@ -632,16 +655,24 @@ def test_task_env_and_rendezvous_from_slurm():
     assert task_env(step) == (5, 8, 1) and task_env({**step, "RANK": "0", "WORLD_SIZE": "1"}) == (5, 8, 1)
     torchrun = {"TORCHELASTIC_RUN_ID": "x", "RANK": "3", "WORLD_SIZE": "4", "LOCAL_RANK": "3"}
     assert task_env({**step, **torchrun}) == (3, 4, 3) and task_env({"RANK": "1", "WORLD_SIZE": "2"}) == (0, 1, 0)
+    with pytest.raises(ValueError, match="TORCHELASTIC_RUN_ID is set but WORLD_SIZE not"):
+        task_env({**step, "TORCHELASTIC_RUN_ID": "x", "RANK": "3"})
 
     assert first_host("nid002812") == "nid002812" and first_host("nid[002812-002813]") == "nid002812"
     assert first_host("nid[002900,002812-002813]") == "nid002900" and first_host("a[1-2],b3") == "a1"
     assert first_host("x1,y[2-3]") == "x1" and first_host("rack[1-2]-node[07-08]") == "rack1-node07"
     job = {"SLURM_JOB_NODELIST": "nid[002812-002815]", "SLURM_JOB_ID": "426031"}
-    assert rendezvous(job) == ("nid002812", 21031)
-    assert rendezvous({**job, "SLURM_STEP_NODELIST": "nid[002814-002815]"}) == ("nid002814", 21031)
+    assert rendezvous(job) == ("nid002812", 15496)  # 15000 + 16 * 31, no step id (the batch script)
+    in_step = {**job, "SLURM_STEP_ID": "2", "SLURM_STEP_NODELIST": "nid[002814-002815]"}
+    assert rendezvous(in_step) == ("nid002814", 15498)
+    assert rendezvous({**in_step, "SLURM_STEP_ID": "3"}) == ("nid002814", 15499)  # a concurrent step of the job
     task = {**job, "SLURM_JOB_ID": "426033", "SLURM_ARRAY_JOB_ID": "426031", "SLURM_ARRAY_TASK_ID": "2"}
-    assert rendezvous(task) == ("nid002812", 21033)
-    assert rendezvous({**job, "SLURM_JOB_ID": "9999"}) == ("nid002812", 24999)
+    assert rendezvous(task) == ("nid002812", 15528)  # another job's steps are 16 ports apart
+    ports = {
+        rendezvous({**job, "SLURM_JOB_ID": str(j), "SLURM_STEP_ID": str(s)})[1] for j in range(1000) for s in range(16)
+    }
+    assert len(ports) == 16000 and min(ports) == 15000 and max(ports) < 32768
+    assert rendezvous({**job, "SLURM_STEP_ID": "4294967294"})[1] == 15496 + 14  # Slurm's batch step id
     assert rendezvous({**job, "MASTER_ADDR": "10.0.0.1", "MASTER_PORT": "29500"}) == ("10.0.0.1", 29500)
     assert rendezvous({**job, "MASTER_PORT": "29500"}) == ("nid002812", 29500)
     assert rendezvous({"MASTER_ADDR": "h", "MASTER_PORT": "1234"}) == ("h", 1234)

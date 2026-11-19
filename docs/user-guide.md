@@ -883,13 +883,16 @@ srun --kill-on-bad-exit=1 anemoi-evaluation run config.yaml --member-group
 ```
 
 A bare `--member-group` makes all the tasks of the step one group; `--member-group R` must equal
-their number (`srun`'s, or `torchrun`'s `WORLD_SIZE`). The ranks meet at rank 0's node: under
-Slurm the first host of the step and port `15000` plus the job id modulo 10000, so the tasks of a
-job array, each a job of its own, meet on different ports even on one node. `MASTER_ADDR` and
+their number (`srun`'s, or `torchrun`'s `WORLD_SIZE`). A bare flag in a step of one task, as when
+`srun` is forgotten, is refused rather than run all the members on one GPU; `--member-group 1`
+runs unsplit on purpose. The ranks meet at rank 0's node: under Slurm the first host of the step
+and port `15000 + 16 * (job id % 1000) + step id % 16`, so concurrent steps of one job, and the
+tasks of a job array (each a job of its own), meet on different ports even on one node. `MASTER_ADDR` and
 `MASTER_PORT` override them; outside Slurm they are required. With CUDA a task that sees one GPU
 (`--gpus-per-task=1`) takes it, and tasks that share a node's GPUs take the GPU `SLURM_LOCALID`;
 more tasks on a node than GPUs are refused. Leave `device: cuda` in the inference block without an
-index (an index other than the rank's GPU is refused); the ranks talk over NCCL, otherwise over gloo.
+index: an index is refused on every rank when a task sees several GPUs (`cuda:0` passes only when
+the task sees its own GPU alone); the ranks talk over NCCL, otherwise over gloo.
 `--kill-on-bad-exit=1` matters: a failing rank aborts the group, but a rank already waiting for it
 inside NCCL only notices when Slurm kills the step.
 
@@ -1077,6 +1080,7 @@ Dates, grids, variables and merging:
 | `cannot merge states that share init times`, `duplicate shards of n` | the same result would be counted twice |
 | `cannot merge states with different coordinates or statistics` | the inputs came from different configs |
 | `--member-group R needs as many tasks in the step` | start the run with `srun` (or `torchrun`) and `R` tasks, `--member-group "$SLURM_NTASKS"` |
+| `a bare --member-group takes the group size from the tasks of the step` | the run is one task: start it with `srun` and one task per rank, or pass `--member-group 1` to run unsplit |
 | `a member group needs MASTER_ADDR and MASTER_PORT in the environment` | outside Slurm, export rank 0's host and a free port, as in [member-parallel runs](#member-parallel-runs) |
 | `the ranks run on different GPU models [...]` | the group spans GPU models (mixed nodes), whose members are not bit-identical; constrain the job to one GPU model |
 

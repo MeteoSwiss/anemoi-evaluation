@@ -20,7 +20,7 @@ The console script `anemoi-evaluation` (entry point `anemoi.evaluation.__main__:
 subcommands. A subcommand is required.
 
 ```
-anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group R] [--dry-run] [--step-time seconds]
+anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group [R]] [--dry-run] [--step-time seconds]
 anemoi-evaluation merge <results.nc>... -o <merged.nc> [--partial]
 ```
 
@@ -32,7 +32,7 @@ Runs an evaluation from a YAML config and writes the results netcdf.
 |---|---|---|---|
 | `config` | path, positional, required | n/a | YAML config, loaded by `load_config` (`base:` chain and `from_checkpoint:` blocks resolved first). |
 | `--shard i/n` | string `i/n` | Slurm auto-detection, else `0/1` | Evaluate init times `i`, `i+n`, `i+2n`, ... and write `output.path` with `{shard}` / `{shards}` filled in. See [Sharding](#sharding). |
-| `--member-group [R]` | int, optional | unset | Split the members of every init time over the `R` tasks of the step, one GPU each, and write the result from rank 0; a bare `--member-group` takes `R` from the step's task count, and `R = 1` is the unsplit run. The tasks are then not shards: only `--shard` and the job array shard. With `--dry-run`, plan rank 0 of `R` (`R` required). See [member-parallel runs](#member-parallel-runs). |
+| `--member-group [R]` | int, optional | unset | Split the members of every init time over the `R` tasks of the step, one GPU each, and write the result from rank 0; a bare `--member-group` takes `R` from the step's task count and is refused in a step of one task, and `R = 1` is the unsplit run. A bare flag may also come before the config. The tasks are then not shards: only `--shard` and the job array shard. With `--dry-run`, plan rank 0 of `R` (`R` required). See [member-parallel runs](#member-parallel-runs). |
 | `--dry-run` | flag | off | Resolve the config and the sources, check the dates, print the plan as YAML on stdout, and exit without loading a model or running it. |
 | `--step-time seconds` | float | unset | Seconds of model time per model call per member; adds the `time` block to the plan. Only valid with `--dry-run`. `docs/benchmarks.md` section 3 reports measured values; one call of a multi-step-output model produces several frames. |
 
@@ -40,7 +40,7 @@ Order of operations in `run`:
 
 1. `--step-time` without `--dry-run` raises `SystemExit("--step-time is only used by --dry-run")`.
 2. The config is loaded. With `--member-group R` and without `--dry-run`, a step whose task count is not
-   `R` raises `SystemExit`, and so does a bare `--member-group` with `--dry-run`. With CUDA and several
+   `R` raises `SystemExit`, and so does a bare `--member-group` with `--dry-run` or in a step of one task. With CUDA and several
    visible devices the task's device is set to `LOCAL_RANK` or `SLURM_LOCALID`, and a local rank without a
    device of its own raises `SystemExit`; a task that sees one device (`--gpus-per-task=1`) keeps it. The shard is resolved, and without `--dry-run` a config with no `output.path`
    raises `SystemExit("the config needs output.path to run from the command line")`.
@@ -90,8 +90,8 @@ merged file carries the same metric variables as its inputs. See
 | `SLURM_STEP_NUM_TASKS` | `resolve_shard`, `task_env` | Tasks per job step; the per-step shard count, or the size of a member group. Default 1. |
 | `SLURM_PROCID` | `resolve_shard`, `task_env` | Task rank within the step. Default 0. |
 | `SLURM_LOCALID` | `task_env` | Node-local task rank, the CUDA device of a member-group rank. Default 0. |
-| `RANK`, `WORLD_SIZE`, `LOCAL_RANK` | `task_env` | torchrun's rank, task count and local rank, read for a member group only when torchrun started the process (`TORCHELASTIC_RUN_ID` set); they then take precedence over the Slurm ones. |
-| `MASTER_ADDR`, `MASTER_PORT` | `rendezvous` | Rank 0's address and a free port, where a member group meets (`tcp://`). Each one unset comes from Slurm: the first host of `SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`, and `15000 + SLURM_JOB_ID % 10000`, below the ephemeral ports; a job-array task has its own `SLURM_JOB_ID`. Required with `--member-group` outside Slurm. |
+| `RANK`, `WORLD_SIZE`, `LOCAL_RANK` | `task_env` | torchrun's rank, task count and local rank, read for a member group only when torchrun started the process (`TORCHELASTIC_RUN_ID` set); they then take precedence over the Slurm ones, and `RANK` and `WORLD_SIZE` are required. |
+| `MASTER_ADDR`, `MASTER_PORT` | `rendezvous` | Rank 0's address and a free port, where a member group meets (`tcp://`). Each one unset comes from Slurm: the first host of `SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`, and `15000 + 16 * (SLURM_JOB_ID % 1000) + SLURM_STEP_ID % 16` (step id 0 when unset or not a number), below the ephemeral ports; concurrent steps of a job differ in `SLURM_STEP_ID`, and a job-array task has its own `SLURM_JOB_ID`. Required with `--member-group` outside Slurm. |
 | `SLURM_ARRAY_TASK_ID` | `resolve_shard` | Job-array task id. Default 0. |
 | `SLURM_ARRAY_TASK_MIN` | `resolve_shard` | Lowest job-array id, subtracted from the task id. Default 0. |
 | `SLURM_ARRAY_TASK_COUNT` | `resolve_shard` | Number of job-array tasks. Default 1. |
@@ -1217,7 +1217,7 @@ fail at once. Over NCCL a rank already inside a collective waits for NCCL's time
 its abort for `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, so run the step with `srun --kill-on-bad-exit=1`.
 
 Refused, with a `SystemExit` from the CLI: a step whose task count is not `R`, one member, fewer members
-than ranks, a forecast source other than `anemoi_inference`, a `device: cuda:N` other than the rank's GPU, more tasks on a
+than ranks, a forecast source other than `anemoi_inference`, a `device: cuda:N` when the task sees several GPUs (only `cuda:0` with one visible GPU passes, the same on every rank), a bare `--member-group` in a step of one task, more tasks on a
 node than visible GPUs (when a task sees several), no `MASTER_ADDR` or `MASTER_PORT` outside Slurm,
 and ranks on different GPU models.
 

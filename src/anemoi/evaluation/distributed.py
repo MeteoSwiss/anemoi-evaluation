@@ -65,6 +65,9 @@ def task_env(env: Mapping[str, str] | None = None) -> tuple[int, int, int]:
     `SLURM_LOCALID` in a job step, else one task. A stray `RANK` or `WORLD_SIZE` is ignored."""
     env = os.environ if env is None else env
     if "TORCHELASTIC_RUN_ID" in env:
+        missing = [name for name in ("RANK", "WORLD_SIZE") if name not in env]
+        if missing:
+            raise ValueError(f"TORCHELASTIC_RUN_ID is set but {' and '.join(missing)} not: start the run with torchrun")
         return int(env["RANK"]), int(env["WORLD_SIZE"]), int(env.get("LOCAL_RANK", 0))
     if "SLURM_STEP_NUM_TASKS" in env:
         return int(env.get("SLURM_PROCID", 0)), int(env["SLURM_STEP_NUM_TASKS"]), int(env.get("SLURM_LOCALID", 0))
@@ -74,8 +77,9 @@ def task_env(env: Mapping[str, str] | None = None) -> tuple[int, int, int]:
 def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
     """Address and port of rank 0 where a member group meets: `MASTER_ADDR` and `MASTER_PORT` when set, each on its
     own, else under Slurm the first host of the step (`SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`) and port
-    `15000 + SLURM_JOB_ID % 10000`, below the ephemeral ports. A job-array task has a job id of its own, so the groups
-    of one array that share a node meet on different ports. Outside Slurm both must be set."""
+    `15000 + 16 * (SLURM_JOB_ID % 1000) + SLURM_STEP_ID % 16`, below the ephemeral ports (32768 and up). Concurrent
+    steps of one job, and the tasks of a job array (each a job of its own), that share a node meet on different ports.
+    Outside Slurm both must be set."""
     env = os.environ if env is None else env
     address, port = env.get("MASTER_ADDR"), env.get("MASTER_PORT")
     nodes = env.get("SLURM_STEP_NODELIST") or env.get("SLURM_JOB_NODELIST")
@@ -83,7 +87,8 @@ def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
     if not address and nodes and job:
         address = first_host(nodes)
     if not port and job:
-        port = str(15000 + int(job) % 10000)
+        step = env.get("SLURM_STEP_ID", "0")
+        port = str(15000 + 16 * (int(job) % 1000) + (int(step) if step.isdigit() else 0) % 16)
     if not address or not port:
         raise ValueError(
             "a member group needs MASTER_ADDR and MASTER_PORT in the environment, the address and a free port of "
@@ -104,27 +109,22 @@ def first_host(nodes: str) -> str:
     return re.sub(r"\[([^\]]*)\]", lambda match: match.group(1).split(",")[0].split("-")[0], nodes)
 
 
-def init_group(
-    group: MemberGroup,
-    device: torch.device,
-    timeout: datetime.timedelta = GROUP_TIMEOUT,
-    backend: str | None = None,
-) -> None:
-    """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise (or `backend`), rendezvous at
+def init_group(group: MemberGroup, device: torch.device) -> None:
+    """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise, rendezvous at
     `rendezvous()`, then a collective over every rank, so that every rank is up before the model loads and every later
     batch of sends and receives may leave ranks out (NCCL needs all of them in the first one). The collective gathers
     the device names, and ranks on different GPU models are refused there rather than after the run. With NCCL the
     CUDA device must be set first."""
     address, port = rendezvous()
-    backend = backend or ("nccl" if device.type == "cuda" else "gloo")
-    nccl = backend == "nccl"
+    nccl = device.type == "cuda"
+    backend = "nccl" if nccl else "gloo"
     LOG.info("rank %d of %d joins the member group at %s:%d (%s)", group.rank, group.size, address, port, backend)
     dist.init_process_group(
         backend,
         init_method=f"tcp://{address}:{port}",
         rank=group.rank,
         world_size=group.size,
-        timeout=timeout,
+        timeout=GROUP_TIMEOUT,
         **({"device_id": torch.device("cuda", torch.cuda.current_device())} if nccl else {}),
     )
     names = [None] * group.size
