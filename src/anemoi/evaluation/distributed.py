@@ -111,6 +111,7 @@ def init_group(
     address, port = rendezvous()
     backend = backend or ("nccl" if device.type == "cuda" else "gloo")
     nccl = backend == "nccl"
+    LOG.info("rank %d of %d joins the member group at %s:%d (%s)", group.rank, group.size, address, port, backend)
     dist.init_process_group(
         backend,
         init_method=f"tcp://{address}:{port}",
