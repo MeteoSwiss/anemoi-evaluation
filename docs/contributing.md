@@ -85,6 +85,7 @@ makes importable.
 | `test_real_sources.py` | `DatasetTargets` reads and member seeding against a stand-in anemoi dataset |
 | `test_temporal_downscaler.py` | temporal downscalers on anemoi-inference's real downscaler runner over the fixture checkpoint with a fake model, and the linear-interpolation baseline against a hand computation |
 | `test_multi_dataset.py` | the two-dataset fixture runner (`tests/_multi_dataset.py`, `tests/fixtures/multi-dataset/`), the per-dataset views, the refusals, the per-dataset config forms, and the end-to-end equality of a two-dataset run with the two single-dataset runs of the same fake |
+| `test_member_parallel.py` | the member-parallel building blocks on gloo in spawned CPU processes: the block partition, the member-to-variable swap, restricted threshold statistics, the gathered state against the unsplit one bit for bit (including `V < R` and a subgroup), the attrs rules and the group abort |
 | `test_offset_forecaster.py` | an offset forecaster on the fixture runner: lead times and model calls from its offsets, the init-time check on its input offsets, the per-call reseeding, and the dry run, sharding and `merge` on the irregular lead-time axis |
 
 The GPU and real-data paths are therefore not covered by `pytest`. They are covered by the
