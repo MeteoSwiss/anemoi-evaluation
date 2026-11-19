@@ -76,8 +76,8 @@ climatology source on a different grid (FR-8).
 float32 tensor, and validates all of it on construction: rank, dtype, the variable count against
 the columns, and `valid_time == init_time + lead_time`.
 
-The `(M, V, N)` layout is chosen so that the reduction over nodes is one matrix product
-`(V, N) @ (N, R)` that produces every region at once, and because both real sources deliver
+The `(M, V, N)` layout is chosen so that the reduction over nodes is one matrix-vector product
+`(N,) @ (N, R)` per variable that produces every region at once, and because both real sources deliver
 `(V, N)` natively: zarr rows are `(variables, ensemble, cells)` and the runner yields one `(N,)`
 column per variable, stacked once.
 
@@ -272,15 +272,16 @@ states that share an init time, since a shard merged twice would double its weig
 float64 matrix `W = w[:, None] * masks` on the device. For each frame it computes the shared
 validity mask `isfinite(pred).all(0) & isfinite(target[0])`, adds `valid.double() @ W` to the
 weights, and for every statistic adds `where(valid, statistic.compute(...), 0) @ W` to its sums
-(FR-18, FR-19). It computes the ensemble mean once per frame and, with a climatology, the two
-anomaly fields and the finite mask once, passing them to the statistics through `aux`; a statistic
-whose declared `aux` is missing raises rather than silently computing something else. `aux` is rebuilt for
-each frame and handed to every statistic of that frame by reference, so a statistic may also put an
-intermediate of its own in it for the others to reuse (the rank bins share `rank_below` and `rank_ties`
-that way, the reliability levels of one label the exceedance count and the observed event); the mapping does
-not outlive the frame, which is what makes the sharing safe without a cache key. Within a frame the key must
-still carry everything that changes the value: the level statistics key on the label because one label
-carries one threshold map across a config, and a family without that property would have to key on the
+(FR-18, FR-19), one variable at a time (`Aggregator.reduce`). It computes the ensemble mean once per
+frame and, with a climatology, the two anomaly fields and the finite mask once, passing them to the
+statistics through `aux`; a statistic whose declared `aux` is missing raises rather than silently
+computing something else. `aux` is rebuilt for each frame and handed to every statistic of that
+frame by reference, so a statistic may also put an intermediate of its own in it for the others to
+reuse (the rank bins share `rank_below` and `rank_ties` that way, the reliability levels of one
+label the exceedance count and the observed event); the mapping does not outlive the frame, which is
+what makes the sharing safe without a cache key. Within a frame the key must still carry everything
+that changes the value: the level statistics key on the label because one label carries one
+threshold map across a config, and a family without that property would have to key on the
 thresholds too.
 
 ### 3.8 Weights, regions, bins
@@ -434,10 +435,13 @@ costs terabytes and an intermediate format that the comparison would then depend
 records, so the evaluation period is whatever the run configuration opened (FR-9). Same grid, same
 units, no regridding (FR-8).
 
-**Float64 per-element sums and a matrix-product node reduction.** Statistics return float64 and the
-reduction over nodes is `values.double() @ W`, which produces every region in one operation and
-which TF32 cannot touch (NFR-1). The package sets no global precision knob (NFR-7), and the cost is
-milliseconds against seconds of model time (NFR-9).
+**Float64 per-element sums and a per-variable node reduction.** Statistics return float64 and the
+reduction over nodes is `values[v].double() @ W` for each variable `v`, which produces every region in
+one operation and which TF32 cannot touch (NFR-1). One product over all the variables would be faster,
+but BLAS may group its terms differently with the number of variables, so a variable's sums would
+change in the last bits with the other variables of the frame; per variable they do not, and a run
+scored on a subset of the variables gives the same sums as the full run. The package sets no global
+precision knob (NFR-7), and the cost is milliseconds against seconds of model time (NFR-9).
 
 **One shared validity mask per frame.** The mask is computed from the members and the target
 together and drives both the statistic sums and the weight sum, so `sums / weights` is always a

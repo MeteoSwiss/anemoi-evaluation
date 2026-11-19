@@ -170,6 +170,12 @@ class Aggregator:
         """Number of region masks."""
         return self.W.shape[1]
 
+    def reduce(self, values: torch.Tensor) -> torch.Tensor:
+        """(V, N) -> (V, R) float64 weighted sums over the nodes of every region, one matrix-vector product per
+        variable, so a variable's sums do not depend on which other variables the frame holds; one product over all of
+        them may group the terms differently with the variable count, which changes the last bits."""
+        return torch.stack([row @ self.W for row in values.double()])
+
     def new_state(
         self,
         lead_times: list[datetime.timedelta],
@@ -214,13 +220,13 @@ class Aggregator:
             forecast, truth, finite = anomalies(aux["ensemble_mean"], target[0], climatology)
             aux.update(forecast_anomaly=forecast, target_anomaly=truth, climatology_finite=finite)
         valid = torch.isfinite(pred).all(0) & torch.isfinite(target[0])
-        state.weights[lead, time_bin] += valid.double() @ self.W
+        state.weights[lead, time_bin] += self.reduce(valid)
         for name, statistic in self.statistics.items():
             missing = [key for key in statistic.aux if key not in aux]
             if missing:
                 raise ValueError(f"statistic {name} needs {missing} in aux")
             values = torch.where(valid, statistic.compute(pred, target, aux), 0.0)
-            state.sums[name][lead, time_bin] += values.double() @ self.W
+            state.sums[name][lead, time_bin] += self.reduce(values)
         state.n_init[lead, time_bin] += 1
         if frame.init_time not in state.init_times:
             state.init_times.append(frame.init_time)
