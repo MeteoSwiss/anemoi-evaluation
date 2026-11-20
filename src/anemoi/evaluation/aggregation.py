@@ -171,10 +171,11 @@ class Aggregator:
         return self.W.shape[1]
 
     def reduce(self, values: torch.Tensor) -> torch.Tensor:
-        """(V, N) -> (V, R) float64 region sums, one product per variable so the other variables cannot change them."""
+        """(V, N) -> (V, R) float64 region sums, one product per variable on a fresh copy of its row, so neither the
+        other variables nor the row's alignment in memory (which BLAS kernels may depend on) can change them."""
         if values.shape[0] == 0:
             return torch.zeros((0, self.n_regions), dtype=torch.float64, device=self.W.device)
-        return torch.stack([row @ self.W for row in values.double()])
+        return torch.stack([row.to(torch.float64, copy=True) @ self.W for row in values])
 
     def new_state(
         self,
