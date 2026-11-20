@@ -280,8 +280,6 @@ def test_blocks_concat_and_attrs():
     assert merged["time_model_s"] == 3.5 and merged["target_reads"] == 4 and merged["forcings_hits"] == 3
     assert merged["peak_gpu_memory_bytes"] == 30 and merged["model_calls"] == 4 and merged["checkpoint"] == "x.ckpt"
     assert json.loads(merged["climatology_nonfinite_nodes"]) == {"t": 0, "tp": 2, "u": 1}
-    with pytest.raises(ValueError, match="gpu"):
-        merge_attrs([ranks[0], {**ranks[1], "gpu": "PG506-232"}])
     with pytest.raises(ValueError, match="inference_chunks_processor"):
         merge_attrs([{**ranks[0], "inference_chunks_processor": 2}, ranks[1]])
     for key in ("checkpoint_uuid", "config", "package_versions"):
@@ -362,7 +360,7 @@ def _cli_worker(rank: int, size: int, cases: list[dict]) -> None:
                 continue
             _patch(monkeypatch, case)
             os.environ.update(RANK=str(rank), WORLD_SIZE=str(case["ranks"]), MASTER_PORT=str(case["port"]))
-            main(["run", case["config"], "--member-group", str(case["ranks"]), *case["args"]])
+            main(["run", case["config"], "--member-group", *case["args"]])
 
 
 _PORTS: set[int] = set()
@@ -539,7 +537,6 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
 def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
     """The plan of rank 0 of a member group, the shards of a member-group step, and what a member group refuses."""
     import _multi_dataset as fixture
-    import xarray as xr
     import yaml
 
     from anemoi.evaluation.__main__ import main
@@ -574,7 +571,7 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
     held = sizes.get("checkpoint_bytes", 0) + sizes["member_states"] + sizes["frame"] + 4 * n * 4
     exchange, scoring = sizes["swap_peak"], sizes["statistics_temporaries"] + sizes["ensemble_temporaries"]
     assert sizes["peak"] == held + sizes["aggregator_weights"] + max(exchange, scoring)
-    main(["run", path(5), "--member-group", "2", "--dry-run", "--step-time", "1"])
+    main(["run", path(5), "--member-group", "--dry-run", "--ranks", "2", "--step-time", "1"])
     assert "member_group:" in capsys.readouterr().out
 
     env = {"SLURM_STEP_NUM_TASKS": "4", "SLURM_PROCID": "2", "SLURM_ARRAY_TASK_ID": "3", "SLURM_ARRAY_TASK_MIN": "2"}
@@ -582,25 +579,22 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
     assert resolve_shard(None, env) == (6, 12) and resolve_shard(None, env, member_group=True) == (1, 3)
 
     with pytest.raises(SystemExit, match="one member"):
-        main(["run", path(1), "--member-group", "2", "--dry-run"])
+        main(["run", path(1), "--member-group", "--dry-run", "--ranks", "2"])
     with pytest.raises(SystemExit, match="every rank needs a member"):
-        main(["run", path(2), "--member-group", "3", "--dry-run"])
-    with pytest.raises(SystemExit, match="as many tasks"):
-        main(["run", path(5), "--member-group", "2"])
-    main(["run", path(5), "--member-group", "1", "--dry-run"])  # a group of one is the unsplit run
-    assert "member_group:" not in capsys.readouterr().out
-    # bare, in a step of one task (srun forgotten): refused, before the flag or after the config
+        main(["run", path(2), "--member-group", "--dry-run", "--ranks", "3"])
+    for argv in (["--dry-run"], ["--dry-run", "--ranks", "1"]):
+        with pytest.raises(SystemExit, match="pass --ranks R, at least 2"):
+            main(["run", path(5), "--member-group", *argv])
+    for argv in (["--ranks", "2"], ["--ranks", "2", "--dry-run"], ["--ranks", "2", "--member-group"]):
+        with pytest.raises(SystemExit, match="--ranks is only used by --dry-run with --member-group"):
+            main(["run", path(5), *argv])
+    # a one-task launch (srun forgotten) is refused, the flag before or after the config
     for argv in (["run", path(5), "--member-group"], ["run", "--member-group", path(5)]):
-        with pytest.raises(SystemExit, match=r"srun.*--member-group 1 to run unsplit"):
+        with pytest.raises(SystemExit, match="one task per GPU with srun or torchrun"):
             main(argv)
-    main(["run", path(5), "--member-group", "1"])  # explicit: the unsplit run, no rendezvous
-    with xr.open_dataset(tmp_path / "m5-0-1.nc") as written:
-        assert "member_ranks" not in written.attrs
-    with pytest.raises(SystemExit, match="pass --member-group R"):
-        main(["run", path(5), "--member-group", "--dry-run"])
     monkeypatch.setenv("TORCHELASTIC_RUN_ID", "x")
     with pytest.raises(SystemExit, match="RANK and WORLD_SIZE not"):
-        main(["run", path(5), "--member-group", "2"])
+        main(["run", path(5), "--member-group"])
     monkeypatch.delenv("TORCHELASTIC_RUN_ID")
 
     # a device index is refused alike on every rank, unless the task sees only its own GPU and names it cuda:0
@@ -631,22 +625,21 @@ def test_member_group_plan_shards_and_refusals(tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(torch.cuda, "device_count", lambda visible=visible: visible)
         monkeypatch.setenv("SLURM_LOCALID", str(local))
         with pytest.raises(SystemExit, match="MASTER_ADDR" if local < visible or visible == 1 else "GPU of its own"):
-            main(["run", path(5), "--member-group", "3"])
+            main(["run", path(5), "--member-group"])
     assert chosen == [1]
-    monkeypatch.setenv("SLURM_LOCALID", "0")
-    with pytest.raises(SystemExit, match="MASTER_ADDR and MASTER_PORT"):
-        main(["run", path(5), "--member-group"])  # bare, in a step of three tasks, outside a Slurm job
     targets = fixture.make_targets("era5")
     persistence = Evaluation(PersistenceForecastSource(targets, "6h", 2), targets, fixture.init_times(), "6h", ["rmse"])
     with pytest.raises(ValueError, match="PersistenceForecastSource cannot split its members"):
         persistence.split_members(MemberGroup(0, 2))
 
 
-def test_task_env_and_rendezvous_from_slurm():
+def test_task_env_and_rendezvous_from_slurm(monkeypatch):
     """The launcher of the process gives its rank: torchrun when it started it, else srun; without `MASTER_ADDR` and
     `MASTER_PORT` a member group meets at the first host of the step and a port below the ephemeral range from the job
     id (a job-array task's own) and the step id, so concurrent steps of a job meet apart; set, they win, each on its
-    own."""
+    own. A host that does not resolve is refused at once."""
+    import socket
+
     from anemoi.evaluation.distributed import first_host
     from anemoi.evaluation.distributed import rendezvous
     from anemoi.evaluation.distributed import task_env
@@ -661,6 +654,13 @@ def test_task_env_and_rendezvous_from_slurm():
     assert first_host("nid002812") == "nid002812" and first_host("nid[002812-002813]") == "nid002812"
     assert first_host("nid[002900,002812-002813]") == "nid002900" and first_host("a[1-2],b3") == "a1"
     assert first_host("x1,y[2-3]") == "x1" and first_host("rack[1-2]-node[07-08]") == "rack1-node07"
+
+    def resolve(host):
+        if host == "nowhere":
+            raise socket.gaierror(-2, "Name or service not known")
+        return host
+
+    monkeypatch.setattr(socket, "gethostbyname", resolve)
     job = {"SLURM_JOB_NODELIST": "nid[002812-002815]", "SLURM_JOB_ID": "426031"}
     assert rendezvous(job) == ("nid002812", 15496)  # 15000 + 16 * 31, no step id (the batch script)
     in_step = {**job, "SLURM_STEP_ID": "2", "SLURM_STEP_NODELIST": "nid[002814-002815]"}
@@ -679,11 +679,17 @@ def test_task_env_and_rendezvous_from_slurm():
     for env in ({"SLURM_JOB_ID": "426031"}, {"MASTER_ADDR": "h"}, {}):
         with pytest.raises(ValueError, match="MASTER_ADDR and MASTER_PORT"):
             rendezvous(env)
+    with pytest.raises(ValueError, match="cannot resolve .* host 'nowhere' .* set MASTER_ADDR"):
+        rendezvous({"MASTER_ADDR": "nowhere", "MASTER_PORT": "1234"})
+    monkeypatch.undo()
+    assert rendezvous({"MASTER_ADDR": "localhost", "MASTER_PORT": "1234"})[0].startswith("127.")
 
 
-def test_mixed_gpu_models_are_refused_at_startup(monkeypatch):
-    """Ranks on an A100 and a PG506 (Balfrin mixes them) are refused by the first collective, which gathers the
-    device names, and the group is torn down; one GPU model passes."""
+def test_shared_gpus_are_refused_and_mixed_models_warned_at_startup(monkeypatch, caplog):
+    """The first collective gathers every rank's host and GPU: two ranks on one GPU are refused and the group torn
+    down; ranks on an A100 and a PG506 (Balfrin mixes them) only log a warning, and their file lists both models."""
+    import socket
+
     from anemoi.evaluation.distributed import MemberGroup
     from anemoi.evaluation.distributed import init_group
 
@@ -692,18 +698,34 @@ def test_mixed_gpu_models_are_refused_at_startup(monkeypatch):
     monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setattr(dist, "init_process_group", lambda backend, **kwargs: calls.append(("init", backend)))
     monkeypatch.setattr(dist, "destroy_process_group", lambda: calls.append(("destroy",)))
+    monkeypatch.setattr(socket, "gethostname", lambda: "nid002812")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA A100-SXM4-80GB")
-    for peer, refused in (("NVIDIA PG506-232", True), ("NVIDIA A100-SXM4-80GB", False)):
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: type("P", (), {"uuid": "GPU-a"}))
+    a100, pg506 = "NVIDIA A100-SXM4-80GB", "NVIDIA PG506-232"
+    for peers, refused, warned in (
+        ([("nid002812", "GPU-b", a100)], None, False),
+        (
+            [("nid002812", "GPU-b", a100), ("nid002812", "GPU-a", a100)],
+            "ranks 0, 2 share GPU GPU-a on nid002812",
+            False,
+        ),
+        ([("nid002900", "GPU-a", pg506)], None, True),  # another node's GPU, whatever its uuid
+    ):
 
-        def gather(names, name, peer=peer):
-            names[:] = [name, peer]
+        def gather(ranks, mine, peers=peers):
+            ranks[:] = [mine, *peers]
 
         monkeypatch.setattr(dist, "all_gather_object", gather)
         calls.clear()
+        caplog.clear()
+        group = MemberGroup(0, 1 + len(peers))
         if refused:
-            with pytest.raises(ValueError, match="different GPU models"):
-                init_group(MemberGroup(0, 2), torch.device("cuda"))
+            with pytest.raises(ValueError, match=f"{refused}: a member group needs one GPU per task"):
+                init_group(group, torch.device("cuda"))
         else:
-            init_group(MemberGroup(0, 2), torch.device("cuda"))
+            init_group(group, torch.device("cuda"))
         assert calls == [("init", "nccl"), *([("destroy",)] if refused else [])], calls
+        assert ("not bit-identical to an unsplit run" in caplog.text) == warned
+    assert merge_attrs([{"gpu": a100}, {"gpu": pg506}, {"gpu": a100}])["gpu"] == f"{a100}, {pg506}"
+    assert merge_attrs([{"gpu": a100}, {"gpu": a100}])["gpu"] == a100

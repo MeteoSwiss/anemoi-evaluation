@@ -1,11 +1,10 @@
-"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group [R]] [--dry-run
-[--step-time s]]`` and ``anemoi-evaluation merge <nc>... -o <nc> [--partial]``."""
+"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group] [--dry-run
+[--step-time s] [--ranks R]]`` and ``anemoi-evaluation merge <nc>... -o <nc> [--partial]``."""
 
 import argparse
 import json
 import logging
 import os
-import sys
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -13,7 +12,6 @@ if TYPE_CHECKING:
     from anemoi.evaluation.distributed import MemberGroup
 
 LOG = logging.getLogger(__name__)
-STEP_TASKS = object()  # a bare --member-group: as many ranks as the step has tasks (argparse converts a str const)
 
 
 def resolve_shard(
@@ -92,36 +90,26 @@ def _headline(plan: dict, count: int) -> str:
 
 
 def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
-    """This task's rank of the ``--member-group`` (rank 0 for a dry run), its CUDA device set; None without it or for a
-    group of one, which is the unsplit run."""
-    if args.member_group is None:
+    """This task's rank of the ``--member-group`` (rank 0 of ``--ranks`` for a dry run), its CUDA device set; None
+    without the flag."""
+    if not args.member_group:
         return None
     from anemoi.evaluation.distributed import MemberGroup
     from anemoi.evaluation.distributed import task_env
 
-    if args.member_group is STEP_TASKS:
-        if args.dry_run:
-            raise SystemExit("--dry-run plans a member group of a given size: pass --member-group R")
-    elif args.member_group < 1:
-        raise SystemExit(f"--member-group must be at least 1, got {args.member_group}")
     if args.dry_run:
-        return MemberGroup(0, args.member_group) if args.member_group > 1 else None
+        if args.ranks is None or args.ranks < 2:
+            raise SystemExit("--dry-run --member-group plans rank 0 of a group: pass --ranks R, at least 2")
+        return MemberGroup(0, args.ranks)
     try:
         rank, tasks, local = task_env()
     except ValueError as error:
         raise SystemExit(f"--member-group: {error}") from None
-    if args.member_group is STEP_TASKS and tasks == 1:
+    if tasks == 1:
         raise SystemExit(
-            "a bare --member-group takes the group size from the tasks of the step, and this process is one task: "
-            "start one task per rank with srun (or torchrun), or pass --member-group 1 to run unsplit"
+            "--member-group makes the tasks of the launch one group, and this process is one task: start one task per "
+            "GPU with srun or torchrun, or run without --member-group"
         )
-    if args.member_group not in (STEP_TASKS, tasks):
-        raise SystemExit(
-            f"--member-group {args.member_group} needs as many tasks in the step, this one has {tasks}: "
-            "start one task per rank with srun (or torchrun)"
-        )
-    if tasks == 1:  # --member-group 1, the unsplit run
-        return None
     import torch
 
     if torch.cuda.is_available():
@@ -131,7 +119,7 @@ def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
             if local >= visible:
                 raise SystemExit(
                     f"--member-group: task {local} of this node has no GPU of its own, {visible} are visible: start "
-                    "at most one task per GPU on a node"
+                    "one task per GPU, each with its own (srun --gpus-per-task=1) or sharing the node's"
                 )
             torch.cuda.set_device(local)
     return MemberGroup(rank, tasks)
@@ -140,6 +128,8 @@ def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
 def _run(args: argparse.Namespace) -> None:
     if args.step_time is not None and not args.dry_run:
         raise SystemExit("--step-time is only used by --dry-run")
+    if args.ranks is not None and not (args.dry_run and args.member_group):
+        raise SystemExit("--ranks is only used by --dry-run with --member-group")
     import torch
     import yaml
     from anemoi.utils.humanize import bytes_to_human
@@ -251,16 +241,6 @@ def _merge(args: argparse.Namespace) -> None:
     write(to_xarray(state, metrics.build(specs, members=state.members)), args.output)
 
 
-def _bare_member_group_last(argv: list[str]) -> list[str]:
-    """`argv` with a bare ``--member-group`` moved to the end, where argparse cannot take the config that follows it
-    for the group size."""
-    for position, arg in enumerate(argv[:-1]):
-        following = argv[position + 1]
-        if arg == "--member-group" and not following.startswith("-") and not following.isdigit():
-            return [*argv[:position], *argv[position + 1 :], arg]
-    return argv
-
-
 def main(argv: list[str] | None = None) -> None:
     """Parse the command line and dispatch to ``run`` or ``merge``."""
     parser = argparse.ArgumentParser(prog="anemoi-evaluation", description="Evaluate anemoi forecasts in memory.")
@@ -275,15 +255,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     run.add_argument(
         "--member-group",
-        metavar="R",
-        type=int,
-        nargs="?",
-        const=STEP_TASKS,
-        help="Split the members of every init time over the R tasks of the srun (or torchrun) step, one GPU each, "
-        "and write one result per shard from rank 0; without R, as many ranks as the step has tasks (refused in a "
-        "step of one task). The tasks are "
-        "then not shards, init times are sharded by --shard or a job array only. With --dry-run, plan rank 0 of R "
-        "ranks (R required).",
+        action="store_true",
+        help="Split the members of every init time over the tasks of the srun or torchrun launch, one GPU each, and "
+        "write one result per shard from rank 0. The tasks are then not shards: init times are sharded by --shard "
+        "or a job array only.",
     )
     run.add_argument(
         "--dry-run",
@@ -298,6 +273,12 @@ def main(argv: list[str] | None = None) -> None:
         "docs/benchmarks.md section 3 reports it per checkpoint, and one call of a multi-step-output model "
         "produces several frames.",
     )
+    run.add_argument(
+        "--ranks",
+        metavar="R",
+        type=int,
+        help="With --dry-run and --member-group, plan rank 0 of a member group of R ranks.",
+    )
     merge = commands.add_parser("merge", help="Sum the aggregation states of several result files.")
     merge.add_argument("inputs", nargs="+", help="Result netcdf files to merge.")
     merge.add_argument("-o", "--output", required=True, help="Merged result netcdf.")
@@ -307,7 +288,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Merge an incomplete set of shards, recording the shards merged in the output's shard attr; "
         "without it the inputs must be the complete 0..n-1 shards of one run.",
     )
-    args = parser.parse_args(_bare_member_group_last(sys.argv[1:] if argv is None else list(argv)))
+    args = parser.parse_args(argv)
     {"run": _run, "merge": _merge}[args.command](args)
 
 

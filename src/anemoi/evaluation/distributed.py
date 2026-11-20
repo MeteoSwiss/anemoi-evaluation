@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import socket
 from collections.abc import Iterator
 from collections.abc import Mapping
 
@@ -28,7 +29,7 @@ from anemoi.evaluation.output import TIMING_ATTRS
 LOG = logging.getLogger(__name__)
 SUMMED_ATTRS = ("target_reads", "target_cache_hits")
 SUMMED_PREFIXES = ("forcings_",)
-IDENTITY_ATTRS = ("gpu", "checkpoint_uuid", "config", "package_versions")
+IDENTITY_ATTRS = ("checkpoint_uuid", "config", "package_versions")
 IDENTITY_PREFIXES = ("inference_chunks_",)
 GROUP_TIMEOUT = datetime.timedelta(minutes=10)
 
@@ -79,7 +80,7 @@ def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
     own, else under Slurm the first host of the step (`SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`) and port
     `15000 + 16 * (SLURM_JOB_ID % 1000) + SLURM_STEP_ID % 16`, below the ephemeral ports (32768 and up). Concurrent
     steps of one job, and the tasks of a job array (each a job of its own), that share a node meet on different ports.
-    Outside Slurm both must be set."""
+    Outside Slurm both must be set. The address is resolved here, so a bad host fails at once."""
     env = os.environ if env is None else env
     address, port = env.get("MASTER_ADDR"), env.get("MASTER_PORT")
     nodes = env.get("SLURM_STEP_NODELIST") or env.get("SLURM_JOB_NODELIST")
@@ -94,7 +95,13 @@ def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
             "a member group needs MASTER_ADDR and MASTER_PORT in the environment, the address and a free port of "
             "rank 0, unless it runs under Slurm, which gives them"
         )
-    return address, int(port)
+    try:
+        return socket.gethostbyname(address), int(port)
+    except OSError as error:
+        raise ValueError(
+            f"cannot resolve the member group's rendezvous host {address!r} ({error}): set MASTER_ADDR to an address "
+            "of rank 0's node that every rank can reach"
+        ) from None
 
 
 def first_host(nodes: str) -> str:
@@ -110,11 +117,11 @@ def first_host(nodes: str) -> str:
 
 
 def init_group(group: MemberGroup, device: torch.device) -> None:
-    """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise, rendezvous at
-    `rendezvous()`, then a collective over every rank, so that every rank is up before the model loads and every later
-    batch of sends and receives may leave ranks out (NCCL needs all of them in the first one). The collective gathers
-    the device names, and ranks on different GPU models are refused there rather than after the run. With NCCL the
-    CUDA device must be set first."""
+    """Join the world group of `group`: NCCL on a CUDA device, gloo otherwise, rendezvous at `rendezvous()`, then a
+    collective over every rank, so that every rank is up before the model loads and every later batch of sends and
+    receives may leave ranks out (NCCL needs all of them in the first one). The collective gathers each rank's host and
+    GPU: ranks that share a GPU are refused, and ranks on different GPU models are warned about. With NCCL the CUDA
+    device must be set first."""
     address, port = rendezvous()
     nccl = device.type == "cuda"
     backend = "nccl" if nccl else "gloo"
@@ -127,11 +134,40 @@ def init_group(group: MemberGroup, device: torch.device) -> None:
         timeout=GROUP_TIMEOUT,
         **({"device_id": torch.device("cuda", torch.cuda.current_device())} if nccl else {}),
     )
-    names = [None] * group.size
-    dist.all_gather_object(names, torch.cuda.get_device_name(device) if device.type == "cuda" else device.type)
-    if len(set(names)) > 1:
+    host = socket.gethostname()
+    if nccl:
+        mine = (host, str(torch.cuda.get_device_properties(device).uuid), torch.cuda.get_device_name(device))
+    else:
+        mine = (host, None, device.type)
+    ranks = [None] * group.size
+    dist.all_gather_object(ranks, mine)
+    try:
+        models = check_devices(ranks)
+    except ValueError:
         dist.destroy_process_group()
-        raise ValueError(f"the ranks run on different GPU models {sorted(set(names))}, a member group needs one")
+        raise
+    if len(models) > 1 and group.rank == 0:
+        LOG.warning(
+            "the ranks run on different GPU models %s: the ensemble is valid, but not bit-identical to an unsplit run",
+            models,
+        )
+
+
+def check_devices(ranks: list[tuple[str, str | None, str]]) -> list[str]:
+    """The GPU models of the ranks, from every rank's `(host, GPU uuid, GPU model)` (uuid None without a GPU); ranks
+    that share a GPU are refused."""
+    holders: dict[tuple[str, str], list[int]] = {}
+    for rank, (host, uuid, _) in enumerate(ranks):
+        if uuid is not None:
+            holders.setdefault((host, uuid), []).append(rank)
+    shared = [
+        f"ranks {', '.join(map(str, held))} share GPU {uuid} on {host}"
+        for (host, uuid), held in holders.items()
+        if len(held) > 1
+    ]
+    if shared:
+        raise ValueError(f"{'; '.join(shared)}: a member group needs one GPU per task")
+    return sorted({model for _, _, model in ranks})
 
 
 def swap(data: torch.Tensor, members: int) -> torch.Tensor:
@@ -178,10 +214,10 @@ def merge_attrs(attrs: list[dict]) -> dict:
     """The attrs of a member group's result from its ranks', in rank order.
 
     Timings and the target-read and forcings counters are summed, `peak_gpu_memory_bytes` is the maximum, the
-    `climatology_nonfinite_nodes` maps are unioned, and everything else, `model_calls` included (every rank makes the
-    same calls, each for its own members), is rank 0's. Ranks on different GPU models or inference chunk counts are refused,
-    since the bit-exact members depend on both, and so are ranks that disagree on the checkpoint uuid, the config or
-    the package versions.
+    `climatology_nonfinite_nodes` maps are unioned, `gpu` lists the ranks' GPU models (one when they agree), and
+    everything else, `model_calls` included (every rank makes the same calls, each for its own members), is rank 0's.
+    Ranks that disagree on the inference chunk counts, the checkpoint uuid, the config or the package versions are
+    refused.
     """
     if not attrs:
         raise ValueError("no attrs to merge")
@@ -190,9 +226,7 @@ def merge_attrs(attrs: list[dict]) -> dict:
         if key in IDENTITY_ATTRS or key.startswith(IDENTITY_PREFIXES):
             values = [item.get(key) for item in attrs]
             if len({str(value) for value in values}) > 1:
-                raise ValueError(
-                    f"the ranks disagree on {key!r}: {values}; a member group runs one setup on one GPU model"
-                )
+                raise ValueError(f"the ranks disagree on {key!r}: {values}; a member group runs one setup")
     result = dict(attrs[0])
     for key in keys:
         values = [item[key] for item in attrs if key in item]
@@ -202,6 +236,8 @@ def merge_attrs(attrs: list[dict]) -> dict:
             result[key] = int(sum(values))
         elif key in MAX_ATTRS:
             result[key] = int(max(values))
+        elif key == "gpu":
+            result[key] = ", ".join(sorted(set(values)))
     if "climatology_nonfinite_nodes" in keys:
         union: dict[str, int] = {}
         for item in attrs:
@@ -275,8 +311,7 @@ def abort_on_error() -> Iterator[None]:
     With gloo the other ranks see the connections close and raise in their next or current operation. With NCCL the
     abort frees only this rank's communicators: a rank already inside a collective waits for NCCL's timeout, and
     torch's abort is meant to run with `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, since otherwise NCCL's watchdog may abort
-    the group by itself first. Run a member group under `srun --kill-on-bad-exit=1`, so that Slurm kills the other
-    tasks of the step as soon as one exits with an error.
+    the group by itself first. Run a member group under a launcher that stops every task as soon as one fails.
     """
     try:
         yield
