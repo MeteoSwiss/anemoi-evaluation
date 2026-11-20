@@ -322,7 +322,7 @@ def _levtype_recorded(variable: object) -> bool:
 
 
 # Whether a variable records what `Variable.compatible` of anemoi-transform compares, by the option that skips it. A
-# `levtype` of `unknown` (realch1 v2.0 pressure levels) is not recorded, though transform reads it as no level type.
+# `levtype` of `unknown` (some datasets write it for pressure levels) is not recorded, though transform reads it as no level type.
 RECORDED_METADATA = {
     "units": lambda variable: variable.units is not None,
     "time_processing": lambda variable: variable.time_processing is not None,

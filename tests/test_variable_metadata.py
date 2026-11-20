@@ -97,7 +97,7 @@ def test_units_and_levels_are_checked_and_request_keys_are_not(monkeypatch, tmp_
 
 
 def test_what_transform_reads_as_no_metadata_is_not_compared(monkeypatch, tmp_path, caplog):
-    """A `levtype` of `unknown` (realch1 v2.0 writes it for its pressure levels) and a malformed `period` are not
+    """A `levtype` of `unknown` (some datasets write it for pressure levels) and a malformed `period` are not
     recorded, so they are skipped instead of warned about or raised on; another time processing is a difference."""
     forecast = fixture.forecast_source(monkeypatch, tmp_path, ("era5",))
     mars = fixture.FixtureDataset("era5").typed_variables["2t"].data["mars"]
