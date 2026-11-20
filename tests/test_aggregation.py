@@ -82,6 +82,41 @@ def test_state_matches_naive_reference_and_merges_exactly():
         aggregator.add(winter, frames[0][0], frames[0][1][:, :1])
 
 
+def test_variable_subset_aggregates_like_the_matching_slice():
+    """A frame holding only some of the variables gives, bit for bit, those variables' sums of the full frame, which is
+    what lets members be scored on variable blocks; three regions and an odd node count, where one product over all
+    the variables groups the terms differently with the variable count."""
+    rng = np.random.default_rng(3)
+    members, n, variables, leads = 5, 1001, ["a", "b", "c", "d", "e"], [6 * HOUR]
+    weights = rng.random(n) + 0.1
+    masks = np.stack([np.ones(n, dtype=bool), rng.random(n) < 0.5, rng.random(n) < 0.3], axis=1)
+    init = datetime.datetime(2024, 1, 1)
+    pred = torch.from_numpy(rng.normal(280, 2, (members, 5, n)).astype(np.float32))
+    target = torch.from_numpy(rng.normal(280, 2, (1, 5, n)).astype(np.float32))
+    climatology = torch.from_numpy(rng.normal(280, 1, (5, n)))
+    pred[1, 2, :4], target[0, 1, 10:13], climatology[3, 20:25] = float("nan"), float("nan"), float("nan")
+    warm = {"label": "warm", "thresholds": {"b": 280.5}}
+    specs = ["rmse", "mae", "bias", "fair_crps", "spread", "member_rmse", "acc", "rank_histogram"]
+    specs += [{"csi": warm}, {"brier": warm}, {"reliability": warm}]
+
+    def aggregate(columns):
+        statistics = metrics.unique_statistics(metrics.build(specs, [variables[j] for j in columns], members))
+        aggregator = Aggregator(weights, masks, statistics, SeasonBinning("init_time"))
+        state = aggregator.new_state(leads, [variables[j] for j in columns], ["all", "half", "third"], members)
+        frame = Frame(init, leads[0], init + leads[0], state.variables, pred[:, columns].contiguous())
+        aggregator.add(state, frame, target[:, columns].contiguous(), {"climatology": climatology[columns]})
+        return state
+
+    full = aggregate(list(range(5)))
+    # each subset binds its own variables, so the map names only `b`, which every subset holds
+    for columns in ([1, 2], [1, 3, 4], [1]):
+        part = aggregate(columns)
+        assert torch.equal(part.weights, full.weights[:, :, columns])
+        assert part.sums.keys() == full.sums.keys()
+        for name, total in part.sums.items():
+            torch.testing.assert_close(total, full.sums[name][:, :, columns], rtol=0, atol=0, equal_nan=True, msg=name)
+
+
 def test_binnings():
     init, lead = datetime.datetime(2024, 11, 30, 12), 18 * HOUR
     frame = Frame(init, lead, init + lead, ["a"], torch.zeros(1, 1, 3))

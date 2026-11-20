@@ -1,20 +1,28 @@
-"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--dry-run [--step-time s]]``
-and ``anemoi-evaluation merge <nc>... -o <nc> [--partial]``."""
+"""Command line interface: ``anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group] [--dry-run
+[--step-time s] [--ranks R]]`` and ``anemoi-evaluation merge <nc>... -o <nc> [--partial]``."""
 
 import argparse
 import json
 import logging
 import os
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from anemoi.evaluation.distributed import MemberGroup
 
 LOG = logging.getLogger(__name__)
 
 
-def resolve_shard(shard: str | None, env: Mapping[str, str] | None = None) -> tuple[int, int]:
+def resolve_shard(
+    shard: str | None, env: Mapping[str, str] | None = None, member_group: bool = False
+) -> tuple[int, int]:
     """Shard index and count: ``--shard i/n``, else the Slurm job-array task times the job-step task, else 0 of 1.
 
     The task count comes from ``SLURM_STEP_NUM_TASKS`` (set by ``srun`` for every task of a step) rather than
     ``SLURM_NTASKS``, which a batch script also sees with ``SLURM_PROCID`` 0 and would silently evaluate one shard.
+    With `member_group` the tasks of the step are the ranks of one member group, not shards: only the job array
+    shards.
     """
     if shard is not None:
         try:
@@ -27,10 +35,10 @@ def resolve_shard(shard: str | None, env: Mapping[str, str] | None = None) -> tu
         def value(name: str, default: int) -> int:
             return int(env.get(name, default))
 
-        tasks = value("SLURM_STEP_NUM_TASKS", 1)
+        tasks = 1 if member_group else value("SLURM_STEP_NUM_TASKS", 1)
         array = value("SLURM_ARRAY_TASK_ID", 0) - value("SLURM_ARRAY_TASK_MIN", 0)
         count = value("SLURM_ARRAY_TASK_COUNT", 1) * tasks
-        index = array * tasks + value("SLURM_PROCID", 0)
+        index = array * tasks + (0 if member_group else value("SLURM_PROCID", 0))
     if not 0 <= index < count:
         raise ValueError(f"shard index {index} is out of range for {count} shards")
     return index, count
@@ -81,11 +89,50 @@ def _headline(plan: dict, count: int) -> str:
     )
 
 
+def _member_group(args: argparse.Namespace) -> "MemberGroup | None":
+    """This task's rank of the ``--member-group`` (rank 0 of ``--ranks`` for a dry run), its CUDA device set; None
+    without the flag."""
+    if not args.member_group:
+        return None
+    from anemoi.evaluation.distributed import MemberGroup
+    from anemoi.evaluation.distributed import task_env
+
+    if args.dry_run:
+        if args.ranks is None or args.ranks < 2:
+            raise SystemExit("--dry-run --member-group plans rank 0 of a group: pass --ranks R, at least 2")
+        return MemberGroup(0, args.ranks)
+    try:
+        rank, tasks, local = task_env()
+    except ValueError as error:
+        raise SystemExit(f"--member-group: {error}") from None
+    if tasks == 1:
+        raise SystemExit(
+            "--member-group makes the tasks of the launch one group, and this process is one task: start one task per "
+            "GPU with srun or torchrun, or run without --member-group"
+        )
+    import torch
+
+    if torch.cuda.is_available():
+        visible = torch.cuda.device_count()
+        # one visible GPU is the task's own (srun --gpus-per-task=1); several are shared by the tasks of the node
+        if visible > 1:
+            if local >= visible:
+                raise SystemExit(
+                    f"--member-group: task {local} of this node has no GPU of its own, {visible} are visible: start "
+                    "one task per GPU, each with its own (srun --gpus-per-task=1) or sharing the node's"
+                )
+            torch.cuda.set_device(local)
+    return MemberGroup(rank, tasks)
+
+
 def _run(args: argparse.Namespace) -> None:
     if args.step_time is not None and not args.dry_run:
         raise SystemExit("--step-time is only used by --dry-run")
+    if args.ranks is not None and not (args.dry_run and args.member_group):
+        raise SystemExit("--ranks is only used by --dry-run with --member-group")
     import torch
     import yaml
+    from anemoi.utils.humanize import bytes_to_human
     from anemoi.utils.humanize import compress_dates
 
     from anemoi.evaluation.config import load_config
@@ -93,11 +140,19 @@ def _run(args: argparse.Namespace) -> None:
     from anemoi.evaluation.output import write
 
     config = load_config(args.config)
-    index, count = resolve_shard(args.shard)
+    group = _member_group(args)
+    index, count = resolve_shard(args.shard, member_group=group is not None)
     if config.output is None and not args.dry_run:
         raise SystemExit("the config needs output.path to run from the command line")
-    logging.basicConfig(level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    label = f"rank {group.rank}/{group.size} " if group is not None and not args.dry_run else ""
+    logging.basicConfig(level=config.log_level, format=f"%(asctime)s {label}%(levelname)s %(name)s: %(message)s")
     evaluation = Evaluation.from_config(config)
+    if group is not None:
+        try:
+            evaluation.split_members(group)
+        except ValueError as error:
+            evaluation.close()
+            raise SystemExit(f"--member-group: {error}") from None
     datasets = getattr(evaluation, "dataset_names", None)  # None for a single-dataset run
     paths = (
         {name: format_output_path(config.output.path, index, count, name) for name in datasets or [None]}
@@ -116,7 +171,10 @@ def _run(args: argparse.Namespace) -> None:
         # the datasets of a multi-dataset run share the model call, so any one of them carries the run's cost
         summary = next(iter(plan["datasets"].values())) if "datasets" in plan else plan
         LOG.info(
-            "dry run: %s; model loaded: %s", _headline(summary, count), summary["forecast"].get("model_loaded", "n/a")
+            "dry run: %s; model loaded: %s; device memory about %s at the peak, without the model's activations",
+            _headline(summary, count),
+            summary["forecast"].get("model_loaded", "n/a"),
+            bytes_to_human(summary["bytes"]["peak"]),
         )
         evaluation.close()
         return
@@ -125,16 +183,51 @@ def _run(args: argparse.Namespace) -> None:
         LOG.info("device %s: %s, %d visible", device, torch.cuda.get_device_name(device), torch.cuda.device_count())
     else:
         LOG.info("device %s", device)
-    try:
-        result = evaluation.run(init_times)
-    finally:
-        evaluation.close()
-    states = result if datasets else {None: result}
+    if group is None:
+        try:
+            result = evaluation.run(init_times)
+        finally:
+            evaluation.close()
+        states = result if datasets else {None: result}
+    else:
+        states = _run_member_group(evaluation, group, init_times, datasets)
+        if states is None:
+            return
     metrics = evaluation.metrics if datasets else {None: evaluation.metrics}
     for name, state in states.items():
         state.attrs["shard"] = f"{index}/{count}"
         write(state.to_xarray(metrics[name]), paths[name])
         LOG.info("wrote %s", paths[name])
+
+
+def _run_member_group(evaluation: object, group: "MemberGroup", init_times: list, datasets: list | None) -> dict | None:
+    """Run this rank's share and gather every dataset's state on rank 0, which gets them (with the `member_ranks`
+    attr), the other ranks None; any error aborts the group, so that no rank waits for a failed one."""
+    import torch.distributed as dist
+
+    from anemoi.evaluation.distributed import abort_on_error
+    from anemoi.evaluation.distributed import gather_state
+    from anemoi.evaluation.distributed import init_group
+
+    try:
+        init_group(group, evaluation.device)
+    except ValueError as error:
+        evaluation.close()
+        raise SystemExit(f"--member-group: {error}") from None
+    with abort_on_error():
+        try:
+            result = evaluation.run(init_times)
+        finally:
+            evaluation.close()
+        local = result if datasets else {None: result}
+        states = {name: gather_state(state) for name, state in local.items()}
+    dist.destroy_process_group()
+    if group.rank != 0:
+        LOG.info("sent the results to rank 0")
+        return None
+    for state in states.values():
+        state.attrs["member_ranks"] = group.size
+    return states
 
 
 def _merge(args: argparse.Namespace) -> None:
@@ -161,6 +254,13 @@ def main(argv: list[str] | None = None) -> None:
         "without it, Slurm job-array and job-step variables shard automatically (0/1 disables that).",
     )
     run.add_argument(
+        "--member-group",
+        action="store_true",
+        help="Split the members of every init time over the tasks of the srun or torchrun launch, one GPU each, and "
+        "write one result per shard from rank 0. The tasks are then not shards: init times are sharded by --shard "
+        "or a job array only.",
+    )
+    run.add_argument(
         "--dry-run",
         action="store_true",
         help="Resolve the config and sources, check the dates and print the plan without running the model.",
@@ -172,6 +272,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Seconds of model time per model call per member, to add a time and GPU-hour estimate to the plan; "
         "docs/benchmarks.md section 3 reports it per checkpoint, and one call of a multi-step-output model "
         "produces several frames.",
+    )
+    run.add_argument(
+        "--ranks",
+        metavar="R",
+        type=int,
+        help="With --dry-run and --member-group, plan rank 0 of a member group of R ranks.",
     )
     merge = commands.add_parser("merge", help="Sum the aggregation states of several result files.")
     merge.add_argument("inputs", nargs="+", help="Result netcdf files to merge.")
