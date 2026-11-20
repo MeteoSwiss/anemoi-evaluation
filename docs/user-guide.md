@@ -899,7 +899,7 @@ rank 0's address in the launcher's environment:
 | | `srun` | `torchrun` |
 |---|---|---|
 | Rank, group size, rank on the node | `SLURM_PROCID`, `SLURM_STEP_NUM_TASKS`, `SLURM_LOCALID` | `RANK`, `WORLD_SIZE`, `LOCAL_RANK` (they win over Slurm's when torchrun started the process) |
-| Where the ranks meet | the first host of the step, port `15000 + 16 * (job id % 1000) + step id % 16` | `MASTER_ADDR`, `MASTER_PORT`, set by torchrun to its own store |
+| Where the ranks meet | the first host of the step, port `15000 + 16 * (job id % 1000) + step id % 16` | `MASTER_ADDR`, `MASTER_PORT`, set by torchrun to its own store (port 29500 unless `--master-port` or `--standalone`) |
 | Overrides | `MASTER_ADDR` and `MASTER_PORT`, each on its own | none needed |
 
 Under Slurm, concurrent steps of one job, and the tasks of a job array (each a job of its own),
