@@ -34,6 +34,9 @@ contents of the result file may still change between releases.
   regions and result file.
 * **Sharding** over init times (`--shard i/n`, or automatically from Slurm job steps and job
   arrays) with exact merging of the partial results.
+* **Member-parallel runs** (`--member-group`) spread the members of every init time over the GPUs
+  of an `srun` or `torchrun` launch, for ensembles too large for one GPU, and write the unsplit
+  run's file.
 * **Bring your own sources**: forecast, target and climatology sources are small protocols; a
   persistence baseline, a linear-interpolation baseline, an in-memory climatology and in-memory
   fakes are included.
@@ -167,6 +170,7 @@ src/anemoi/evaluation/
     weights.py           node weights
     regions.py           region masks
     output.py            xarray output, netcdf round trip, merging
+    distributed.py       member groups: the member exchange, the gathered state, the group abort
     sources/base.py      source protocols and base classes
     sources/anemoi_inference.py   forecasts from an anemoi-inference runner
     sources/anemoi_dataset.py     targets from an anemoi-datasets zarr, prefetched

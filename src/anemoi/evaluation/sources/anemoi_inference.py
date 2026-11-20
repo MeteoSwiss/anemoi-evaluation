@@ -15,6 +15,7 @@ import os
 from collections import OrderedDict
 from collections.abc import Iterator
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -30,6 +31,9 @@ from anemoi.evaluation.sources.base import variable_info
 from anemoi.evaluation.sources.temporal_downscaler import downscaler_window
 from anemoi.evaluation.sources.temporal_downscaler import trajectory_trained
 from anemoi.evaluation.sources.temporal_downscaler import window_input_state
+
+if TYPE_CHECKING:
+    from anemoi.evaluation.distributed import MemberGroup
 
 LOG = logging.getLogger(__name__)
 QUIET_LOGGERS = ("anemoi.inference", "anemoi.utils.timer")
@@ -471,8 +475,8 @@ class DatasetForecast:
 
 
 class InferenceForecastSource(ForecastSourceBase):
-    """Runs an anemoi-inference checkpoint; `members` lockstep rollouts per init time, `quiet` silences the
-    runner's per-step logging while it runs.
+    """Runs an anemoi-inference checkpoint; `members` lockstep rollouts per init time (a rank's block of them in a
+    member group, see `split_members`), `quiet` silences the runner's per-step logging while it runs.
 
     A checkpoint trained on multiple datasets gives one `DatasetForecast` view per dataset (`datasets`), all sharing
     this runner and one rollout; `multi_frames()` yields one frame per dataset per step. A single-dataset
@@ -506,6 +510,7 @@ class InferenceForecastSource(ForecastSourceBase):
         self.seed = seed
         self.quiet = quiet
         self.forcings_cache_bytes = forcings_cache_bytes
+        self.member_group: MemberGroup | None = None
         self._initial: dict[str, tuple[datetime.datetime, dict]] = {}
         with self._quiet():
             config = RunConfiguration.load({"verbosity": 0, **self.run_config, "output": "none"})
@@ -631,6 +636,60 @@ class InferenceForecastSource(ForecastSourceBase):
         """Device the model runs on."""
         return self.runner.device
 
+    def split_members(self, group: MemberGroup) -> None:
+        """Run this rank's block of the members of a member group, reseeded by their index in the whole ensemble, and
+        yield frames of every member and this rank's block of the requested variables, exchanged with the other
+        ranks once per frame per dataset. `members` stays the ensemble size; the lead-0 frame is built locally."""
+        if self.members < 2:
+            raise ValueError("a member-parallel run needs an ensemble, the forecast has one member")
+        if self.members < group.size:
+            raise ValueError(
+                f"{self.members} members cannot be split over {group.size} ranks: every rank needs a member"
+            )
+        device = self.run_config.get("device")
+        configured = None if device is None else torch.device(str(device))
+        if configured is not None and configured.type == "cuda" and configured.index is not None:
+            # the same answer on every rank: only a task that sees just its own GPU may name it, as cuda:0
+            visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            if visible != 1 or configured.index != 0:
+                raise ValueError(
+                    f"device {device!r} names a GPU, and this task sees {visible}: set device: cuda, each rank then "
+                    "takes its own"
+                )
+        self.member_group = group
+
+    def _member_indices(self) -> range:
+        """The members this process runs, by their index in the ensemble."""
+        block = slice(0, self.members) if self.member_group is None else self.member_group.block(self.members)
+        return range(block.start, block.stop)
+
+    def _frames(
+        self,
+        init_time: datetime.datetime,
+        step: datetime.timedelta,
+        date: datetime.datetime,
+        variables: Mapping[str, list[str]],
+        outputs: list[dict],
+        device: torch.device,
+    ) -> dict[str, Frame]:
+        """One frame per dataset of `variables` from the members' `outputs` (tensors, or numpy arrays from a
+        temporal downscaler), copied into a new tensor. In a member group it is every member's frame of this rank's
+        variables, and the rank's frame of every variable is freed here, before the frames are scored."""
+        frames = {}
+        for name, columns in variables.items():
+            columns = list(columns)
+            data = torch.stack(
+                [torch.stack([torch.as_tensor(output[name]["fields"][v]) for v in columns]) for output in outputs]
+            )
+            data = data.float().to(device)
+            if self.member_group is not None:
+                from anemoi.evaluation.distributed import swap
+
+                data = swap(data, self.members)
+                columns = columns[self.member_group.block(len(columns))]
+            frames[name] = Frame(init_time, step, date, columns, data)
+        return frames
+
     def lead_times(self, lead_time: datetime.timedelta) -> list[datetime.timedelta]:
         """Lead times of the model's outputs up to `lead_time` (see `rollout_schedule`); warns when the model's last
         call computes beyond `lead_time`. A forecaster's `lead_time` must be a multiple of its timestep, a temporal
@@ -723,9 +782,9 @@ class InferenceForecastSource(ForecastSourceBase):
         # The runner enters inference mode inside each generator; interleaved generators exit out of
         # order, so this outer guard is what restores the caller's mode.
         with self._quiet(), torch.inference_mode():
+            members = self._member_indices()
             generators = [
-                self.runner.run(input_states=states, lead_time=lead_time, return_numpy=False)
-                for _ in range(self.members)
+                self.runner.run(input_states=states, lead_time=lead_time, return_numpy=False) for _ in members
             ]
             # reseeded before the `next()` that makes a call; every yielded step must be the scheduled one
             schedule = self.rollout_schedule(lead_time)
@@ -734,7 +793,7 @@ class InferenceForecastSource(ForecastSourceBase):
                     outputs = []
                     call, lead = schedule[step_index] if step_index < len(schedule) else (None, None)
                     new_call = call is not None and (step_index == 0 or schedule[step_index - 1][0] != call)
-                    for member, generator in enumerate(generators):
+                    for member, generator in zip(members, generators):
                         if new_call:
                             torch.manual_seed(member_seed(self.seed, init_time, member, call))
                         outputs.append(next(generator, None))
@@ -749,14 +808,7 @@ class InferenceForecastSource(ForecastSourceBase):
                         raise RuntimeError(f"the runner yielded more outputs than scheduled at {init_time} + {step}")
                     if step != lead:
                         raise RuntimeError(f"the runner yielded step {step} at {init_time}, lead time {lead} was due")
-                    frames = {}
-                    for name in names:
-                        columns = list(variables[name])
-                        data = torch.stack(
-                            [torch.stack([output[name]["fields"][v] for v in columns]) for output in outputs]
-                        ).float()
-                        frames[name] = Frame(init_time, step, date, columns, data.to(device))
-                    yield frames
+                    yield self._frames(init_time, step, date, variables, outputs, device)
             finally:
                 for generator in generators:
                     generator.close()
@@ -777,9 +829,11 @@ class InferenceForecastSource(ForecastSourceBase):
         view = self.datasets[name]
         select_variables(list(variables), view.variables)
         fields = self._initial_state(name, init_time)["fields"]
-        nan = np.full(view.grid.n, np.nan, dtype=np.float32)
-        data = np.stack([np.asarray(fields[v][-1], dtype=np.float32) if v in fields else nan for v in variables])
-        data = torch.from_numpy(np.ascontiguousarray(data)).to(device)[None].repeat(self.members, 1, 1)
+        data = np.full((len(variables), view.grid.n), np.nan, dtype=np.float32)
+        for row, v in zip(data, variables):
+            if v in fields:
+                row[:] = fields[v][-1]
+        data = torch.from_numpy(data).to(device)[None].repeat(self.members, 1, 1)
         return Frame(init_time, datetime.timedelta(0), init_time, list(variables), data)
 
     def _quiet(self) -> contextlib.AbstractContextManager:
@@ -811,10 +865,10 @@ class InferenceForecastSource(ForecastSourceBase):
         `init_time`, one frame per output offset, the left bound skipped.
 
         The members advance in lockstep as a forecaster's do and each member's model call is preceded by
-        `member_seed(seed, init_time, member, 0)`. The runner yields the left bound first when it writes the initial
-        state (no model call), so a member is reseeded before every `next()` until its first output; its fields are
-        numpy arrays whatever `return_numpy` says, and are copied into tensors before the next `next()`. Any other
-        step than the window's leads, or a missing one, raises."""
+        `member_seed(seed, init_time, member, 0)`, `member` its index in the ensemble. The runner yields the left bound
+        first when it writes the initial state (no model call), so a member is reseeded before every `next()` until its
+        first output; its fields are numpy arrays whatever `return_numpy` says, and are copied into tensors before the
+        next `next()`. Any other step than the window's leads, or a missing one, raises."""
         names = list(variables)
         for name in names:
             select_variables(list(variables[name]), self.datasets[self._resolve_dataset(name)].variables)
@@ -825,20 +879,20 @@ class InferenceForecastSource(ForecastSourceBase):
         }
         self.runner.reference_date = None
         with self._quiet(), torch.inference_mode():
+            members = self._member_indices()
             generators = [
-                self.runner.run(input_states=states, lead_time=self.window, return_numpy=False)
-                for _ in range(self.members)
+                self.runner.run(input_states=states, lead_time=self.window, return_numpy=False) for _ in members
             ]
-            called, yielded = [False] * self.members, []
+            called, yielded = [False] * len(members), []
             try:
                 while True:
                     outputs = []
-                    for member, generator in enumerate(generators):
-                        if not called[member]:
+                    for local, (member, generator) in enumerate(zip(members, generators)):
+                        if not called[local]:
                             torch.manual_seed(member_seed(self.seed, init_time, member, 0))
                         output = next(generator, None)
                         if output is not None and output[names[0]]["step"] > datetime.timedelta(0):
-                            called[member] = True
+                            called[local] = True
                         outputs.append(output)
                     if all(output is None for output in outputs):
                         break
@@ -853,17 +907,7 @@ class InferenceForecastSource(ForecastSourceBase):
                     if step not in leads:
                         raise RuntimeError(f"the runner yielded {step} at {init_time}, not a lead of the window")
                     yielded.append(step)
-                    frames = {}
-                    for name in names:
-                        columns = list(variables[name])
-                        data = torch.stack(
-                            [
-                                torch.stack([torch.as_tensor(output[name]["fields"][v]) for v in columns])
-                                for output in outputs
-                            ]
-                        ).float()
-                        frames[name] = Frame(init_time, step, date, columns, data.to(device))
-                    yield frames
+                    yield self._frames(init_time, step, date, variables, outputs, device)
             finally:
                 for generator in generators:
                     generator.close()
