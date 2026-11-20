@@ -529,6 +529,10 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
                 str(tmp_path / f"{label}-unsplit-{middle}0-1.nc"),
                 ranks,
             )
+    for name in ("era5-3-0-1.nc", "both-3-realch1-0-1.nc"):  # `_same_file` compared the periods too
+        with xr.open_dataset(tmp_path / name, decode_timedelta=True) as split:
+            periods = dict(zip(split["variable"].values.tolist(), split["period"].values.tolist()))
+        assert periods["tp"] == "6h" and {period for key, period in periods.items() if key != "tp"} == {""}, name
     with xr.open_dataset(tmp_path / "skip-unsplit-0-1.nc", decode_timedelta=True) as skipped:
         counts = skipped["n_init"].values
     assert counts.min() < counts.max()  # the missing target date was skipped
