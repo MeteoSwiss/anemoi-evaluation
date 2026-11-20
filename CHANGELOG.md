@@ -6,12 +6,13 @@
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.
-* `run --member-group` spreads the members of every init time over the tasks of a job step, one
-  GPU each, and rank 0 writes the file the unsplit run would write, with a `member_ranks` attr and the
-  timings and counters summed over the ranks. The tasks form one member group, not shards: init times are
-  sharded by `--shard` or a job array, and a member-group shard merges like any other.
-* The dry-run plan sizes the lockstep members and the ensemble scoring temporaries, and in a member group
-  a rank's share of the model time and the member exchange.
+* `run --member-group` spreads the members of every init time over the tasks of an `srun` or
+  `torchrun` launch, one GPU each, and rank 0 writes the file the unsplit run would write, with a
+  `member_ranks` attr and the timings and counters summed over the ranks. The tasks form one member
+  group, not shards: init times are sharded by `--shard` or a job array, and a member-group shard
+  merges like any other.
+* The dry-run plan sizes the lockstep members and the ensemble scoring temporaries, and with
+  `--member-group --ranks R` a rank's share of the model time and the member exchange.
 
 ### Changes
 

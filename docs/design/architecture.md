@@ -388,15 +388,16 @@ and would then silently evaluate one shard of n under the full output name.
 scores one. A shard of such a run writes one file per dataset; merging is then per dataset, and `merge()`
 refuses inputs whose `dataset` attributes differ (FR-30). The
 module imports torch and the package lazily inside the command functions, so `--help` is cheap.
-`--member-group R` makes the tasks of the step one member group (section 3.13) instead of shards,
+`--member-group` makes the tasks of the launch one member group (section 3.13) instead of shards,
 so `resolve_shard()` then counts only the job array.
 
 ### 3.13 Member groups: `distributed.py`
 
-A member group (FR-41) is the `R` tasks of one job step, the world process group: NCCL on CUDA, gloo
-otherwise, joined at `MASTER_ADDR:MASTER_PORT` (derived from Slurm when unset) with an explicit
-timeout and a collective right after, which gathers the device names and refuses a group on mixed
-GPU models (NFR-6). The collective makes
+A member group (FR-41) is the `R` tasks of one `srun` step or `torchrun` launch, the world process
+group: NCCL on CUDA, gloo otherwise, joined at `MASTER_ADDR:MASTER_PORT` (derived from Slurm when
+unset, torchrun's store under torchrun) with an explicit timeout and a collective right after,
+which gathers every rank's host and GPU. Two ranks on one GPU are refused; a group on mixed GPU
+models only warns, since its ensemble is valid but not bit-identical to an unsplit run (NFR-6). The collective makes
 every rank come up before the model loads and satisfies NCCL's rule that every rank takes part in the
 first batched send and receive of a group. Rank `r` of `R` owns the contiguous
 member block `blocks(M, R)[r]` and the contiguous variable block `blocks(V, R)[r]`; `M < R` is
@@ -421,12 +422,13 @@ rank's state is the slice of the unsplit state bit for bit, and rank 0 concatena
 (`gather_state`, `concat_states`) gives the unsplit state. `finish` runs on every rank first, since
 the attrs it sets are merged by rule (`merge_attrs`): timings and read counters summed, the peak
 memory the maximum, the non-finite climatology maps unioned, the rest rank 0's, and a group whose
-ranks disagree on the GPU model, the chunk counts, the checkpoint, the config or the package
-versions refused. Rank 0 writes; its file is an ordinary shard.
+ranks disagree on the chunk counts, the checkpoint, the config or the package versions refused;
+`gpu` lists the ranks' GPU models. Rank 0 writes; its file is an ordinary shard.
 
 A failing rank aborts the world group and re-raises (`abort_on_error`). Over gloo the peers fail at
-once; over NCCL a peer already inside a collective waits for the timeout, which is why the user
-guide runs the step with `srun --kill-on-bad-exit=1`. Only the world group is aborted: destroying a
+once; over NCCL a peer already inside a collective waits for the timeout, which is why the
+launcher must stop the other tasks (`srun --kill-on-bad-exit=1`, or torchrun, which does it by
+itself). Only the world group is aborted: destroying a
 gloo subgroup does not unblock its peers.
 
 ## 4. Data flow of a run

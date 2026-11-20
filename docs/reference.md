@@ -20,7 +20,7 @@ The console script `anemoi-evaluation` (entry point `anemoi.evaluation.__main__:
 subcommands. A subcommand is required.
 
 ```
-anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group [R]] [--dry-run] [--step-time seconds]
+anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group] [--dry-run] [--step-time seconds] [--ranks R]
 anemoi-evaluation merge <results.nc>... -o <merged.nc> [--partial]
 ```
 
@@ -32,15 +32,17 @@ Runs an evaluation from a YAML config and writes the results netcdf.
 |---|---|---|---|
 | `config` | path, positional, required | n/a | YAML config, loaded by `load_config` (`base:` chain and `from_checkpoint:` blocks resolved first). |
 | `--shard i/n` | string `i/n` | Slurm auto-detection, else `0/1` | Evaluate init times `i`, `i+n`, `i+2n`, ... and write `output.path` with `{shard}` / `{shards}` filled in. See [Sharding](#sharding). |
-| `--member-group [R]` | int, optional | unset | Split the members of every init time over the `R` tasks of the step, one GPU each, and write the result from rank 0; a bare `--member-group` takes `R` from the step's task count and is refused in a step of one task, and `R = 1` is the unsplit run. A bare flag may also come before the config. The tasks are then not shards: only `--shard` and the job array shard. With `--dry-run`, plan rank 0 of `R` (`R` required). See [member-parallel runs](#member-parallel-runs). |
+| `--member-group` | flag | off | Split the members of every init time over the tasks of the `srun` or `torchrun` launch, one GPU each, and write the result from rank 0; refused in a launch of one task. The tasks are then not shards: only `--shard` and the job array shard. See [member-parallel runs](#member-parallel-runs). |
 | `--dry-run` | flag | off | Resolve the config and the sources, check the dates, print the plan as YAML on stdout, and exit without loading a model or running it. |
 | `--step-time seconds` | float | unset | Seconds of model time per model call per member; adds the `time` block to the plan. Only valid with `--dry-run`. `docs/benchmarks.md` section 3 reports measured values; one call of a multi-step-output model produces several frames. |
+| `--ranks R` | int | unset | The member group size to plan for, at least 2; the plan is rank 0's. Only valid with `--dry-run` and `--member-group`, which requires it. |
 
 Order of operations in `run`:
 
-1. `--step-time` without `--dry-run` raises `SystemExit("--step-time is only used by --dry-run")`.
-2. The config is loaded. With `--member-group R` and without `--dry-run`, a step whose task count is not
-   `R` raises `SystemExit`, and so does a bare `--member-group` with `--dry-run` or in a step of one task. With CUDA and several
+1. `--step-time` without `--dry-run` raises `SystemExit("--step-time is only used by --dry-run")`, and
+   `--ranks` without both `--dry-run` and `--member-group` raises `SystemExit` too.
+2. The config is loaded. With `--member-group`, a launch of one task raises `SystemExit`, and so does
+   `--dry-run` without `--ranks R` (or with `R < 2`). With CUDA and several
    visible devices the task's device is set to `LOCAL_RANK` or `SLURM_LOCALID`, and a local rank without a
    device of its own raises `SystemExit`; a task that sees one device (`--gpus-per-task=1`) keeps it. The shard is resolved, and without `--dry-run` a config with no `output.path`
    raises `SystemExit("the config needs output.path to run from the command line")`.
@@ -55,7 +57,8 @@ Order of operations in `run`:
    closed in a `finally`, `state.attrs["shard"]` is set to `"i/n"` (also for an unsharded run, where it
    is `"0/1"`), and the dataset is written to the formatted path, creating parent directories. A
    multi-dataset run writes one file per dataset, `{dataset}` filled in with the dataset's name. A member
-   group joins its process group first (no rendezvous, see `MASTER_ADDR`, raises `SystemExit`),
+   group joins its process group first (no rendezvous, an unresolvable host or two ranks on one GPU raise
+   `SystemExit`),
    runs under `abort_on_error`, gathers every dataset's state on rank 0 after closing the sources, sets
    `member_ranks` and `shard` there, and only rank 0 writes.
 
@@ -87,11 +90,11 @@ merged file carries the same metric variables as its inputs. See
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `SLURM_STEP_NUM_TASKS` | `resolve_shard`, `task_env` | Tasks per job step; the per-step shard count, or the size of a member group. Default 1. |
+| `SLURM_STEP_NUM_TASKS` | `resolve_shard`, `task_env` | Tasks per job step; the per-step shard count, or the size of a member group started by `srun`. Default 1. |
 | `SLURM_PROCID` | `resolve_shard`, `task_env` | Task rank within the step. Default 0. |
 | `SLURM_LOCALID` | `task_env` | Node-local task rank, the CUDA device of a member-group rank. Default 0. |
 | `RANK`, `WORLD_SIZE`, `LOCAL_RANK` | `task_env` | torchrun's rank, task count and local rank, read for a member group only when torchrun started the process (`TORCHELASTIC_RUN_ID` set); they then take precedence over the Slurm ones, and `RANK` and `WORLD_SIZE` are required. |
-| `MASTER_ADDR`, `MASTER_PORT` | `rendezvous` | Rank 0's address and a free port, where a member group meets (`tcp://`). Each one unset comes from Slurm: the first host of `SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`, and `15000 + 16 * (SLURM_JOB_ID % 1000) + SLURM_STEP_ID % 16` (step id 0 when unset or not a number), below the ephemeral ports; concurrent steps of a job differ in `SLURM_STEP_ID`, and a job-array task has its own `SLURM_JOB_ID`. Required with `--member-group` outside Slurm. |
+| `MASTER_ADDR`, `MASTER_PORT` | `rendezvous` | Rank 0's address and a free port, where a member group meets (`tcp://`). Each one unset comes from Slurm: the first host of `SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`, and `15000 + 16 * (SLURM_JOB_ID % 1000) + SLURM_STEP_ID % 16` (step id 0 when unset or not a number), below the ephemeral ports; concurrent steps of a job differ in `SLURM_STEP_ID`, and a job-array task has its own `SLURM_JOB_ID`. Required with `--member-group` outside Slurm; torchrun sets both to its own store. The address is resolved with `socket.gethostbyname` before the group is joined, and a failure raises. |
 | `SLURM_ARRAY_TASK_ID` | `resolve_shard` | Job-array task id. Default 0. |
 | `SLURM_ARRAY_TASK_MIN` | `resolve_shard` | Lowest job-array id, subtracted from the task id. Default 0. |
 | `SLURM_ARRAY_TASK_COUNT` | `resolve_shard` | Number of job-array tasks. Default 1. |
@@ -756,7 +759,7 @@ Provenance:
 | Attr | Content |
 |---|---|
 | `checkpoint`, `checkpoint_uuid`, `checkpoint_run_id` | Checkpoint identity, from the inference source. |
-| `gpu`, `inference_chunks_processor`, `inference_chunks_mapper` | Recorded once the model is loaded; part of a run's numerical identity. |
+| `gpu`, `inference_chunks_processor`, `inference_chunks_mapper` | Recorded once the model is loaded; part of a run's numerical identity. A member group's `gpu` lists its ranks' models. |
 | `forecast` | `persistence` or `linear_interpolation`, from the baseline sources. |
 | `config` | The run's config as YAML; omitted when the objects cannot be serialised. |
 | `package_versions` | JSON of the installed `anemoi-evaluation`, `anemoi-inference`, `anemoi-models`, `anemoi-graphs`, `anemoi-datasets` and `torch` versions (null when absent). |
@@ -1173,10 +1176,13 @@ run. For what the merge guarantees numerically, see [merging](#merging).
 
 ## Member-parallel runs
 
-A member group is the `R` tasks of one `srun` (or `torchrun`) step, started with `run --member-group R`;
+A member group is the `R` tasks of one `srun` step or `torchrun` launch, started with `run --member-group`;
 it is the world process group, NCCL on CUDA and gloo otherwise, met at `rendezvous()` (`MASTER_ADDR:MASTER_PORT`,
-else derived from Slurm) with a 10-minute timeout. Right after, every rank sends its device name to every other one, which is the first
-collective of the group, and ranks on different GPU models are refused. With `M` members and `V` scored variables, rank `r` has the
+else derived from Slurm, the host resolved first) with a 10-minute timeout. Under torchrun the `tcp://` init joins
+torchrun's store at `MASTER_ADDR:MASTER_PORT` as a client (or rank 0 hosts one there when torchrun does not share
+its store, `TORCH_DISABLE_SHARE_RDZV_TCP_STORE=1`). Right after, every rank sends its host, GPU uuid and GPU
+model to every other one, which is the first collective of the group: two ranks on one GPU are refused, and ranks on
+different GPU models log a warning on rank 0, since their ensemble is valid but not bit-identical to an unsplit run. With `M` members and `V` scored variables, rank `r` has the
 member block `blocks(M, R)[r]` and the variable block `blocks(V, R)[r]` (`anemoi.evaluation.distributed`):
 contiguous, sizes differing by at most one, the larger first. Per frame and dataset:
 
@@ -1197,8 +1203,7 @@ rank bins, the reliability levels and the config stay those of the whole ensembl
 
 Rank 0 refuses to concatenate states that disagree on anything but their variables: lead times, bins,
 regions, `members`, init times, frame counts (`n_init`) or statistics, overlapping variable blocks, and
-attrs that must match: `gpu` (bit-identity needs one GPU model), `inference_chunks_*`,
-`checkpoint_uuid`, `config` and `package_versions`.
+attrs that must match: `inference_chunks_*`, `checkpoint_uuid`, `config` and `package_versions`.
 
 The attrs of the written file, against the unsplit run's:
 
@@ -1209,17 +1214,21 @@ The attrs of the written file, against the unsplit run's:
 | `forcings_computed`, `forcings_bypassed`, `forcings_hits` | Summed: every rank computes the forcings of its own members, so `forcings_computed` comes out `R` times the unsplit value and `forcings_hits` lower by the difference; the three add up to the unsplit total. |
 | `peak_gpu_memory_bytes` | The maximum over the ranks. |
 | `climatology_nonfinite_nodes` | The union of the ranks' maps. |
+| `gpu` | The ranks' GPU models, sorted and comma-separated: one model, as in the unsplit run, when they agree. |
 | `member_ranks` | `R`. |
 | everything else, `model_calls` included | Rank 0's, the unsplit run's. |
 
 A failing rank aborts the world group (`abort_on_error`) and re-raises. Over gloo the other ranks then
 fail at once. Over NCCL a rank already inside a collective waits for NCCL's timeout, and torch documents
-its abort for `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, so run the step with `srun --kill-on-bad-exit=1`.
+its abort for `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, so the launcher must stop the other tasks: `srun
+--kill-on-bad-exit=1` ends the step when one task fails, and `torchrun` stops its workers when one fails (or
+restarts them all with `--max-restarts`).
 
-Refused, with a `SystemExit` from the CLI: a step whose task count is not `R`, one member, fewer members
-than ranks, a forecast source other than `anemoi_inference`, a `device: cuda:N` when the task sees several GPUs (only `cuda:0` with one visible GPU passes, the same on every rank), a bare `--member-group` in a step of one task, more tasks on a
-node than visible GPUs (when a task sees several), no `MASTER_ADDR` or `MASTER_PORT` outside Slurm,
-and ranks on different GPU models.
+Refused, with a `SystemExit` from the CLI: a launch of one task, one member, fewer members than ranks, a
+forecast source other than `anemoi_inference`, a `device: cuda:N` when the task sees several GPUs (only `cuda:0`
+with one visible GPU passes, the same on every rank), more tasks on a node than visible GPUs (when a task sees
+several), no `MASTER_ADDR` or `MASTER_PORT` outside Slurm, a rendezvous host that does not resolve, and two ranks
+on one GPU (same host and GPU uuid). Supported launchers are `srun` and `torchrun`.
 
 ## Seeding and reproducibility
 

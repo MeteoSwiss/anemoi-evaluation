@@ -272,7 +272,7 @@ INFO ...: dry run: about 0.14 GPU-hours of model time, about 10 minutes 9 second
 The estimate is `model calls x members x step time` plus 105 s of process startup per shard, so
 the same run with `--shard 0/4` reports about 3 minutes 51 seconds per shard over 4 shards. It
 counts neither target reads (assumed hidden by prefetch) nor statistics. `--step-time` without
-`--dry-run` is an error. With `--member-group R`, `members` is the members of one rank and
+`--dry-run` is an error. With `--member-group --ranks R`, `members` is the members of one rank and
 `gpu_hours` counts all `R` GPUs ([member-parallel runs](#member-parallel-runs)).
 
 ## Ensembles
@@ -865,12 +865,15 @@ merged = ae.merge(["results/run-0.nc", "results/run-2.nc"], partial=True)
 ## Member-parallel runs
 
 Sharding splits the init times; a member-parallel run splits the members of every init time over
-the `R` tasks of one `srun` step, one GPU each, for an ensemble too large for one GPU. Rank `r`
-runs a contiguous block of the members, seeded by their index in the whole ensemble, so they are
-the members an unsplit run would produce. After every frame the ranks exchange their members, so
-that each one holds every member of a contiguous block of the variables, which it scores. At the
-end rank 0 gathers the blocks and writes the file the unsplit run would have written, bit for bit
-on one GPU model. The other ranks write nothing.
+the tasks of one launch, one GPU each, for an ensemble too large for one GPU. Rank `r` runs a
+contiguous block of the members, seeded by their index in the whole ensemble, so they are the
+members an unsplit run would produce. After every frame the ranks exchange their members, so that
+each one holds every member of a contiguous block of the variables, which it scores. At the end
+rank 0 gathers the blocks and writes the file the unsplit run would have written, bit-identical
+when every rank and the unsplit run use one GPU model and the same software stack. The other ranks
+write nothing.
+
+`--member-group` makes all the tasks of the launch one group. Start them with `srun`:
 
 ```bash
 #!/bin/bash
@@ -882,23 +885,46 @@ on one GPU model. The other ranks write nothing.
 srun --kill-on-bad-exit=1 anemoi-evaluation run config.yaml --member-group
 ```
 
-A bare `--member-group` makes all the tasks of the step one group; `--member-group R` must equal
-their number (`srun`'s, or `torchrun`'s `WORLD_SIZE`). A bare flag in a step of one task, as when
-`srun` is forgotten, is refused rather than run all the members on one GPU; `--member-group 1`
-runs unsplit on purpose. The ranks meet at rank 0's node: under Slurm the first host of the step
-and port `15000 + 16 * (job id % 1000) + step id % 16`, so concurrent steps of one job, and the
-tasks of a job array (each a job of its own), meet on different ports even on one node. `MASTER_ADDR` and
-`MASTER_PORT` override them; outside Slurm they are required. With CUDA a task that sees one GPU
-(`--gpus-per-task=1`) takes it, and tasks that share a node's GPUs take the GPU `SLURM_LOCALID`;
-more tasks on a node than GPUs are refused. Leave `device: cuda` in the inference block without an
-index: an index is refused on every rank when a task sees several GPUs (`cuda:0` passes only when
-the task sees its own GPU alone); the ranks talk over NCCL, otherwise over gloo.
-`--kill-on-bad-exit=1` matters: a failing rank aborts the group, but a rank already waiting for it
-inside NCCL only notices when Slurm kills the step.
+or with `torchrun`, one worker per GPU of the node (inside a Slurm job, as the single task of a
+step that sees the node's GPUs):
 
-The tasks of the step are one member group, not shards. Shard init times as before with `--shard`
-or a job array, one group per shard: `#SBATCH --array=0-3` and the same `srun` line give four
-groups, each writing its shard. A member-group shard is an ordinary shard: it merges with the
+```bash
+torchrun --nproc_per_node=4 $(which anemoi-evaluation) run config.yaml --member-group
+```
+
+A one-task launch with `--member-group`, as when `srun` is forgotten, is refused rather than run
+all the members on one GPU; without the flag the run is unsplit. The tasks find their rank and
+rank 0's address in the launcher's environment:
+
+| | `srun` | `torchrun` |
+|---|---|---|
+| Rank, group size, rank on the node | `SLURM_PROCID`, `SLURM_STEP_NUM_TASKS`, `SLURM_LOCALID` | `RANK`, `WORLD_SIZE`, `LOCAL_RANK` (they win over Slurm's when torchrun started the process) |
+| Where the ranks meet | the first host of the step, port `15000 + 16 * (job id % 1000) + step id % 16` | `MASTER_ADDR`, `MASTER_PORT`, set by torchrun to its own store |
+| Overrides | `MASTER_ADDR` and `MASTER_PORT`, each on its own | none needed |
+
+Under Slurm, concurrent steps of one job, and the tasks of a job array (each a job of its own),
+meet on different ports even on one node. The address is resolved at startup, so a host the
+nodes cannot resolve fails at once. Other launchers (`mpirun`, ...) are not supported; ask for one
+in an issue.
+
+**One GPU per task.** A task that sees one GPU (`--gpus-per-task=1`) takes it, and tasks that
+share a node's GPUs (`--gpus-per-node`, `torchrun`) take the one of their rank on the node; more
+tasks on a node than GPUs are refused, and so are two ranks that end up on one GPU. Several GPUs
+per task (`--gpus-per-task=2`) are not supported: a task would use one of its GPUs, picked by its
+rank on the node, or be refused. Leave `device: cuda` in the inference block without an index: an
+index is refused on every rank when a task sees several GPUs (`cuda:0` passes only when the task
+sees its own GPU alone). The ranks talk over NCCL, otherwise over gloo. A group on different GPU
+models (mixed nodes) runs with a warning: its ensemble is valid but not bit-identical to an
+unsplit run, and the file's `gpu` lists the models.
+
+**Failures.** A failing rank aborts the group, but a rank already waiting for it inside NCCL only
+notices when the launcher stops it. With `srun`, pass `--kill-on-bad-exit=1`, which ends the step
+as soon as one task fails. `torchrun` stops all its workers when one fails, and with
+`--max-restarts` above 0 it restarts the whole group instead.
+
+The tasks of the launch are one member group, not shards. Shard init times as before with
+`--shard` or a job array, one group per shard: `#SBATCH --array=0-3` and the same `srun` line give
+four groups, each writing its shard. A member-group shard is an ordinary shard: it merges with the
 others, and with the shards of an unsplit run of the same config.
 
 The file records the group size as `member_ranks`. Its timings and read counters are summed over
@@ -909,11 +935,24 @@ of its own members); see the [reference](reference.md#member-parallel-runs).
 Every rank needs at least one member, `M >= R`, and an ensemble: one member is refused, and so is
 any forecast source other than `anemoi_inference` (persistence and linear interpolation). Forecasters,
 offset forecasters, temporal downscalers, multi-dataset checkpoints and `include_lead_zero` all
-work. `--dry-run --member-group R` plans rank 0, with the rank's members in the time estimate
-(`gpu_hours` counts every rank) and in the `bytes` block the lockstep members, the exchange
-buffers (about twice the rank's frame, beside the frame it receives) and the ensemble scoring
-temporaries, and their sum as `peak` (without the model's activations). `--dry-run` needs the group
-size, `--member-group R`; `--member-group 1` is the unsplit run.
+work. `--dry-run --member-group --ranks R` plans rank 0 of `R`, with the rank's members in the
+time estimate (`gpu_hours` counts every rank) and in the `bytes` block the lockstep members, the
+exchange buffers (about twice the rank's frame, beside the frame it receives) and the ensemble
+scoring temporaries, and their sum as `peak` (without the model's activations).
+
+### Site notes
+
+Tested on one HPC system (Slingshot, NVIDIA A100, `srun` and `torchrun`). Elsewhere:
+
+- **Multi-homed nodes**: NCCL and gloo pick a network interface themselves. If they pick one the
+  other nodes cannot reach, set `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the right one.
+- **Interconnect**: without the NCCL plugin for the site's fabric (such as aws-ofi-nccl on
+  Slingshot) NCCL falls back to TCP sockets. Results are the same, but the exchange is slow across
+  nodes; `NCCL_DEBUG=INFO` logs the network it uses.
+- **Containers**: every task needs its GPU and the fabric inside the container, and the rendezvous
+  port of rank 0's node must be reachable from the other nodes.
+- **ROCm**: torch reports AMD GPUs as `cuda` and runs the group on RCCL under the `nccl` name.
+  Untested.
 
 ## Reading the results
 
@@ -1079,15 +1118,19 @@ Dates, grids, variables and merging:
 | `N of the M shards of the run were given, missing ...` | rerun the shard, or merge with `--partial` |
 | `cannot merge states that share init times`, `duplicate shards of n` | the same result would be counted twice |
 | `cannot merge states with different coordinates or statistics` | the inputs came from different configs |
-| `--member-group R needs as many tasks in the step` | start the run with `srun` (or `torchrun`) and `R` tasks, `--member-group "$SLURM_NTASKS"` |
-| `a bare --member-group takes the group size from the tasks of the step` | the run is one task: start it with `srun` and one task per rank, or pass `--member-group 1` to run unsplit |
-| `a member group needs MASTER_ADDR and MASTER_PORT in the environment` | outside Slurm, export rank 0's host and a free port, as in [member-parallel runs](#member-parallel-runs) |
-| `the ranks run on different GPU models [...]` | the group spans GPU models (mixed nodes), whose members are not bit-identical; constrain the job to one GPU model |
+| `--member-group makes the tasks of the launch one group, and this process is one task` | start one task per GPU with `srun` or `torchrun`, or run without `--member-group` |
+| `--dry-run --member-group plans rank 0 of a group: pass --ranks R` | give the group size to plan for, `--ranks R` with `R` at least 2 |
+| `a member group needs MASTER_ADDR and MASTER_PORT in the environment` | outside Slurm and torchrun, export rank 0's host and a free port, as in [member-parallel runs](#member-parallel-runs) |
+| `cannot resolve the member group's rendezvous host` | the host in `MASTER_ADDR`, or the first host of the step, is not a name the node resolves; set `MASTER_ADDR` to an address of rank 0's node |
+| `ranks 0, 1 share GPU ...: a member group needs one GPU per task` | two tasks landed on one GPU; give each task its own (`--gpus-per-task=1`), or start at most one task per GPU of a node |
 
 Behaviour that is not an error:
 
 - **Members are identical and `spread` is 0**: the checkpoint has no noise injector (a warning is
   logged when the source is built).
+- **`the ranks run on different GPU models`**: a member group spans GPU models (mixed nodes). Its
+  ensemble is valid but not bit-identical to an unsplit run; constrain the job to one GPU model
+  when the bits matter.
 - **NaN metrics at lead 0 for some variables**: diagnostic variables have no analysis to score
   against; prognostic variables should be exactly 0.
 - **A low `n_init`**: targets were missing and skipped. Set `on_missing_target: raise` to find out,

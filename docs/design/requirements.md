@@ -277,7 +277,8 @@ output path MUST carry a shard placeholder or the run MUST refuse to start.
 
 **FR-41** A run MUST be able to spread the members of every init time over the ranks of one job
 step, one device each, and write the file an unsplit run of the same config writes, bit for bit
-on one GPU model apart from the summed timings and counters. Such a member group MUST be switched
+when every rank and the unsplit run use one GPU model and the same software stack, apart from the
+summed timings and counters. Such a member group MUST be switched
 on explicitly, its tasks MUST NOT also count as shards, and its file MUST merge as an ordinary
 shard. A rank that fails MUST NOT leave the others waiting for it.
 *Rationale: an AIFS-ENS-sized ensemble (about 0.6 GiB per lockstep member at 542k nodes, 1000+
