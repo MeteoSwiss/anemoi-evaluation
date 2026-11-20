@@ -317,6 +317,47 @@ def accumulation_periods(typed_variables: dict) -> dict[str, datetime.timedelta 
     return periods
 
 
+# What `Variable.compatible` of anemoi-transform compares, by the option that skips it, and the properties it reads
+COMPARED_METADATA = {
+    "units": ("units",),
+    "time_processing": ("time_processing",),
+    "processing_period": ("period",),
+    "type_of_level": ("is_pressure_level", "is_model_level", "is_surface_level"),
+}
+
+
+def _recorded(variable: object, attribute: str) -> bool:
+    try:
+        return getattr(variable, attribute) is not None
+    except (TypeError, ValueError):  # a malformed entry, such as a bad `period`
+        return False
+
+
+def compare_variables(checkpoint: dict, targets: dict, names: list[str]) -> tuple[list[str], list[str]]:
+    """Compare the anemoi-transform variables `names` of the checkpoint with the targets' as `Variable.compatible`
+    does (units, time processing, period, type of level). Returns the differences (`name: reason`) and what only one
+    side records (`name (what)`, or the name alone when a side has no metadata for it); those are skipped rather than
+    left to `compatible`, which warns about each. What neither side records is not reported."""
+    differ, unknown = [], []
+    for name in names:
+        if name not in checkpoint or name not in targets:
+            unknown.append(name)
+            continue
+        ours, theirs = checkpoint[name], targets[name]
+        skip, one_sided = {}, []
+        for option, attributes in COMPARED_METADATA.items():
+            known = [(_recorded(ours, attribute), _recorded(theirs, attribute)) for attribute in attributes]
+            skip[f"ignore_{option}"] = not all(a and b for a, b in known)
+            if any(a != b for a, b in known):
+                one_sided.append(option.replace("_", " "))
+        if one_sided:
+            unknown.append(f"{name} ({', '.join(one_sided)})")
+        compatible, reason = ours.compatible(theirs, return_reason=True, **skip)
+        if not compatible:
+            differ.append(f"{name}: {reason}")
+    return differ, unknown
+
+
 def select_variables(requested: list[str], available: list[str]) -> list[int]:
     """Indices of `requested` in `available`; raises on names that cannot be delivered."""
     unknown = [v for v in requested if v not in available]

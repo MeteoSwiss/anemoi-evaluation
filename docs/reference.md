@@ -241,13 +241,16 @@ Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
 
-When the evaluation is built, every scored variable the forecast source reports as an accumulation
-(`accumulation_periods()`; an inference source reports the periods its checkpoint records, the
-baselines none) is compared with the period in the targets' `variables_metadata`, and a difference
-is warned about. A period unknown on either side, including one anemoi-inference fills in for a
-checkpoint that records no `variables_metadata`, is logged at info level and not checked. A mismatch
-needs targets, or a forecast input, other than the checkpoint's training dataset; a cutout reports
-its first element's periods only. Other variables processed over a period are not checked yet.
+When the evaluation is built, the metadata of every scored variable the checkpoint records is
+compared with the targets' `variables_metadata`, as anemoi-transform's `Variable.compatible` does:
+units, time processing (such as `accumulation`), accumulation period and type of level (surface,
+pressure or model level). A difference is warned about, such as a 6 h `tp` checkpoint against
+realch1 v2.0's 1 h `tp`. The MARS request keys (`class`, `stream`, the GRIB `param` name) are not
+compared, since they differ between sources of truth for the same quantity. Units are compared as
+written, so `m s-1` and `m s**-1` differ. What only one side records, including what anemoi-inference
+fills in for a checkpoint that records no `variables_metadata`, is logged at info level and not
+checked; the baselines are not checked. A mismatch needs targets, or a forecast input, other than the
+checkpoint's training dataset; a cutout reports its first element's metadata only.
 
 ### Multi-dataset checkpoints
 
@@ -1081,6 +1084,7 @@ frames(init_time: datetime, lead_time: timedelta, variables: list[str], device: 
 check_init_times(init_times: list[datetime], lead_time: timedelta) -> None
 graph_node_attribute(name: str, nodes: str = "data") -> np.ndarray
 variable_info(name: str) -> dict
+recorded_variables() -> dict[str, Variable]   # optional: the anemoi-transform variables it records
 provenance() -> dict
 stats -> dict            # property
 describe() -> dict       # must not load a model
@@ -1101,6 +1105,7 @@ stats -> dict            # property: reads, read_seconds, cache_hits
 close() -> None
 grid_mask(i: int) -> np.ndarray
 variable_info(name: str) -> dict
+recorded_variables() -> dict[str, Variable]   # optional, as for forecasts
 to_config() -> dict
 describe() -> dict
 ```
@@ -1121,7 +1126,9 @@ with defaults: no device preference, no graph, no date check, no sub-grids, no l
 `stats` and `provenance`, unknown `variable_info`, and `to_config()` raising.
 Their `describe()` reports the class name, the node count and the variable count, and the forecast base
 adds `members`. Helpers: `lead_time_steps(lead_time, timestep)`, `variable_info(variable)`,
-`select_variables(requested, available)`.
+`accumulation_periods(typed_variables)`, `compare_variables(checkpoint, targets, names)`,
+`select_variables(requested, available)`. A forecast source without `recorded_variables` is not
+checked against the targets (the baselines).
 
 ### Internals (no compatibility promise)
 

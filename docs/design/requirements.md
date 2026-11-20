@@ -103,10 +103,12 @@ targets are opened with `interpolate_frequency`.
 are planned (MeteoSwiss/anemoi-evaluation#5). Interpolated targets would score the distance to an
 interpolation, not to the truth.*
 
-**FR-41** The package MUST warn when a scored accumulation covers another period in the targets
-than in the checkpoint, and MUST record each variable's accumulation period in the result.
-*Rationale: 1 h and 6 h totals give plausible scores that cannot be compared, within a run or
-across models (MeteoSwiss/anemoi-evaluation#7).*
+**FR-42** The package MUST warn when the targets describe a scored variable differently than the
+checkpoint's `variables_metadata` (units, time processing, accumulation period or type of level), and
+MUST record each variable's accumulation period in the result.
+*Rationale: such scores look plausible but compare different quantities, such as 1 h and 6 h totals,
+within a run or across models (MeteoSwiss/anemoi-evaluation#7). anemoi-transform defines when two
+variables are compatible; the request keys differ between sources of truth and are not compared.*
 
 **FR-7** Before a run, the package MUST refuse init times whose rollout would read dates absent
 from, or listed as missing in, the datasets the runner reads.
@@ -472,5 +474,6 @@ the config forms and the merge checks) and, where they need a real checkpoint, b
 [`tools/`](../../tools/README.md): `validate.py` for FR-1 to FR-11, FR-40 and NFR-1 to NFR-3,
 `compare_results.py` for NFR-4, `ab_prefetch.py` for NFR-10 and NFR-20, and the run attributes
 for the rest of section 4.2. FR-41 is verified on gloo by `tests/test_member_parallel.py`, which
-compares the files of member groups with the unsplit run's. The measurements behind every *Evidence* line above, and the
+compares the files of member groups with the unsplit run's, and FR-42 by
+`tests/test_variable_metadata.py`. The measurements behind every *Evidence* line above, and the
 testbeds they were taken on, are in [`../benchmarks.md`](../benchmarks.md).

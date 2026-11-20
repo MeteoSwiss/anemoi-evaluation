@@ -48,6 +48,8 @@ from anemoi.evaluation.sources.base import ForecastSource
 from anemoi.evaluation.sources.base import MissingGraphError
 from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSource
+from anemoi.evaluation.sources.base import accumulation_periods
+from anemoi.evaluation.sources.base import compare_variables
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.climatology import ArrayClimatology
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
@@ -144,7 +146,7 @@ class Evaluation:
             )
         targets.prefetch_hint(forecast.frames_per_pass)
         self.variables = self._resolve_variables(variables)
-        self._check_accumulation_periods()
+        self._check_variable_metadata()
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)
         if needed > forecast.members:
@@ -259,39 +261,35 @@ class Evaluation:
             raise ValueError("no variables to evaluate")
         return list(variables)
 
-    def _accumulation_periods(self) -> tuple[dict, dict]:
-        """The accumulation periods the forecast and the targets report; none from a source that reports none."""
+    def _recorded_variables(self) -> tuple[dict, dict]:
+        """The anemoi-transform variables the forecast and the targets record; none from a source that records none,
+        such as a baseline."""
         return (
-            getattr(self.forecast, "accumulation_periods", dict)(),
-            getattr(self.targets, "accumulation_periods", dict)(),
+            getattr(self.forecast, "recorded_variables", dict)(),
+            getattr(self.targets, "recorded_variables", dict)(),
         )
 
-    def _check_accumulation_periods(self) -> None:
-        """Warn about scored accumulations whose period differs between the forecast and the targets. Only the
-        accumulations the forecast reports are checked (none for the baselines); a period unknown on either side is
-        logged and not checked."""
-        model, truth = self._accumulation_periods()
-        scored = [name for name in self.variables if name in model]
-        unknown = [name for name in scored if model[name] is None or truth.get(name) is None]
-        differ = [
-            f"{name} {frequency_to_string(truth[name])} against {frequency_to_string(model[name])}"
-            for name in scored
-            if name not in unknown and model[name] != truth[name]
-        ]
+    def _check_variable_metadata(self) -> None:
+        """Warn about scored variables the targets describe differently than the checkpoint: units, time processing,
+        accumulation period or type of level, as anemoi-transform compares them. What only one side records is logged
+        and not checked; the baselines are not checked."""
+        if not hasattr(self.forecast, "recorded_variables"):
+            return
+        differ, unknown = compare_variables(*self._recorded_variables(), self.variables)
         if unknown:
-            LOG.info("the accumulation period of %s is unknown in the targets or the forecast, not checked", unknown)
+            LOG.info("variable metadata recorded on one side only, not checked: %s", ", ".join(unknown))
         if differ:
             LOG.warning(
-                "%sthe targets accumulate over another period than the checkpoint: %s in the checkpoint; the scores "
-                "compare totals over different periods (check the targets and the forecast input)",
+                "%sthe targets describe scored variables differently than the checkpoint (checkpoint vs targets): %s; "
+                "the scores may compare different quantities (check the targets and the forecast input)",
                 f"dataset {self.dataset!r}: " if self.dataset else "",
-                ", ".join(differ),
+                "; ".join(differ),
             )
 
     def variable_coords(self) -> dict[str, list]:
         """`param`, `level` and accumulation `period` of each variable from the sources' typed variables; '', NaN and
         '' when unknown. The period is the forecast's, else the targets'."""
-        model, truth = self._accumulation_periods()
+        model, truth = (accumulation_periods(variables) for variables in self._recorded_variables())
         periods = [model.get(name) or truth.get(name) for name in self.variables]
         params, levels = [], []
         for name in self.variables:

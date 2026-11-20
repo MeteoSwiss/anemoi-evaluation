@@ -16,7 +16,6 @@ import torch
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSourceBase
-from anemoi.evaluation.sources.base import accumulation_periods
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.base import variable_info
 
@@ -218,9 +217,9 @@ class DatasetTargets(TargetSourceBase):
         """`param` and `level` of a variable from the dataset's typed variables; None when unknown."""
         return variable_info(self.typed_variables.get(name))
 
-    def accumulation_periods(self) -> dict:
-        """The period of each accumulated variable, from the dataset's `variables_metadata`; None when not recorded."""
-        return accumulation_periods(self.typed_variables)
+    def recorded_variables(self) -> dict:
+        """The anemoi-transform variables of the dataset's `variables_metadata`."""
+        return dict(self.typed_variables)
 
     def describe(self) -> dict:
         """Dataset arguments, date range, row size and the prefetch and cache settings."""

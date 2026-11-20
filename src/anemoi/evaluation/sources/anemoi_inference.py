@@ -19,13 +19,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from anemoi.transform.variables import Variable
 from anemoi.utils.dates import frequency_to_string
 
 from anemoi.evaluation.frame import Frame
 from anemoi.evaluation.frame import Grid
 from anemoi.evaluation.sources.base import ForecastSourceBase
 from anemoi.evaluation.sources.base import MissingGraphError
-from anemoi.evaluation.sources.base import accumulation_periods
 from anemoi.evaluation.sources.base import lead_time_steps
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.base import variable_info
@@ -415,12 +415,13 @@ class DatasetForecast:
         names = metadata.output_tensor_index_to_variable
         self.variables = [names[i] for i in range(len(names))]
         self.typed_variables = dict(metadata.typed_variables)
-        # anemoi-inference fills in assumed periods where the checkpoint records no `variables_metadata` (its legacy
-        # path), so a period counts as known only where the recorded metadata gives one
+        # anemoi-inference fills in assumed metadata where the checkpoint records no `variables_metadata` (its legacy
+        # path), so only what the checkpoint records is compared with the targets
         recorded = recorded_variables_metadata(source._recorded_metadata, name)
-        self._accumulation_periods = {
-            name: period if "period" in (recorded.get(name) or {}) else None
-            for name, period in accumulation_periods(self.typed_variables).items()
+        self._recorded_variables = {
+            variable: Variable.from_dict(variable, entry)
+            for variable, entry in recorded.items()
+            if variable in self.typed_variables
         }
         arrays = metadata.supporting_arrays
         self.grid_indices = arrays.get("grid_indices")
@@ -481,10 +482,10 @@ class DatasetForecast:
         """`param` and `level` of a variable of this dataset."""
         return variable_info(self.typed_variables.get(name))
 
-    def accumulation_periods(self) -> dict:
-        """The period of each accumulated variable of this dataset, as the checkpoint records it; None when not
-        recorded."""
-        return dict(self._accumulation_periods)
+    def recorded_variables(self) -> dict:
+        """The anemoi-transform variables of this dataset whose metadata the checkpoint records; none that
+        anemoi-inference assumed."""
+        return dict(self._recorded_variables)
 
     def describe(self) -> dict:
         """What the parent reports for this dataset."""
@@ -539,7 +540,8 @@ class InferenceForecastSource(ForecastSourceBase):
             # before the runner is built: the `auto` runner raises on a task it has no runner for
             metadata = load_metadata(Checkpoint(config.checkpoint).path)
             patched = patched_metadata(metadata, config.patch_metadata)
-            self._recorded_metadata = patched  # as stored (and patched), before the runner fills anything in
+            # as stored (and patched), copied before the runner, whose legacy path fills it in place
+            self._recorded_metadata = {"dataset": copy.deepcopy(patched.get("dataset") or {})}
             self.task = check_task(patched)
             self.runner = create_runner(config)
             check_runner(self.task, self.runner, config.runner, (patched.get("metadata_inference") or {}).get("task"))
@@ -1026,9 +1028,9 @@ class InferenceForecastSource(ForecastSourceBase):
         """`param` and `level` of a variable from the checkpoint's typed variables; None when unknown."""
         return variable_info(self.typed_variables.get(name))
 
-    def accumulation_periods(self) -> dict:
-        """The period of each accumulated variable, as the checkpoint records it (its training dataset's)."""
-        return self.datasets[self.dataset_name].accumulation_periods()
+    def recorded_variables(self) -> dict:
+        """The anemoi-transform variables whose metadata the checkpoint records (its training dataset's)."""
+        return self.datasets[self.dataset_name].recorded_variables()
 
     def provenance(self) -> dict:
         """Result-file attrs identifying the checkpoint: its path, uuid and training run id; once the model is loaded,

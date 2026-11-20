@@ -13,9 +13,10 @@
   merges like any other.
 * The dry-run plan sizes the lockstep members and the ensemble scoring temporaries, and with
   `--member-group --ranks R` a rank's share of the model time and the member exchange.
-* A run warns when a scored accumulation covers another period in the targets than in the checkpoint,
-  and the result file records each variable's accumulation `period` next to `param` and `level`;
-  `merge` refuses inputs whose `param`, `level` or `period` disagree.
+* A run warns when the targets describe a scored variable differently than the checkpoint: units, time
+  processing, accumulation period or type of level, as anemoi-transform compares them. The result file
+  records each variable's accumulation `period` next to `param` and `level`, and `merge` refuses inputs
+  whose `param`, `level` or `period` disagree.
 
 ### Changes
 
