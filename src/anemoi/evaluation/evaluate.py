@@ -50,6 +50,7 @@ from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSource
 from anemoi.evaluation.sources.base import accumulation_periods
 from anemoi.evaluation.sources.base import compare_variables
+from anemoi.evaluation.sources.base import name_list
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.climatology import ArrayClimatology
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
@@ -277,13 +278,16 @@ class Evaluation:
             return
         differ, unknown = compare_variables(*self._recorded_variables(), self.variables)
         if unknown:
-            LOG.info("variable metadata recorded on one side only, not checked: %s", ", ".join(unknown))
+            LOG.info(
+                "variable metadata recorded on one side only, not checked: %s",
+                "; ".join(f"{what} of {name_list(names)}" for what, names in unknown.items()),
+            )
         if differ:
             LOG.warning(
                 "%sthe targets describe scored variables differently than the checkpoint (checkpoint vs targets): %s; "
                 "the scores may compare different quantities (check the targets and the forecast input)",
                 f"dataset {self.dataset!r}: " if self.dataset else "",
-                "; ".join(differ),
+                "; ".join(f"{', '.join(names)}: {reason}" for reason, names in differ.items()),
             )
 
     def variable_coords(self) -> dict[str, list]:

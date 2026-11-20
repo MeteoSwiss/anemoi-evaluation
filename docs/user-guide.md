@@ -169,6 +169,10 @@ targets:
     prefetch: 4
 ```
 
+A run warns when the targets describe a scored variable differently than the checkpoint, such as
+a 6 h `tp` model against hourly `tp` targets: check the targets, or the forecast input, before
+reading those scores.
+
 Targets opened with `interpolate_frequency`, `fill_missing_dates` (other than `nan`) or
 `rolling_average` are not truth at the dates they make up. On a cutout whose global element is
 interpolated, score the LAM with `regions: {lam: {grid: 0}}`.

@@ -540,8 +540,8 @@ class InferenceForecastSource(ForecastSourceBase):
             # before the runner is built: the `auto` runner raises on a task it has no runner for
             metadata = load_metadata(Checkpoint(config.checkpoint).path)
             patched = patched_metadata(metadata, config.patch_metadata)
-            # as stored (and patched), copied before the runner, whose legacy path fills it in place
-            self._recorded_metadata = {"dataset": copy.deepcopy(patched.get("dataset") or {})}
+            # as stored (and patched): the runner fills in assumed `variables_metadata` on its own copy
+            self._recorded_metadata = patched
             self.task = check_task(patched)
             self.runner = create_runner(config)
             check_runner(self.task, self.runner, config.runner, (patched.get("metadata_inference") or {}).get("task"))

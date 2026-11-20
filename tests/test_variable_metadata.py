@@ -13,6 +13,8 @@ from anemoi.evaluation.output import load_state
 from anemoi.evaluation.output import merge
 from anemoi.evaluation.output import write
 from anemoi.evaluation.sources.anemoi_dataset import DatasetTargets
+from anemoi.evaluation.sources.base import compare_variables
+from anemoi.evaluation.sources.base import name_list
 from anemoi.evaluation.sources.persistence import PersistenceForecastSource
 
 ONE_HOUR = {"period": ["0h", "1h"]}
@@ -67,7 +69,7 @@ def test_periods_are_checked_against_the_checkpoint(monkeypatch, tmp_path, caplo
         evaluation(PersistenceForecastSource(hourly, "6h"), hourly)  # a baseline records no metadata
         assert ours(caplog) == ""
         evaluation(forecast, targets(changes={"tp": {"period": None}}))
-        assert UNCHECKED + "tp (processing period)" in caplog.text and WARNING not in caplog.text
+        assert UNCHECKED + "processing period of tp" in caplog.text and WARNING not in caplog.text
         caplog.clear()
         evaluation(forecast, hourly)
         assert MISMATCH in caplog.text and "dataset" not in caplog.text
@@ -83,7 +85,7 @@ def test_units_and_levels_are_checked_and_request_keys_are_not(monkeypatch, tmp_
         evaluation(forecast, targets(changes={"2t": {"units": "K"}, "tp": request}))
         assert ours(caplog) == ""
         evaluation(forecast, targets())
-        assert UNCHECKED + "2t (units)" in caplog.text and WARNING not in caplog.text
+        assert UNCHECKED + "units of 2t" in caplog.text and WARNING not in caplog.text
         caplog.clear()
         surface = fixture.FixtureDataset("era5").typed_variables["2t"].data["mars"]
         evaluation(forecast, targets(changes={"2t": {"units": "degC", "mars": {**surface, "levtype": "pl"}}}))
@@ -94,6 +96,35 @@ def test_units_and_levels_are_checked_and_request_keys_are_not(monkeypatch, tmp_
     assert not [record for record in caplog.records if record.name.startswith("anemoi.transform")]  # skipped instead
 
 
+def test_what_transform_reads_as_no_metadata_is_not_compared(monkeypatch, tmp_path, caplog):
+    """A `levtype` of `unknown` (realch1 v2.0 writes it for its pressure levels) and a malformed `period` are not
+    recorded, so they are skipped instead of warned about or raised on; another time processing is a difference."""
+    forecast = fixture.forecast_source(monkeypatch, tmp_path, ("era5",))
+    mars = fixture.FixtureDataset("era5").typed_variables["2t"].data["mars"]
+    with caplog.at_level(logging.INFO):
+        caplog.clear()
+        run = evaluation(
+            forecast, targets(changes={"2t": {"mars": {**mars, "levtype": "unknown"}}, "tp": {"period": [None, "6h"]}})
+        )
+        assert UNCHECKED + "type of level of 2t; processing period of tp" in ours(caplog) and WARNING not in caplog.text
+        assert run.variable_coords()["period"] == ["", "6h"]  # the checkpoint's
+        evaluation(forecast, targets(changes={"tp": {"process": "average"}}))
+        assert WARNING + "tp: Time processinging types are not compatible: accumulation vs average;" in caplog.text
+
+
+def test_differences_and_unknowns_are_grouped():
+    def variable(name, **entry):
+        return Variable.from_dict(name, {"mars": {"levtype": "sfc"}, **entry})
+
+    names = [f"v{i}" for i in range(7)]
+    checkpoint = {name: variable(name, units="K") for name in names}
+    targets = {name: variable(name, units="degC" if name < "v2" else None) for name in names}
+    differ, unknown = compare_variables(checkpoint, {**targets, "w": variable("w")}, [*names, "w"])
+    assert differ == {"Units are not compatible: K vs degC": ["v0", "v1"]}
+    assert unknown == {"units": names[2:], "any metadata": ["w"]}
+    assert name_list(names) == "v0, v1, v2, v3, v4 and 2 more" and name_list(names[:5]) == "v0, v1, v2, v3, v4"
+
+
 def test_metadata_the_checkpoint_does_not_record_is_unknown(monkeypatch, tmp_path, caplog):
     """anemoi-inference fills an absent `variables_metadata` with assumed entries, a 6h tp among them: not recorded."""
     forecast = fixture.forecast_source(monkeypatch, tmp_path, ("era5",), patch=no_variables_metadata)
@@ -101,7 +132,7 @@ def test_metadata_the_checkpoint_does_not_record_is_unknown(monkeypatch, tmp_pat
     assert forecast.recorded_variables() == {}
     with caplog.at_level(logging.INFO):
         run = evaluation(forecast, targets(changes={"tp": ONE_HOUR}, drop=["2t"]))
-        assert UNCHECKED + "2t, tp" in caplog.text and WARNING not in caplog.text
+        assert UNCHECKED + "any metadata of 2t, tp" in caplog.text and WARNING not in caplog.text
     assert run.variable_coords()["period"] == ["", "1h"]  # the targets' period
 
 

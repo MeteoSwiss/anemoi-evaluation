@@ -245,11 +245,12 @@ When the evaluation is built, the metadata of every scored variable the checkpoi
 compared with the targets' `variables_metadata`, as anemoi-transform's `Variable.compatible` does:
 units, time processing (such as `accumulation`), accumulation period and type of level (surface,
 pressure or model level). A difference is warned about, such as a 6 h `tp` checkpoint against
-realch1 v2.0's 1 h `tp`. The MARS request keys (`class`, `stream`, the GRIB `param` name) are not
-compared, since they differ between sources of truth for the same quantity. Units are compared as
-written, so `m s-1` and `m s**-1` differ. What only one side records, including what anemoi-inference
-fills in for a checkpoint that records no `variables_metadata`, is logged at info level and not
-checked; the baselines are not checked. A mismatch needs targets, or a forecast input, other than the
+realch1 v2.0's 1 h `tp`. The MARS request keys (`class`, `stream`, the GRIB `param` name, `levelist`)
+are not compared, since they differ between sources of truth for the same quantity. Units are
+compared as written, so `m s-1` and `m s**-1` differ. What only one side records is logged at info
+level and not checked: this includes a `levtype` of `unknown` (realch1 v2.0 pressure levels) and what
+anemoi-inference fills in for a checkpoint that records no `variables_metadata`. The baselines are
+not checked. A mismatch needs targets, or a forecast input, other than the
 checkpoint's training dataset; a cutout reports its first element's metadata only.
 
 ### Multi-dataset checkpoints
