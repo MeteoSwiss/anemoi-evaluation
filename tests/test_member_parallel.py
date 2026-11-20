@@ -347,10 +347,13 @@ def _launcher_env(env) -> list[str]:
     return [name for name in env if name.startswith("SLURM_") or name in torchrun]
 
 
+CLI_THREADS = 1  # the unsplit runs and the ranks must use the same CPU thread count to agree bit for bit
+
+
 def _cli_worker(rank: int, size: int, cases: list[dict]) -> None:
     from anemoi.evaluation.__main__ import main
 
-    torch.set_num_threads(1)
+    torch.set_num_threads(CLI_THREADS)
     for name in _launcher_env(os.environ):
         del os.environ[name]
     os.environ.update(MASTER_ADDR="127.0.0.1", TORCHELASTIC_RUN_ID="test", LOCAL_RANK=str(rank))
@@ -497,8 +500,13 @@ def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch
         if label == "skip":
             case["missing"] = (fixture.init_times()[0] + 6 * HOUR).isoformat()
         _patch(monkeypatch, case)
-        for args in (["--shard", "0/1"], ["--shard", "1/2"]) if label == "era5" else [[]]:
-            main(["run", str(tmp_path / f"{label}-unsplit.yaml"), *args])
+        threads = torch.get_num_threads()
+        torch.set_num_threads(CLI_THREADS)  # CPU kernels may sum in a thread-count dependent order
+        try:
+            for args in (["--shard", "0/1"], ["--shard", "1/2"]) if label == "era5" else [[]]:
+                main(["run", str(tmp_path / f"{label}-unsplit.yaml"), *args])
+        finally:
+            torch.set_num_threads(threads)
         for ranks in (3,) if kind == "forecaster" else (2,):
             config_path = tmp_path / f"{label}-{ranks}.yaml"
             output = config["output"]["path"].replace(label, f"{label}-{ranks}")

@@ -870,7 +870,8 @@ contiguous block of the members, seeded by their index in the whole ensemble, so
 members an unsplit run would produce. After every frame the ranks exchange their members, so that
 each one holds every member of a contiguous block of the variables, which it scores. At the end
 rank 0 gathers the blocks and writes the file the unsplit run would have written, bit-identical
-when every rank and the unsplit run use one GPU model and the same software stack. The other ranks
+when every rank and the unsplit run use one GPU model and the same software stack (on CPU, also the
+same number of threads). The other ranks
 write nothing.
 
 `--member-group` makes all the tasks of the launch one group. Start them with `srun`:
