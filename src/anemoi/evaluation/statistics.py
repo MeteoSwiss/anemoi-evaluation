@@ -239,13 +239,13 @@ class SquaredError(Statistic):
         return (ensemble_mean(pred, aux) - target) ** 2
 
 
-class AbsoluteError(Statistic):
-    """Absolute error of the ensemble mean."""
+class AbsMedianError(Statistic):
+    """Absolute error of the ensemble median; the mean of the two middle members for an even count."""
 
-    name = "absolute_error"
+    name = "abs_median_error"
 
     def _compute(self, pred: torch.Tensor, target: torch.Tensor, aux: dict[str, torch.Tensor]) -> torch.Tensor:
-        return (ensemble_mean(pred, aux) - target).abs()
+        return per_variable(pred, target, lambda members, truth: (members.quantile(0.5, dim=0) - truth).abs())
 
 
 class EnsembleVariance(Statistic):

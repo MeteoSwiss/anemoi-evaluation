@@ -301,7 +301,7 @@ least two members and raise when the source has fewer. Five choices worth making
 |---|---|
 | `crps` / `fair_crps` | kernel CRPS at `alpha = 0` / `alpha = 1`; the fair version is the unbiased one for a finite ensemble and is always the smaller |
 | `{crps: {alpha: 0.5}}` | any `alpha` in `[0, 1]`; the result variable is named after it, `crps_0p5` |
-| `member_rmse`, `member_mae` | the error of a randomly drawn member in expectation, never below `rmse` / `mae`, which are computed on the ensemble mean |
+| `member_rmse`, `member_mae` | the error of a randomly drawn member in expectation; `member_rmse` is never below `rmse`, computed on the ensemble mean, while `mae` is computed on the ensemble median |
 | `rank_histogram`, `outlier_fraction` | whether the ensemble is calibrated rather than how accurate it is, see [Rank histogram](#rank-histogram) |
 | `reliability`, `forecast_frequency` | whether the forecast probabilities of a threshold mean what they say, see [Reliability diagram](#reliability-diagram); unlike the rank histogram they work at one member too |
 | `roc_pod`, `roc_pofd`, `roc_area`, `rev` | how well those probabilities separate events from non-events, and what that is worth to a user, see [ROC curve and economic value](#roc-curve-and-economic-value) |
@@ -999,7 +999,7 @@ python tools/compare_results.py a.nc b.nc           # element by element, --lead
 ```
 
 `inspect_results.py` checks weight sums, the excluded fraction per lead, the lead-0 zeros and the
-inequalities that must hold (`mae <= rmse`, `fair_crps <= crps`, `member_rmse >= rmse`, `acc` in
+inequalities that must hold (`mae <= rmse` at one member, `fair_crps <= crps`, `member_rmse >= rmse`, `acc` in
 `[-1, 1]`). `compare_results.py` reports every raw sum and metric as bit-exact or by its maximum
 relative difference and exits non-zero on a structural difference; `--leads common --stats common`
 compares files that differ in lead times or statistics ([`tools/README.md`](../tools/README.md)).

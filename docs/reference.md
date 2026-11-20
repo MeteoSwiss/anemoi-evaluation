@@ -381,7 +381,7 @@ Per variable and node, with `m` a member, `y` the target, `e` the ensemble mean 
 |---|---|---|---|
 | `error` | `e - y` | 1 | n/a |
 | `squared_error` | `(e - y)^2` | 1 | n/a |
-| `absolute_error` | `abs(e - y)` | 1 | n/a |
+| `abs_median_error` | `abs(med_m(m) - y)`, the mean of the two middle members for even `M` | 1 | n/a |
 | `ensemble_variance` | `var_m(m)`, unbiased | 2 | n/a |
 | `skill` | `mean_m abs(m - y)` | 1 | n/a |
 | `pairs` | `sum_{i<j} abs(m_i - m_j)` | 2 | n/a |
@@ -545,7 +545,7 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | Name | Spec | Statistics | Metric from the means | Min members |
 |---|---|---|---|---|
 | `bias` | `bias` | `error` | `mean(error)` | 1 |
-| `mae` | `mae` | `absolute_error` | `mean(absolute_error)` | 1 |
+| `mae` | `mae` | `abs_median_error` | `mean(abs_median_error)` | 1 |
 | `rmse` | `rmse` | `squared_error` | `sqrt(mean(squared_error))` | 1 |
 | `error_std` | `error_std` | `error`, `squared_error` | `sqrt(max(mean(squared_error) - mean(error)^2, 0))` | 1 |
 | `crps` | `crps` or `{crps: {alpha: a}}` | `skill`, `pairs` | `mean(skill) - c(alpha, M) * mean(pairs)` | 2 |
@@ -594,8 +594,8 @@ per-init correlations. Nodes where the climatology is non-finite contribute zero
 sums while the shared weight sum still counts them, so only the ratio is meaningful: the raw means of
 the three anomaly statistics are not.
 
-Ensemble conventions: `bias`, `mae`, `rmse`, `spread_skill` and `acc` score the **ensemble mean**;
-`member_rmse` and `member_mae` score a randomly drawn member in expectation; `member_rmse` is never
+Ensemble conventions: `bias`, `rmse`, `spread_skill` and `acc` score the **ensemble mean**, `mae` the
+**ensemble median** (the optimal point forecast under absolute loss); `member_rmse` and `member_mae` score a randomly drawn member in expectation; `member_rmse` is never
 below `rmse`. A deterministic model is `M = 1`, where `member_squared_error` equals `squared_error` and
 the metrics needing 2 members are rejected at construction (`the metrics need at least N members`).
 
