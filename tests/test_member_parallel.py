@@ -430,7 +430,7 @@ def _config(tmp_path, label: str, checkpoint, members: int, **overrides) -> dict
 
 
 def test_a_member_group_writes_the_file_of_the_unsplit_run(tmp_path, monkeypatch):
-    """`run --member-group R` on R spawned gloo ranks writes the file of the unsplit run of the same config, bit
+    """`run --member-group` on R spawned gloo ranks writes the file of the unsplit run of the same config, bit
     for bit apart from the summed counters: a forecaster at R = 3 with the lead-0 frame, a climatology and a
     threshold, with a missing target date skipped, over two datasets (`V < R` in one, so a rank scores none of its
     variables), a temporal downscaler at R = 2, and a shard of a member group (R = 2) merges with the other shard of
@@ -655,12 +655,12 @@ def test_task_env_and_rendezvous_from_slurm(monkeypatch):
     assert first_host("nid[002900,002812-002813]") == "nid002900" and first_host("a[1-2],b3") == "a1"
     assert first_host("x1,y[2-3]") == "x1" and first_host("rack[1-2]-node[07-08]") == "rack1-node07"
 
-    def resolve(host):
+    def resolve(host, port):
         if host == "nowhere":
             raise socket.gaierror(-2, "Name or service not known")
-        return host
+        return []
 
-    monkeypatch.setattr(socket, "gethostbyname", resolve)
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
     job = {"SLURM_JOB_NODELIST": "nid[002812-002815]", "SLURM_JOB_ID": "426031"}
     assert rendezvous(job) == ("nid002812", 15496)  # 15000 + 16 * 31, no step id (the batch script)
     in_step = {**job, "SLURM_STEP_ID": "2", "SLURM_STEP_NODELIST": "nid[002814-002815]"}
@@ -682,7 +682,7 @@ def test_task_env_and_rendezvous_from_slurm(monkeypatch):
     with pytest.raises(ValueError, match="cannot resolve .* host 'nowhere' .* set MASTER_ADDR"):
         rendezvous({"MASTER_ADDR": "nowhere", "MASTER_PORT": "1234"})
     monkeypatch.undo()
-    assert rendezvous({"MASTER_ADDR": "localhost", "MASTER_PORT": "1234"})[0].startswith("127.")
+    assert rendezvous({"MASTER_ADDR": "localhost", "MASTER_PORT": "1234"}) == ("localhost", 1234)
 
 
 def test_shared_gpus_are_refused_and_mixed_models_warned_at_startup(monkeypatch, caplog):

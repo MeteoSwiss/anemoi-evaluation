@@ -93,15 +93,16 @@ def rendezvous(env: Mapping[str, str] | None = None) -> tuple[str, int]:
     if not address or not port:
         raise ValueError(
             "a member group needs MASTER_ADDR and MASTER_PORT in the environment, the address and a free port of "
-            "rank 0, unless it runs under Slurm, which gives them"
+            "rank 0, unless it runs under Slurm or torchrun, which give them"
         )
     try:
-        return socket.gethostbyname(address), int(port)
+        socket.getaddrinfo(address, int(port))
     except OSError as error:
         raise ValueError(
             f"cannot resolve the member group's rendezvous host {address!r} ({error}): set MASTER_ADDR to an address "
             "of rank 0's node that every rank can reach"
         ) from None
+    return address, int(port)
 
 
 def first_host(nodes: str) -> str:
@@ -136,7 +137,8 @@ def init_group(group: MemberGroup, device: torch.device) -> None:
     )
     host = socket.gethostname()
     if nccl:
-        mine = (host, str(torch.cuda.get_device_properties(device).uuid), torch.cuda.get_device_name(device))
+        uuid = getattr(torch.cuda.get_device_properties(device), "uuid", None)
+        mine = (host, None if uuid is None else str(uuid), torch.cuda.get_device_name(device))
     else:
         mine = (host, None, device.type)
     ranks = [None] * group.size
