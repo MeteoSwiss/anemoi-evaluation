@@ -35,7 +35,10 @@ linear-interpolation baselines, a climatology for anomaly scores, a YAML configu
 sharding with exact merging. Section 5 lists what is deliberately outside. The goal is to score
 every anemoi task: forecasters, and for now temporal downscalers between analysis bounds, are
 supported; the others (temporal downscalers with forecast bounds, spatial downscalers,
-autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. The package itself is
+autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. Not supported yet either:
+checkpoints larger than one device (model-parallel evaluation, blocked by anemoi-inference's parallel
+runner, [`architecture.md`](architecture.md) section 9), and observations as targets, irregular point
+sets through the anemoi-datasets tabular layout. The package itself is
 device-agnostic, but the anemoi checkpoints it is validated against do not run on CPU, so an
 end-to-end exercise needs a GPU.
 
@@ -389,7 +392,8 @@ init-time coordinates. Memory MUST NOT grow with the number of init times or lea
 
 **NFR-16** The package MUST run on Python 3.11 to 3.13, on CPU or one CUDA device per process,
 with no MPI and no launcher beyond the one the user already uses (`srun` or `torchrun` for a
-member group). A checkpoint MUST fit on one device; there is no model-parallel runner (section 5).
+member group). For now a checkpoint MUST fit on one device: model-parallel evaluation is not
+supported yet (section 1.2).
 
 **NFR-17** The package MUST NOT modify the anemoi packages and MUST work around what it finds in
 them. Private coupling to anemoi-inference MUST be minimal and isolated in named helpers.
@@ -439,16 +443,13 @@ commit.
 Deliberate non-goals at v0.4.0. Each is a decision, not an oversight.
 
 * **Spectra, and any statistic that is not a per-node reduction.**
-* **Observations as targets.** Targets are gridded anemoi datasets on the model's grid.
 * **Regridding and unit conversion** (FR-8).
 * **Plots and reports.** A result file is the product; presentation is downstream tooling.
 * **Distributed torch beyond member groups.** Member-parallel evaluation (FR-41) is built: the
   members of an init time are spread over a group of ranks. Data-parallel evaluation over init
   times was designed and deferred: it is the job array without the files, and its only gain is one
   file instead of n. So were groups of member groups in one step (`world = shards x R`): a job array
-  of member groups does the same. Model-parallel evaluation was deferred too: anemoi-inference's
-  parallel runner destroys its process group after every `run()`, and no testbed checkpoint needs
-  more than one GPU.
+  of member groups does the same.
 * **A batched-member runner.** Rejected: batching raises peak memory rather than lowering it, its
   only gain is per-step Python overhead, which is nil at 1.7M nodes, and it is incompatible with a
   sharded model. Should the ensemble memory of NFR-13 bind on one GPU, the fix is the opposite one,

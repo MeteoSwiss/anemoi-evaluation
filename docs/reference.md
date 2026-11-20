@@ -1316,8 +1316,9 @@ Constraints the code enforces, with the message or behaviour:
 - **The `tools/` scripts take a single-dataset checkpoint.** `validate.py`, `make_climatology.py` and
   `ab_prefetch.py` read `forecast.dataset_name`, the `forecast.anemoi_inference.input.dataset` block and
   a plain `regions` block, all of which are per dataset on a multi-dataset checkpoint; they raise on one.
-- **One process per shard.** There is no multi-rank job and no model-parallel runner. Lockstep members
-  cost GPU memory linearly.
+- **A checkpoint must fit on one GPU.** A process runs a shard, or a rank of a member group runs its
+  block of members; model-parallel evaluation is not supported yet. Lockstep members cost GPU memory
+  linearly, per rank in a member group.
 - **Target datasets must have one member** (`shape[2] == 1`).
 - **Grids must match.** `Grid.check_compatible` raises unless forecast, target and climatology grids have
   the same nodes within `1e-5` degrees.
