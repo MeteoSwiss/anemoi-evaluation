@@ -304,6 +304,73 @@ def variable_info(variable: object | None) -> dict:
     return {"param": getattr(variable, "param", None), "level": getattr(variable, "level", None)}
 
 
+def accumulation_periods(typed_variables: dict) -> dict[str, datetime.timedelta | None]:
+    """The period of each accumulated variable of anemoi typed variables (anemoi-transform `Variable`); None when
+    not recorded."""
+    periods = {}
+    for name, variable in typed_variables.items():
+        if getattr(variable, "is_accumulation", False) is True:
+            try:
+                periods[name] = variable.period
+            except Exception:  # a malformed `period`, which transform may refuse with any error
+                periods[name] = None
+    return periods
+
+
+def _levtype_recorded(variable: object) -> bool:
+    return (getattr(variable, "grib_keys", None) or {}).get("levtype") not in (None, "unknown")
+
+
+# Whether a variable records what `Variable.compatible` of anemoi-transform compares, by the option that skips it. A
+# `levtype` of `unknown` (some datasets write it for pressure levels) is not recorded, though transform reads it as no level type.
+RECORDED_METADATA = {
+    "units": lambda variable: variable.units is not None,
+    "time_processing": lambda variable: variable.time_processing is not None,
+    "processing_period": lambda variable: variable.period is not None,
+    "type_of_level": _levtype_recorded,
+}
+
+
+def _recorded(variable: object, option: str) -> bool:
+    try:
+        return RECORDED_METADATA[option](variable)
+    except Exception:  # a malformed entry, such as a bad `period` or `mars`
+        return False
+
+
+def compare_variables(
+    checkpoint: dict, targets: dict, names: list[str]
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Compare the anemoi-transform variables `names` of the checkpoint with the targets' as `Variable.compatible`
+    does (units, time processing, period, type of level). Returns the names by difference (transform's reason) and
+    by what only one side records (`any metadata` when a side has none for the name); those are skipped rather than
+    left to `compatible`, which warns about each. What neither side records is not reported."""
+    differ: dict[str, list[str]] = {}
+    unknown: dict[str, list[str]] = {}
+    for name in names:
+        if name not in checkpoint or name not in targets:
+            unknown.setdefault("any metadata", []).append(name)
+            continue
+        ours, theirs = checkpoint[name], targets[name]
+        skip = {}
+        for option in RECORDED_METADATA:
+            known = _recorded(ours, option), _recorded(theirs, option)
+            skip[f"ignore_{option}"] = not all(known)
+            if any(known) and not all(known):
+                unknown.setdefault(option.replace("_", " "), []).append(name)
+        compatible, reason = ours.compatible(theirs, return_reason=True, **skip)
+        if not compatible:
+            differ.setdefault(reason, []).append(name)
+    return differ, unknown
+
+
+def name_list(names: list[str], shown: int = 5) -> str:
+    """`names` joined, the first `shown` and a count when there are more."""
+    if len(names) <= shown:
+        return ", ".join(names)
+    return f"{', '.join(names[:shown])} and {len(names) - shown} more"
+
+
 def select_variables(requested: list[str], available: list[str]) -> list[int]:
     """Indices of `requested` in `available`; raises on names that cannot be delivered."""
     unknown = [v for v in requested if v not in available]

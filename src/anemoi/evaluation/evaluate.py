@@ -48,6 +48,9 @@ from anemoi.evaluation.sources.base import ForecastSource
 from anemoi.evaluation.sources.base import MissingGraphError
 from anemoi.evaluation.sources.base import MissingTargetError
 from anemoi.evaluation.sources.base import TargetSource
+from anemoi.evaluation.sources.base import accumulation_periods
+from anemoi.evaluation.sources.base import compare_variables
+from anemoi.evaluation.sources.base import name_list
 from anemoi.evaluation.sources.base import select_variables
 from anemoi.evaluation.sources.climatology import ArrayClimatology
 from anemoi.evaluation.sources.linear_interpolation import LinearInterpolationForecastSource
@@ -144,6 +147,7 @@ class Evaluation:
             )
         targets.prefetch_hint(forecast.frames_per_pass)
         self.variables = self._resolve_variables(variables)
+        self._check_variable_metadata()
         self.metrics = metrics_module.build(metrics, self.variables, members=forecast.members)
         needed = metrics_module.min_members(self.metrics)
         if needed > forecast.members:
@@ -258,8 +262,39 @@ class Evaluation:
             raise ValueError("no variables to evaluate")
         return list(variables)
 
+    def _recorded_variables(self) -> tuple[dict, dict]:
+        """The anemoi-transform variables the forecast and the targets record; none from a source that records none,
+        such as a baseline."""
+        return (
+            getattr(self.forecast, "recorded_variables", dict)(),
+            getattr(self.targets, "recorded_variables", dict)(),
+        )
+
+    def _check_variable_metadata(self) -> None:
+        """Warn about scored variables the targets describe differently than the checkpoint: units, time processing,
+        accumulation period or type of level, as anemoi-transform compares them. What only one side records is logged
+        and not checked; the baselines are not checked."""
+        if not hasattr(self.forecast, "recorded_variables"):
+            return
+        differ, unknown = compare_variables(*self._recorded_variables(), self.variables)
+        if unknown:
+            LOG.info(
+                "variable metadata recorded on one side only, not checked: %s",
+                "; ".join(f"{what} of {name_list(names)}" for what, names in unknown.items()),
+            )
+        if differ:
+            LOG.warning(
+                "%sthe targets describe scored variables differently than the checkpoint (checkpoint vs targets): %s; "
+                "the scores may compare different quantities (check the targets and the forecast input)",
+                f"dataset {self.dataset!r}: " if self.dataset else "",
+                "; ".join(f"{', '.join(names)}: {reason}" for reason, names in differ.items()),
+            )
+
     def variable_coords(self) -> dict[str, list]:
-        """`param` and `level` of each variable from the sources' typed variables; '' and NaN when unknown."""
+        """`param`, `level` and accumulation `period` of each variable from the sources' typed variables; '', NaN and
+        '' when unknown. The period is the forecast's, else the targets'."""
+        model, truth = (accumulation_periods(variables) for variables in self._recorded_variables())
+        periods = [model.get(name) or truth.get(name) for name in self.variables]
         params, levels = [], []
         for name in self.variables:
             info = {}
@@ -270,7 +305,11 @@ class Evaluation:
                 levels.append(float(info["level"]))
             except (KeyError, TypeError, ValueError):
                 levels.append(float("nan"))
-        return {"param": params, "level": levels}
+        return {
+            "param": params,
+            "level": levels,
+            "period": [frequency_to_string(period) if period else "" for period in periods],
+        }
 
     def model_calls_per_init(self) -> tuple[int, datetime.timedelta]:
         """Model calls one init time needs and the lead time they compute, from the forecast source."""
