@@ -4,9 +4,9 @@
 
 CPU only, a second or two. Hard checks: n_init, weight sums consistent with the region weight totals (the implied
 excluded fraction is the NaN fraction; at lead 0 diagnostic variables are excluded entirely and prognostic scores are
-exactly zero when the targets come from the input dataset), mae <= rmse, no NaN metric at leads > 0 (`spread_skill`
-excepted: it is NaN where the unbiased squared error is not positive), and for ensembles
-spread > 0, crps > 0, fair_crps <= crps, member_rmse >= rmse, member_mae >= mae; acc within [-1, 1]. For every
+exactly zero when the targets come from the input dataset), mae <= rmse at one member, no NaN metric at leads > 0
+(`spread_skill` excepted: it is NaN where the unbiased squared error is not positive), and for ensembles
+spread > 0, crps > 0, fair_crps <= crps, member_rmse >= rmse; acc within [-1, 1]. For every
 threshold label found in the file: the score ranges (pod, far, pofd, csi, f1, brier and the base rate within [0, 1],
 ets within [-1/3, 1], hss, pss, sedi and orss within [-1, 1], bss <= 1, frequency_bias and odds_ratio >= 0),
 csi <= pod, csi <= 1 - far, hit + miss + false_alarm <= state_weights, the four cells adding up to state_weights to
@@ -95,7 +95,7 @@ for name in (*SCALARS, "acc", "activity_ratio"):
     print(f"{name}: NaN entries at leads > 0: {bad}; min {float(a.min()):.4g} max {float(a.max()):.4g}")
     if name != "spread_skill":
         ok &= bad == 0
-if "mae" in ds:
+if "mae" in ds and int(ds.attrs["members"]) == 1:
     viol = float((ds["mae"] - ds["rmse"]).sel(bin=season).max())
     print("max(mae - rmse):", f"{viol:.3e}", "(must be <= 0)")
     ok &= viol <= 1e-9
@@ -110,10 +110,6 @@ if "activity_ratio" in ds:
 if "member_rmse" in ds:
     viol = float((ds["rmse"] - ds["member_rmse"]).sel(bin=season).max())
     print("max(rmse - member_rmse):", f"{viol:.3e}", "(must be <= 0)")
-    ok &= viol <= 1e-9
-if "member_mae" in ds:
-    viol = float((ds["mae"] - ds["member_mae"]).sel(bin=season).max())
-    print("max(mae - member_mae):", f"{viol:.3e}", "(must be <= 0)")
     ok &= viol <= 1e-9
 if "acc" in ds:
     a = ds["acc"].sel(bin=season).values[positive]

@@ -56,15 +56,15 @@ class Bias(Metric):
 
 
 class MAE(Metric):
-    """Mean absolute error of the ensemble mean."""
+    """Mean absolute error of the ensemble median."""
 
     name = "mae"
 
     def __init__(self) -> None:
-        self.statistics = {"absolute_error": st.AbsoluteError()}
+        self.statistics = {"absolute_median_error": st.AbsoluteMedianError()}
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        return means["absolute_error"]
+        return means["absolute_median_error"]
 
 
 class RMSE(Metric):

@@ -17,11 +17,26 @@ from anemoi.evaluation.statistics import anomalies
 from anemoi.evaluation.statistics import ensemble_mean
 
 
+def _merged_variable_coords(first: dict[str, list], second: dict[str, list]) -> dict[str, list]:
+    """The variable coordinates two merged states both carry, so a coordinate missing from a file written by an older
+    version is dropped; raises when the states disagree on one (NaN equals NaN)."""
+    merged = {}
+    for name, values in first.items():
+        if name not in second:
+            continue
+        if not all(a == b or (a != a and b != b) for a, b in zip(values, second[name])):
+            raise ValueError(
+                f"cannot merge states with different variable coordinate {name!r}: {values} and {second[name]}"
+            )
+        merged[name] = list(values)
+    return merged
+
+
 @dataclass
 class AggregationState:
     """Sums over (lead_time, bin, variable, region) of `members`-member frames; additive, so states merge exactly.
 
-    `variable_coords` are auxiliary per-variable labels (`param`, `level`) written next to the variable axis;
+    `variable_coords` are auxiliary per-variable labels (`param`, `level`, `period`) written next to the variable axis;
     `init_times` are the init times whose frames were added, so that shards can refuse to merge twice.
     """
 
@@ -113,7 +128,7 @@ class AggregationState:
             self.weights + other.weights.to(self.weights.device),
             self.n_init + other.n_init.to(self.n_init.device),
             self.members,
-            dict(self.variable_coords),
+            _merged_variable_coords(self.variable_coords, other.variable_coords),
             sorted(set(self.init_times) | set(other.init_times)),
             dict(self.attrs),
         )
@@ -170,6 +185,13 @@ class Aggregator:
         """Number of region masks."""
         return self.W.shape[1]
 
+    def reduce(self, values: torch.Tensor) -> torch.Tensor:
+        """(V, N) -> (V, R) float64 region sums, one product per variable on a fresh copy of its row, so neither the
+        other variables nor the row's alignment in memory (which BLAS kernels may depend on) can change them."""
+        if values.shape[0] == 0:
+            return torch.zeros((0, self.n_regions), dtype=torch.float64, device=self.W.device)
+        return torch.stack([row.to(torch.float64, copy=True) @ self.W for row in values])
+
     def new_state(
         self,
         lead_times: list[datetime.timedelta],
@@ -214,13 +236,13 @@ class Aggregator:
             forecast, truth, finite = anomalies(aux["ensemble_mean"], target[0], climatology)
             aux.update(forecast_anomaly=forecast, target_anomaly=truth, climatology_finite=finite)
         valid = torch.isfinite(pred).all(0) & torch.isfinite(target[0])
-        state.weights[lead, time_bin] += valid.double() @ self.W
+        state.weights[lead, time_bin] += self.reduce(valid)
         for name, statistic in self.statistics.items():
             missing = [key for key in statistic.aux if key not in aux]
             if missing:
                 raise ValueError(f"statistic {name} needs {missing} in aux")
             values = torch.where(valid, statistic.compute(pred, target, aux), 0.0)
-            state.sums[name][lead, time_bin] += values.double() @ self.W
+            state.sums[name][lead, time_bin] += self.reduce(values)
         state.n_init[lead, time_bin] += 1
         if frame.init_time not in state.init_times:
             state.init_times.append(frame.init_time)

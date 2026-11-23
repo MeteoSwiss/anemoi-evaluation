@@ -10,6 +10,7 @@ Exact behaviour and interfaces of `anemoi-evaluation` 0.4.0. Task-oriented instr
 - [Aggregation and the results file](#aggregation-and-the-results-file)
 - [Python API](#python-api)
 - [Sharding](#sharding)
+- [Member-parallel runs](#member-parallel-runs)
 - [Seeding and reproducibility](#seeding-and-reproducibility)
 - [Limitations and undefined behaviour](#limitations-and-undefined-behaviour)
 
@@ -19,7 +20,7 @@ The console script `anemoi-evaluation` (entry point `anemoi.evaluation.__main__:
 subcommands. A subcommand is required.
 
 ```
-anemoi-evaluation run <config.yaml> [--shard i/n] [--dry-run] [--step-time seconds]
+anemoi-evaluation run <config.yaml> [--shard i/n] [--member-group] [--dry-run] [--step-time seconds] [--ranks R]
 anemoi-evaluation merge <results.nc>... -o <merged.nc> [--partial]
 ```
 
@@ -31,24 +32,35 @@ Runs an evaluation from a YAML config and writes the results netcdf.
 |---|---|---|---|
 | `config` | path, positional, required | n/a | YAML config, loaded by `load_config` (`base:` chain and `from_checkpoint:` blocks resolved first). |
 | `--shard i/n` | string `i/n` | Slurm auto-detection, else `0/1` | Evaluate init times `i`, `i+n`, `i+2n`, ... and write `output.path` with `{shard}` / `{shards}` filled in. See [Sharding](#sharding). |
+| `--member-group` | flag | off | Split the members of every init time over the tasks of the `srun` or `torchrun` launch, one GPU each, and write the result from rank 0; refused in a launch of one task. The tasks are then not shards: only `--shard` and the job array shard. See [member-parallel runs](#member-parallel-runs). |
 | `--dry-run` | flag | off | Resolve the config and the sources, check the dates, print the plan as YAML on stdout, and exit without loading a model or running it. |
 | `--step-time seconds` | float | unset | Seconds of model time per model call per member; adds the `time` block to the plan. Only valid with `--dry-run`. `docs/benchmarks.md` section 3 reports measured values; one call of a multi-step-output model produces several frames. |
+| `--ranks R` | int | unset | The member group size to plan for, at least 2; the plan is rank 0's. Only valid with `--dry-run` and `--member-group`, which requires it. |
 
 Order of operations in `run`:
 
-1. `--step-time` without `--dry-run` raises `SystemExit("--step-time is only used by --dry-run")`.
-2. The config is loaded, the shard is resolved, and without `--dry-run` a config with no `output.path`
+1. `--step-time` without `--dry-run` raises `SystemExit("--step-time is only used by --dry-run")`, and
+   `--ranks` without both `--dry-run` and `--member-group` raises `SystemExit` too.
+2. The config is loaded. With `--member-group`, a launch of one task raises `SystemExit`, and so does
+   `--dry-run` without `--ranks R` (or with `R < 2`). With CUDA and several
+   visible devices the task's device is set to `LOCAL_RANK` or `SLURM_LOCALID`, and a local rank without a
+   device of its own raises `SystemExit`; a task that sees one device (`--gpus-per-task=1`) keeps it. The shard is resolved, and without `--dry-run` a config with no `output.path`
    raises `SystemExit("the config needs output.path to run from the command line")`.
 3. `logging.basicConfig` is called with `config.log_level` and the format
-   `%(asctime)s %(levelname)s %(name)s: %(message)s`.
+   `%(asctime)s %(levelname)s %(name)s: %(message)s`, with `rank r/R ` after the time in a member group.
 4. `Evaluation.from_config` builds the sources; `evaluation.shard(index, count)` selects the init times.
-   An empty shard logs a warning and still writes an empty state.
+   An empty shard logs a warning and still writes an empty state. With `--member-group`,
+   `split_members` makes the evaluation this task's rank, and a refusal raises `SystemExit`.
 5. With `--dry-run`, the plan is printed with `yaml.safe_dump(..., sort_keys=False, width=120)`, byte
    counts and `_s` durations rendered as `1 GiB (1073741824)` and `1 minute 30 seconds (90.0)`, and the
    `shard` block (`index`, `count`, `output`) appended. Otherwise the run executes, the sources are
    closed in a `finally`, `state.attrs["shard"]` is set to `"i/n"` (also for an unsharded run, where it
    is `"0/1"`), and the dataset is written to the formatted path, creating parent directories. A
-   multi-dataset run writes one file per dataset, `{dataset}` filled in with the dataset's name.
+   multi-dataset run writes one file per dataset, `{dataset}` filled in with the dataset's name. A member
+   group joins its process group first (no rendezvous, an unresolvable host or two ranks on one GPU raise
+   `SystemExit`),
+   runs under `abort_on_error`, gathers every dataset's state on rank 0 after closing the sources, sets
+   `member_ranks` and `shard` there, and only rank 0 writes.
 
 ### `merge`
 
@@ -70,7 +82,7 @@ merged file carries the same metric variables as its inputs. See
   `logging.basicConfig` sends them.
 - Bad command line (unknown flag, missing subcommand, missing `-o`): argparse exits with status 2. This
   applies to both subcommands.
-- `SystemExit` with a message: the two `run` checks above, exit status 1. `merge` has no such check.
+- `SystemExit` with a message: the `run` checks above, exit status 1. `merge` has no such check.
 - Everything else (a config validation error, a missing dataset date, an invalid shard set for `merge`)
   propagates as an exception with a traceback and a non-zero exit status. Nothing is written in that case.
 
@@ -78,8 +90,11 @@ merged file carries the same metric variables as its inputs. See
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `SLURM_STEP_NUM_TASKS` | `resolve_shard` | Tasks per job step; the per-step shard count. Default 1. |
-| `SLURM_PROCID` | `resolve_shard` | Task rank within the step. Default 0. |
+| `SLURM_STEP_NUM_TASKS` | `resolve_shard`, `task_env` | Tasks per job step; the per-step shard count, or the size of a member group started by `srun`. Default 1. |
+| `SLURM_PROCID` | `resolve_shard`, `task_env` | Task rank within the step. Default 0. |
+| `SLURM_LOCALID` | `task_env` | Node-local task rank, the CUDA device of a member-group rank. Default 0. |
+| `RANK`, `WORLD_SIZE`, `LOCAL_RANK` | `task_env` | torchrun's rank, task count and local rank, read for a member group only when torchrun started the process (`TORCHELASTIC_RUN_ID` set); they then take precedence over the Slurm ones, and `RANK` and `WORLD_SIZE` are required. |
+| `MASTER_ADDR`, `MASTER_PORT` | `rendezvous` | Rank 0's address and a free port, where a member group meets (`tcp://`). Each one unset comes from Slurm: the first host of `SLURM_STEP_NODELIST`, else `SLURM_JOB_NODELIST`, and `15000 + 16 * (SLURM_JOB_ID % 1000) + SLURM_STEP_ID % 16` (step id 0 when unset or not a number), below the ephemeral ports; concurrent steps of a job differ in `SLURM_STEP_ID`, and a job-array task has its own `SLURM_JOB_ID`. Required with `--member-group` outside Slurm; torchrun sets both to its own store. The address is checked with `socket.getaddrinfo` (IPv4 or IPv6) before the group is joined, and a failure raises. |
 | `SLURM_ARRAY_TASK_ID` | `resolve_shard` | Job-array task id. Default 0. |
 | `SLURM_ARRAY_TASK_MIN` | `resolve_shard` | Lowest job-array id, subtracted from the task id. Default 0. |
 | `SLURM_ARRAY_TASK_COUNT` | `resolve_shard` | Number of job-array tasks. Default 1. |
@@ -87,7 +102,8 @@ merged file carries the same metric variables as its inputs. See
 | `ANEMOI_INFERENCE_NUM_CHUNKS_PROCESSOR` | `inference_env` | If set anywhere, it is left alone. |
 
 `SLURM_NTASKS` is deliberately **not** read: a batch script sees it with `SLURM_PROCID=0` and would
-silently evaluate one shard. No other environment variable is read by the package; the tools in
+silently evaluate one shard. No other environment variable is read by the package (torch reads its own,
+`TORCH_NCCL_ASYNC_ERROR_HANDLING` for one, see [member-parallel runs](#member-parallel-runs)); the tools in
 `tools/` set `ANEMOI_INFERENCE_NUM_CHUNKS` themselves (see [tools/README.md](../tools/README.md)).
 
 ## Configuration
@@ -224,6 +240,18 @@ in float64 rounded to float32. An init time missing either bound produces no fra
 Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no `targets:` block at
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
+
+When the evaluation is built, the metadata of every scored variable the checkpoint records is
+compared with the targets' `variables_metadata`, as anemoi-transform's `Variable.compatible` does:
+units, time processing (such as `accumulation`), accumulation period and type of level (surface,
+pressure or model level). A difference is warned about, such as a 6 h `tp` checkpoint against
+targets whose `tp` is a 1 h total. The MARS request keys (`class`, `stream`, the GRIB `param` name,
+`levelist`) are not compared, since they differ between sources of truth for the same quantity.
+Units are compared as written, so `m s-1` and `m s**-1` differ. What only one side records is logged
+at info level and not checked: this includes a `levtype` of `unknown`, which some datasets write for
+pressure levels, and what anemoi-inference fills in for a checkpoint that records no
+`variables_metadata`. The baselines are not checked. A mismatch needs targets, or a forecast input,
+other than the checkpoint's training dataset; a cutout reports its first element's metadata only.
 
 ### Multi-dataset checkpoints
 
@@ -365,7 +393,7 @@ Per variable and node, with `m` a member, `y` the target, `e` the ensemble mean 
 |---|---|---|---|
 | `error` | `e - y` | 1 | n/a |
 | `squared_error` | `(e - y)^2` | 1 | n/a |
-| `absolute_error` | `abs(e - y)` | 1 | n/a |
+| `absolute_median_error` | `abs(med_m(m) - y)`, the mean of the two middle members for even `M` | 1 | n/a |
 | `ensemble_variance` | `var_m(m)`, unbiased | 2 | n/a |
 | `skill` | `mean_m abs(m - y)` | 1 | n/a |
 | `pairs` | `sum_{i<j} abs(m_i - m_j)` | 2 | n/a |
@@ -529,7 +557,7 @@ are therefore pooled over nodes and init times of a bin, not averages of per-ini
 | Name | Spec | Statistics | Metric from the means | Min members |
 |---|---|---|---|---|
 | `bias` | `bias` | `error` | `mean(error)` | 1 |
-| `mae` | `mae` | `absolute_error` | `mean(absolute_error)` | 1 |
+| `mae` | `mae` | `absolute_median_error` | `mean(absolute_median_error)` | 1 |
 | `rmse` | `rmse` | `squared_error` | `sqrt(mean(squared_error))` | 1 |
 | `error_std` | `error_std` | `error`, `squared_error` | `sqrt(max(mean(squared_error) - mean(error)^2, 0))` | 1 |
 | `crps` | `crps` or `{crps: {alpha: a}}` | `skill`, `pairs` | `mean(skill) - c(alpha, M) * mean(pairs)` | 2 |
@@ -578,8 +606,9 @@ per-init correlations. Nodes where the climatology is non-finite contribute zero
 sums while the shared weight sum still counts them, so only the ratio is meaningful: the raw means of
 the three anomaly statistics are not.
 
-Ensemble conventions: `bias`, `mae`, `rmse`, `spread_skill` and `acc` score the **ensemble mean**;
-`member_rmse` and `member_mae` score a randomly drawn member in expectation; `member_rmse` is never
+Ensemble conventions: `bias`, `rmse`, `spread_skill` and `acc` score the **ensemble mean**, `mae` the
+**ensemble median** (the optimal point forecast under absolute loss); `member_rmse` and `member_mae`
+score a randomly drawn member in expectation; `member_rmse` is never
 below `rmse`. A deterministic model is `M = 1`, where `member_squared_error` equals `squared_error` and
 the metrics needing 2 members are rejected at construction (`the metrics need at least N members`).
 
@@ -692,7 +721,7 @@ The state holds float64 sums over the four axes `(lead_time, bin, variable, regi
 | `weights` | float64 tensor `(L, B, V, R)` | Weight sum of the valid elements. |
 | `n_init` | int64 tensor `(L, B)` | Frames added. |
 | `members` | int | Ensemble size of the frames. |
-| `variable_coords` | dict name to list | Per-variable labels (`param`, `level`). |
+| `variable_coords` | dict name to list | Per-variable labels (`param`, `level`, `period`). |
 | `init_times` | list of datetime | Init times whose frames were added. |
 | `attrs` | dict | Result-file attributes. |
 
@@ -715,6 +744,7 @@ Dimensions and coordinates:
 | `init_time` | `init_time` | `datetime64[ns]` | Init times that contributed. |
 | `param` | `variable` | str | Parameter of each variable, `""` when unknown. |
 | `level` | `variable` | float | Level of each variable, NaN when unknown. |
+| `period` | `variable` | str | Accumulation period of each variable (`6h`), the forecast's, else the targets'; `""` when not an accumulation or unknown. Absent from files written by 0.4.0 or earlier. |
 | `rank` | `rank` | int64 | `0..M`, present only when a metric declares it (`rank_histogram`). |
 | `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`, `roc_pod`, `roc_pofd`). |
 | `cost_loss` | `cost_loss` | float64 | The configured cost/loss ratios, present only when a metric declares it (`rev`). |
@@ -745,6 +775,7 @@ Attributes. Identity of the result:
 | `init_times` | Compressed date list of the init times of this run. |
 | `lead_time` | Frequency string. |
 | `shard` | `i/n` of the run, or `i,j,k/n` after a partial merge. Dropped by a complete merge. |
+| `member_ranks` | The size of the member group that wrote the file; absent for a run that did not split its members. A merge keeps the first input's. |
 | `merged_from` | JSON list of the input paths, written by `merge`. |
 
 Provenance:
@@ -752,7 +783,7 @@ Provenance:
 | Attr | Content |
 |---|---|
 | `checkpoint`, `checkpoint_uuid`, `checkpoint_run_id` | Checkpoint identity, from the inference source. |
-| `gpu`, `inference_chunks_processor`, `inference_chunks_mapper` | Recorded once the model is loaded; part of a run's numerical identity. |
+| `gpu`, `inference_chunks_processor`, `inference_chunks_mapper` | Recorded once the model is loaded; part of a run's numerical identity. A member group's `gpu` lists its ranks' models. |
 | `forecast` | `persistence` or `linear_interpolation`, from the baseline sources. |
 | `config` | The run's config as YAML; omitted when the objects cannot be serialised. |
 | `package_versions` | JSON of the installed `anemoi-evaluation`, `anemoi-inference`, `anemoi-models`, `anemoi-graphs`, `anemoi-datasets` and `torch` versions (null when absent). |
@@ -762,7 +793,7 @@ Timing, in seconds:
 
 | Attr | Content |
 |---|---|
-| `time_model_s` | Wall time in the forecast source, CUDA-synchronised. |
+| `time_model_s` | Wall time in the forecast source, CUDA-synchronised; in a member group it includes the exchange of the frames and the wait for the other ranks there. |
 | `time_target_s` | The main thread's wait for targets. |
 | `time_statistics_s` | Wall time in the aggregator. |
 | `time_total_s` | Wall time of the init-time loop. |
@@ -798,6 +829,8 @@ each shard's partial sum in input order. Float64 addition is not associative, so
   assignment happens to send a bin's init times to a single shard.
 - A cell fed by several shards agrees with the unsharded run to float64 rounding, not necessarily bit for
   bit.
+- A member group's file is an ordinary shard: it merges with the shards of an unsplit run, and with files
+  of 0.4.0 and earlier, whose sums differ from today's in the last float64 bits only.
 - The derived `all` bin inherits this: `_with_total` sums over the bin axis in the same order in both
   cases, so it is bit-exact exactly when its per-bin sums are.
 
@@ -807,6 +840,8 @@ unsharded control; that is a measurement of one configuration, not a guarantee.
 `merge` refuses:
 
 - different coordinates (`lead_times`, `bins`, `variables`, `regions`) or different statistic sets;
+- different per-variable labels (`param`, `level`, `period`); a label only some inputs carry, such as
+  the `period` of a file written by 0.4.0 or earlier, is dropped from the merged state;
 - different `members`;
 - overlapping `init_times` (the same init time counted twice);
 - inputs whose `dataset` attrs are not all the same (a multi-dataset run writes one file per dataset per
@@ -849,8 +884,9 @@ Weights and regions given as specs are resolved on first use.
 | `plan(init_times=None, step_time=None, shards=1)` | `dict` describing a run, loading no model. |
 | `time_estimate(step_time, n_init, shards=1)` | `dict` of model and wall seconds. |
 | `shard(index, count)` | `list[datetime]`, `init_times[index::count]`. |
+| `split_members(group)` | `None`; makes the evaluation rank `group.rank` of a `MemberGroup`: `run()` then returns the rank's state, of its variable block. Raises `ValueError` for a forecast source without `split_members` (only `InferenceForecastSource` has one). See [member-parallel runs](#member-parallel-runs). |
 | `model_calls_per_init()` | `tuple[int, timedelta]`: calls per init time and the lead time they compute. |
-| `variable_coords()` | `dict[str, list]`: `param` and `level` per variable. |
+| `variable_coords()` | `dict[str, list]`: `param`, `level` and `period` per variable. |
 | `attrs(init_times=None, timing=None)` | `dict` of result-file attributes. |
 | `to_config()` | `dict`, YAML-ready; raises when weights or regions were given as arrays. |
 | `close()` | `None`; releases the forecast, target and climatology sources. |
@@ -868,6 +904,8 @@ halves of `run()`, for a driver that feeds the frames itself; `MultiEvaluation` 
 | `climatology` | source or `None` | The climatology source. |
 | `metrics` | `list[Metric]` | The resolved metrics. Load-bearing: `state.to_xarray(evaluation.metrics)`. |
 | `variables` | `list[str]` | The resolved variables. |
+| `scored_variables` | `list[str]` | The variables this process scores: `variables`, or the rank's block in a member group. |
+| `member_group` | `MemberGroup` or `None` | Set by `split_members`. |
 | `init_times` | `list[datetime]` | All init times of the evaluation. |
 | `lead_time` | `timedelta` | The configured maximum. |
 | `lead_times` | `list[timedelta]` | The scored lead times, with a leading `0` when `include_lead_zero`. |
@@ -892,6 +930,7 @@ each evaluation runs on its own (a per-dataset persistence baseline).
 | `pairs(init_times=None)` | `Iterator[tuple[str, Frame, torch.Tensor]]`. |
 | `plan(init_times=None, step_time=None, shards=1)` | `dict` with one plan per dataset under `datasets`, the names scored under `scored` and, when the run scores a subset, the others under `predicted_only`. |
 | `shard(index, count)` | `list[datetime]`, the same for every dataset. |
+| `split_members(group)` | `None`; `Evaluation.split_members` for every dataset, the rollout split once. Refused without a shared inference source. |
 | `attrs(init_times=None)` | `dict[str, dict]`, the result attrs of each dataset. |
 | `to_config()`, `close()` | As `Evaluation`; `close()` also releases the shared runner. |
 | `evaluations` | `dict[str, Evaluation]`. |
@@ -921,7 +960,7 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 | `model_calls` | Calls per init time times the number of init times. |
 | `computed_lead_time` | The lead time those calls actually compute. |
 | `include_lead_zero` | The flag. |
-| `variables` | `{names, param, level}`. |
+| `variables` | `{names, param, level, period}`. |
 | `metrics`, `statistics` | The metric specs, and the sorted names of the statistics they need. |
 | `weights` | The weight spec, or `"array"` when given as an array. |
 | `regions` | Name to spec, or `"array"`. |
@@ -929,8 +968,9 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 | `on_missing_target` | The setting. |
 | `climatology` | The climatology's `describe()`; present only with one. |
 | `frames` | `{total, with_targets, distinct_valid_times}`. |
-| `bytes` | `{target_to_device, target_rows_read, cache_for_all_rows, frame, aggregator_weights, statistics_temporaries}`, plus `checkpoint_bytes` and `per_member_state_bytes` from an inference source and `climatology` when one is configured. |
-| `time` | Present only with `step_time`: `{step_time, model_per_init_s, shard: {model_s, wall_s}, run: {gpu_hours, wall_per_shard_s}, startup_s, note}`. |
+| `bytes` | `{target_to_device, target_rows_read, cache_for_all_rows, frame, aggregator_weights, statistics_temporaries}`, plus `checkpoint_bytes`, `per_member_state_bytes` and `member_states` (the lockstep members of this process times the per-member state) from an inference source, `ensemble_temporaries` with more than one member (four `(M, N)` float64 arrays, the peak of scoring one variable: the members, centred, and the sort's values and indices), `swap_peak` in a member group (the rank's frame of every variable and the copies it sends; `frame` is what it receives) and `climatology` when one is configured. In a member group the frame and the target rows are the rank's variable block. `peak` adds up what is on the device at once: `checkpoint_bytes`, `member_states` (and the predicted-only states), `frame`, one target row, `aggregator_weights` and `climatology` throughout, plus the larger of `swap_peak`, held during the exchange only, and `statistics_temporaries + ensemble_temporaries`, held while a frame is scored. The model's forward activations are not counted. |
+| `time` | Present only with `step_time`: `{step_time, model_per_init_s, shard: {model_s, wall_s}, run: {gpu_hours, wall_per_shard_s}, startup_s, note}`. In a member group `model_per_init_s` is a rank's, `calls x the rank's members x step_time`, and `gpu_hours` counts every rank. |
+| `member_group` | Present only in a member group: `{ranks, rank, members, variables}`, the rank's members count and variable names. |
 | `note` | Present only when the last model call computes past `lead_time`. |
 | `shard` | `{index, count, output}`, added by the CLI, not by `plan()`. |
 
@@ -1011,7 +1051,9 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
   shift, `timestep * multi_step_output` for a forecaster), `checkpoint`, `checkpoint_uuid`,
   `checkpoint_run_id`, `dataset_name`, `task`, and for a temporal downscaler `window` and `window_leads`
   (see [lead times](#lead-times)). `initial_frame` returns the init-time slice of the prognostic
-  variables and NaN for the others, identical for every member.
+  variables and NaN for the others, identical for every member. `split_members(group)` makes it run the
+  rank's block of the members and yield every member of the rank's block of the variables; it refuses one
+  member and fewer members than ranks.
 - `PersistenceForecastSource(targets, timestep, members=1)`: the target at init time at every lead;
   `supports_lead_zero = True`.
 - `LinearInterpolationForecastSource(targets, timestep, members=1)`: the `linear_interpolation` baseline.
@@ -1054,6 +1096,7 @@ frames(init_time: datetime, lead_time: timedelta, variables: list[str], device: 
 check_init_times(init_times: list[datetime], lead_time: timedelta) -> None
 graph_node_attribute(name: str, nodes: str = "data") -> np.ndarray
 variable_info(name: str) -> dict
+recorded_variables() -> dict[str, Variable]   # optional: the anemoi-transform variables it records
 provenance() -> dict
 stats -> dict            # property
 describe() -> dict       # must not load a model
@@ -1074,6 +1117,7 @@ stats -> dict            # property: reads, read_seconds, cache_hits
 close() -> None
 grid_mask(i: int) -> np.ndarray
 variable_info(name: str) -> dict
+recorded_variables() -> dict[str, Variable]   # optional, as for forecasts
 to_config() -> dict
 describe() -> dict
 ```
@@ -1094,7 +1138,9 @@ with defaults: no device preference, no graph, no date check, no sub-grids, no l
 `stats` and `provenance`, unknown `variable_info`, and `to_config()` raising.
 Their `describe()` reports the class name, the node count and the variable count, and the forecast base
 adds `members`. Helpers: `lead_time_steps(lead_time, timestep)`, `variable_info(variable)`,
-`select_variables(requested, available)`.
+`accumulation_periods(typed_variables)`, `compare_variables(checkpoint, targets, names)`,
+`select_variables(requested, available)`. A forecast source without `recorded_variables` is not
+checked against the targets (the baselines).
 
 ### Internals (no compatibility promise)
 
@@ -1150,12 +1196,69 @@ own file; `anemoi-evaluation merge` sums them. Worked examples are in the
    `count = (SLURM_ARRAY_TASK_COUNT or 1) * tasks`,
    `index = array * tasks + (SLURM_PROCID or 0)`.
    Outside Slurm this gives `0/1`; a job array of 3 with 4 tasks each gives 12 shards. `--shard 0/1`
-   disables the auto-detection.
+   disables the auto-detection. With `--member-group` the tasks of the step are one member group, so
+   `tasks` is 1 and `SLURM_PROCID` is not added: only the job array shards.
 3. `0 <= index < count` is enforced in both cases.
 
 `output.path` is formatted with `{shard}` and `{shards}`; with more than one shard a `{shard}`
 placeholder is required. Every run tags its state with the `shard` attr, including an unsharded `0/1`
 run. For what the merge guarantees numerically, see [merging](#merging).
+
+## Member-parallel runs
+
+A member group is the `R` tasks of one `srun` step or `torchrun` launch, started with `run --member-group`;
+it is the world process group, NCCL on CUDA and gloo otherwise, met at `rendezvous()` (`MASTER_ADDR:MASTER_PORT`,
+else derived from Slurm, the host resolved first) with a 10-minute timeout. Under torchrun the `tcp://` init joins
+torchrun's store at `MASTER_ADDR:MASTER_PORT` as a client (or rank 0 hosts one there when torchrun does not share
+its store, `TORCH_DISABLE_SHARE_RDZV_TCP_STORE=1`). Right after, every rank sends its host, GPU uuid and GPU
+model to every other one, which is the first collective of the group: two ranks on one GPU are refused, and ranks on
+different GPU models log a warning on rank 0, since their ensemble is valid but not bit-identical to an unsplit run. With `M` members and `V` scored variables, rank `r` has the
+member block `blocks(M, R)[r]` and the variable block `blocks(V, R)[r]` (`anemoi.evaluation.distributed`):
+contiguous, sizes differing by at most one, the larger first. Per frame and dataset:
+
+1. The rank runs its members in lockstep, each reseeded with its index in the whole ensemble, and builds
+   the `(M_r, V, N)` frame.
+2. `swap` exchanges the blocks in one batch of point-to-point sends and receives: the rank keeps the
+   `(M, V_r, N)` frame of every member, in global member order, and of its variables only. `V_r` may be
+   0 when `V < R`; that rank still takes part.
+3. The rank reads targets and climatology for its variables and aggregates them, with the threshold
+   statistics bound to all the variables and restricted to its block, so no rank sees a threshold error
+   for a variable it does not hold. Every statistic is per variable, so a block is the slice of the unsplit
+   state bit for bit.
+
+The lead-0 frame is the same for every member and is built by each rank for its variables, with no
+exchange. At the end every rank runs `finish`, closes its sources and sends its state to rank 0, which
+concatenates the variable blocks (`gather_state`, `concat_states`) and writes the file. `members`, the
+rank bins, the reliability levels and the config stay those of the whole ensemble.
+
+Rank 0 refuses to concatenate states that disagree on anything but their variables: lead times, bins,
+regions, `members`, init times, frame counts (`n_init`) or statistics, overlapping variable blocks, and
+attrs that must match: `inference_chunks_*`, `checkpoint_uuid`, `config` and `package_versions`.
+
+The attrs of the written file, against the unsplit run's:
+
+| Attr | In a member group's file |
+|---|---|
+| `time_*_s` | Summed over the ranks: `time_total_s` is GPU-seconds over the group, not wall time. |
+| `target_reads`, `target_cache_hits` | Summed: every rank reads every row, so `R` times the unsplit counts. |
+| `forcings_computed`, `forcings_bypassed`, `forcings_hits` | Summed: every rank computes the forcings of its own members, so `forcings_computed` comes out `R` times the unsplit value and `forcings_hits` lower by the difference; the three add up to the unsplit total. |
+| `peak_gpu_memory_bytes` | The maximum over the ranks. |
+| `climatology_nonfinite_nodes` | The union of the ranks' maps. |
+| `gpu` | The ranks' GPU models, sorted and comma-separated: one model, as in the unsplit run, when they agree. |
+| `member_ranks` | `R`. |
+| everything else, `model_calls` included | Rank 0's, the unsplit run's. |
+
+A failing rank aborts the world group (`abort_on_error`) and re-raises. Over gloo the other ranks then
+fail at once. Over NCCL a rank already inside a collective waits for NCCL's timeout, and torch documents
+its abort for `TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, so the launcher must stop the other tasks: `srun
+--kill-on-bad-exit=1` ends the step when one task fails, and `torchrun` stops its workers when one fails (or
+restarts them all with `--max-restarts`).
+
+Refused, with a `SystemExit` from the CLI: a launch of one task, one member, fewer members than ranks, a
+forecast source other than `anemoi_inference`, a `device: cuda:N` when the task sees several GPUs (only `cuda:0`
+with one visible GPU passes, the same on every rank), more tasks on a node than visible GPUs (when a task sees
+several), no `MASTER_ADDR` or `MASTER_PORT` outside Slurm, a rendezvous host that does not resolve, and two ranks
+on one GPU (same host and GPU uuid). Supported launchers are `srun` and `torchrun`.
 
 ## Seeding and reproducibility
 
@@ -1175,8 +1278,8 @@ Consequences:
 
 - A member's noise depends only on `(seed, init_time, member, model call)`, not on the ensemble size, on
   the other members or on how the lockstep rollouts are interleaved. Member 0 of a 4-member run is the
-  same forecast as member 0 of a 50-member run, and a shard produces the members it would have produced
-  unsharded.
+  same forecast as member 0 of a 50-member run, a shard produces the members it would have produced
+  unsharded, and a rank of a member group produces its block of the unsplit run's members.
 - Members of a checkpoint without a noise injector are identical; `members > 1` on such a checkpoint logs
   a warning.
 - The arithmetic identity of a run also depends on the GPU model and on the inference chunk counts, which
@@ -1224,8 +1327,9 @@ Constraints the code enforces, with the message or behaviour:
 - **The `tools/` scripts take a single-dataset checkpoint.** `validate.py`, `make_climatology.py` and
   `ab_prefetch.py` read `forecast.dataset_name`, the `forecast.anemoi_inference.input.dataset` block and
   a plain `regions` block, all of which are per dataset on a multi-dataset checkpoint; they raise on one.
-- **One process per shard.** There is no multi-rank job and no model-parallel runner. Lockstep members
-  cost GPU memory linearly.
+- **A checkpoint must fit on one GPU.** A process runs a shard, or a rank of a member group runs its
+  block of members; model-parallel evaluation is not supported yet. Lockstep members cost GPU memory
+  linearly, per rank in a member group.
 - **Target datasets must have one member** (`shape[2] == 1`).
 - **Grids must match.** `Grid.check_compatible` raises unless forecast, target and climatology grids have
   the same nodes within `1e-5` degrees.

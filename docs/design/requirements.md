@@ -35,7 +35,10 @@ linear-interpolation baselines, a climatology for anomaly scores, a YAML configu
 sharding with exact merging. Section 5 lists what is deliberately outside. The goal is to score
 every anemoi task: forecasters, and for now temporal downscalers between analysis bounds, are
 supported; the others (temporal downscalers with forecast bounds, spatial downscalers,
-autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. The package itself is
+autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. Not supported yet either:
+checkpoints larger than one device (model-parallel evaluation, blocked by anemoi-inference's parallel
+runner, [`architecture.md`](architecture.md) section 9), and observations as targets, irregular point
+sets through the anemoi-datasets tabular layout. The package itself is
 device-agnostic, but the anemoi checkpoints it is validated against do not run on CPU, so an
 end-to-end exercise needs a GPU.
 
@@ -102,6 +105,13 @@ targets are opened with `interpolate_frequency`.
 *Rationale: a first step that compares downscalers; forecast bounds, a downscaler after a forecaster,
 are planned (MeteoSwiss/anemoi-evaluation#5). Interpolated targets would score the distance to an
 interpolation, not to the truth.*
+
+**FR-42** The package MUST warn when the targets describe a scored variable differently than the
+checkpoint's `variables_metadata` (units, time processing, accumulation period or type of level), and
+MUST record each variable's accumulation period in the result.
+*Rationale: such scores look plausible but compare different quantities, such as 1 h and 6 h totals,
+within a run or across models (MeteoSwiss/anemoi-evaluation#7). anemoi-transform defines when two
+variables are compatible; the request keys differ between sources of truth and are not compared.*
 
 **FR-7** Before a run, the package MUST refuse init times whose rollout would read dates absent
 from, or listed as missing in, the datasets the runner reads.
@@ -275,6 +285,15 @@ count.*
 and job-array variables, so that job steps and job arrays compose. With more than one shard the
 output path MUST carry a shard placeholder or the run MUST refuse to start.
 
+**FR-41** A run MUST be able to spread the members of every init time over the ranks of one job
+step, one device each, and write the file an unsplit run of the same config writes, bit for bit
+when every rank and the unsplit run use one GPU model and the same software stack, apart from the
+summed timings and counters. Such a member group MUST be switched
+on explicitly, its tasks MUST NOT also count as shards, and its file MUST merge as an ordinary
+shard. A rank that fails MUST NOT leave the others waiting for it.
+*Rationale: an AIFS-ENS-sized ensemble (about 0.6 GiB per lockstep member at 542k nodes, 1000+
+members) does not fit one GPU, and sharding over init times does not split an init time.*
+
 ### 3.7 Extensibility
 
 **FR-34** A forecast, target or climatology source that is not shipped with the package MUST be
@@ -350,24 +369,31 @@ peak memory and bit-identical fields (benchmarks 10).*
 **NFR-13** GPU memory MUST be linear in the ensemble size with a documented per-member cost, so a
 user can size a job. With multiple datasets the per-member cost is the sum over their grids: the
 rollout holds one state per dataset and builds every dataset's frame before yielding, and the host
-holds one target prefetch buffer and one forcings cache per dataset.
+holds one target prefetch buffer and one forcings cache per dataset. In a member group of `R`
+ranks (FR-41) a rank holds its `ceil(M / R)` lockstep members, the exchange peak (its `(M_r, V, N)`
+frame, the copies it sends and the `(M, V_r, N)` frame it receives, about three times the frame),
+and the scoring temporaries of one variable at a time, four `(M, N)` float64 arrays, which grow
+with the whole ensemble and not with the rank's share (4.2 GiB each at M = 1040, N = 542k). The
+dry-run plan sizes all three.
 *Evidence: 1.45 to 1.55 GiB per member for a 6-hourly 2-in/1-out model at 1.69M nodes, about
 6 GiB for an hourly 7-in/6-out one, linear to M = 24 (benchmarks 3 and 10).*
 
 ### 4.3 Scalability
 
 **NFR-14** A run MUST scale by evaluating disjoint subsets of the init times independently, with
-no communication between them, no shared filesystem state and no distributed torch anywhere. Such
-a job tolerates a lost task and recombines exactly.
+no communication between them, no shared filesystem state and no distributed torch. Such a job
+tolerates a lost task and recombines exactly. Distributed torch is used only inside a member group
+(FR-41), whose ranks evaluate the same init times.
 
 **NFR-15** A result file MUST be small and its size independent of the grid, up to the bin and
 init-time coordinates. Memory MUST NOT grow with the number of init times or lead times.
 
 ### 4.4 Portability
 
-**NFR-16** The package MUST run on Python 3.11 to 3.13, on CPU or one CUDA device, with no MPI
-and no launcher beyond the one the user already uses. A checkpoint MUST fit on one device; there
-is no model-parallel or multi-rank runner (section 5).
+**NFR-16** The package MUST run on Python 3.11 to 3.13, on CPU or one CUDA device per process,
+with no MPI and no launcher beyond the one the user already uses (`srun` or `torchrun` for a
+member group). For now a checkpoint MUST fit on one device: model-parallel evaluation is not
+supported yet (section 1.2).
 
 **NFR-17** The package MUST NOT modify the anemoi packages and MUST work around what it finds in
 them. Private coupling to anemoi-inference MUST be minimal and isolated in named helpers.
@@ -417,17 +443,18 @@ commit.
 Deliberate non-goals at v0.4.0. Each is a decision, not an oversight.
 
 * **Spectra, and any statistic that is not a per-node reduction.**
-* **Observations as targets.** Targets are gridded anemoi datasets on the model's grid.
 * **Regridding and unit conversion** (FR-8).
 * **Plots and reports.** A result file is the product; presentation is downstream tooling.
-* **Distributed torch.** Data-parallel evaluation over init times was designed and deferred: it
-  is the job array without the files, and its only gain is one file instead of n. Model-parallel
-  evaluation was deferred too: anemoi-inference's parallel runner destroys its process group after
-  every `run()`, and no testbed checkpoint needs more than one GPU.
+* **Distributed torch beyond member groups.** Member-parallel evaluation (FR-41) is built: the
+  members of an init time are spread over a group of ranks. Data-parallel evaluation over init
+  times was designed and deferred: it is the job array without the files, and its only gain is one
+  file instead of n. So were groups of member groups in one step (`world = shards x R`): a job array
+  of member groups does the same.
 * **A batched-member runner.** Rejected: batching raises peak memory rather than lowering it, its
   only gain is per-step Python overhead, which is nil at 1.7M nodes, and it is incompatible with a
-  sharded model. Should the ensemble memory of NFR-13 ever bind, the fix is the opposite one,
-  sequential members with a pinned host buffer ([`architecture.md`](architecture.md) section 9).
+  sharded model. Should the ensemble memory of NFR-13 bind on one GPU, the fix is the opposite one,
+  sequential members with a pinned host buffer ([`architecture.md`](architecture.md) section 9);
+  over several GPUs it is a member group.
 * **Comparing several checkpoints in one run**: one checkpoint per run, comparison is offline from
   result files.
 * **Neighbourhood scores** (FSS and its relatives). They are not per-node reductions, and on an
@@ -447,5 +474,7 @@ The functional requirements are verified by the unit suite (naive numpy referenc
 the config forms and the merge checks) and, where they need a real checkpoint, by the scripts in
 [`tools/`](../../tools/README.md): `validate.py` for FR-1 to FR-11, FR-40 and NFR-1 to NFR-3,
 `compare_results.py` for NFR-4, `ab_prefetch.py` for NFR-10 and NFR-20, and the run attributes
-for the rest of section 4.2. The measurements behind every *Evidence* line above, and the
+for the rest of section 4.2. FR-41 is verified on gloo by `tests/test_member_parallel.py`, which
+compares the files of member groups with the unsplit run's, and FR-42 by
+`tests/test_variable_metadata.py`. The measurements behind every *Evidence* line above, and the
 testbeds they were taken on, are in [`../benchmarks.md`](../benchmarks.md).

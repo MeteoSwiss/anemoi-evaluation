@@ -5,11 +5,30 @@
 ### Breaking
 
 * `spread_skill` now uses the unbiased RMSE of the ensemble mean (the WeatherBench-X `UnbiasedSpreadSkillRatio`). Merging older result files recomputes it with the new formula.
+* `mae` scores the ensemble median instead of the ensemble mean, from the new statistic `absolute_median_error`,
+  which replaces `absolute_error`. Values at one or two members are unchanged.
+  Older result files with mae can no longer be merged or re-read.
 
 ### Features
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.
+* `run --member-group` spreads the members of every init time over the tasks of an `srun` or
+  `torchrun` launch, one GPU each, and rank 0 writes the file the unsplit run would write, with a
+  `member_ranks` attr and the timings and counters summed over the ranks. The tasks form one member
+  group, not shards: init times are sharded by `--shard` or a job array, and a member-group shard
+  merges like any other.
+* The dry-run plan sizes the lockstep members and the ensemble scoring temporaries, and with
+  `--member-group --ranks R` a rank's share of the model time and the member exchange.
+* A run warns when the targets describe a scored variable differently than the checkpoint: units, time
+  processing, accumulation period or type of level, as anemoi-transform compares them. The result file
+  records each variable's accumulation `period` next to `param` and `level`, and `merge` refuses inputs
+  whose `param`, `level` or `period` disagree.
+
+### Changes
+
+* The node reduction and the ensemble mean are taken one variable at a time. Results differ from 0.4.0
+  in the last float64 bits, and files of both versions still merge.
 
 ## 0.4.0 — 2026-11-18
 

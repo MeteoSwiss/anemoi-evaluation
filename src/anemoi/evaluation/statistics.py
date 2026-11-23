@@ -1,8 +1,8 @@
 """Per-element statistics: (M, V, N) prediction x (1, V, N) target -> (V, N) float64.
 
-Members are reduced in float64 without an (M, V, N) float64 copy: the mean accumulates in float64 and
-the ensemble statistics work one variable at a time, so large offsets (pressure in Pa, temperature in K)
-with a small spread do not cancel in float32. The ensemble statistics are the WeatherBench-X primitives
+Members are reduced in float64 without an (M, V, N) float64 copy, one variable at a time, so large offsets
+(pressure in Pa, temperature in K) with a small spread do not cancel in float32, and a variable's values do not depend
+on which other variables the frame holds. The ensemble statistics are the WeatherBench-X primitives
 (`skill`, `pairs`, `ensemble_variance`); CRPS for any alpha and the spread are derived from their means. The anomaly
 statistics need a climatology in `aux` (declared by `Statistic.aux`) and zero their own contribution where it is
 non-finite, so those nodes leave the anomaly correlation only.
@@ -10,6 +10,7 @@ non-finite, so those nodes leave the anomaly correlation only.
 The threshold statistics binarise the target, and the ensemble mean or the members, with a strict `>` against a
 per-variable threshold map carrying a user-given label, so their names are `<kind>_<label>`. They learn the variable order of the run from
 `bind_variables`, and a variable the map does not name is NaN in every value, hence NaN in every sum derived from it.
+`restrict` gives a bound statistic for a contiguous block of those variables, for frames that hold only the block.
 
 The rank bins hold the position of the target among the members, one statistic per bin of `0..M`, with tied members
 spread deterministically over the bins the target could occupy, so no seed is involved. Their two counts are the same
@@ -26,6 +27,7 @@ need the same count and the same observed event, so they share them through `exc
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 from collections.abc import Callable
@@ -37,12 +39,18 @@ def ensemble_mean(pred: torch.Tensor, aux: dict[str, torch.Tensor] | None = None
     """Member mean in float64, taken from `aux` when the aggregator already computed it for the frame."""
     if aux and "ensemble_mean" in aux:
         return aux["ensemble_mean"]
-    return pred.mean(0, dtype=torch.float64)
+    out = torch.empty(pred.shape[1:], dtype=torch.float64, device=pred.device)
+    for j in range(pred.shape[1]):
+        out[j] = pred[:, j].mean(0, dtype=torch.float64)
+    return out
 
 
 def per_variable(pred: torch.Tensor, target: torch.Tensor, function: Callable) -> torch.Tensor:
     """Apply `function((M, N) float64 members, (N,) float64 target)` to each variable and stack the results."""
-    return torch.stack([function(pred[:, j].double(), target[j].double()) for j in range(pred.shape[1])])
+    out = torch.empty(pred.shape[1:], dtype=torch.float64, device=pred.device)
+    for j in range(pred.shape[1]):
+        out[j] = function(pred[:, j].double(), target[j].double())
+    return out
 
 
 def exceedance(field: torch.Tensor, thresholds: list[float | None]) -> torch.Tensor:
@@ -190,6 +198,11 @@ class Statistic:
     def bind_variables(self, variables: list[str]) -> None:
         """Tell the statistic the variable order of the run; the default statistics do not care."""
 
+    def restrict(self, block: slice) -> Statistic:
+        """The statistic for the frames holding only the variables `block` of the bound ones; the default statistics
+        do not care and return themselves."""
+        return self
+
     def compute(
         self, pred: torch.Tensor, target: torch.Tensor, aux: dict[str, torch.Tensor] | None = None
     ) -> torch.Tensor:
@@ -226,13 +239,15 @@ class SquaredError(Statistic):
         return (ensemble_mean(pred, aux) - target) ** 2
 
 
-class AbsoluteError(Statistic):
-    """Absolute error of the ensemble mean."""
+class AbsoluteMedianError(Statistic):
+    """Absolute error of the ensemble median; the mean of the two middle members for an even count."""
 
-    name = "absolute_error"
+    name = "absolute_median_error"
 
     def _compute(self, pred: torch.Tensor, target: torch.Tensor, aux: dict[str, torch.Tensor]) -> torch.Tensor:
-        return (ensemble_mean(pred, aux) - target).abs()
+        if pred.shape[0] == 1:
+            return (pred[0].double() - target.double()).abs()
+        return per_variable(pred, target, lambda members, truth: (members.quantile(0.5, dim=0) - truth).abs())
 
 
 class EnsembleVariance(Statistic):
@@ -344,6 +359,16 @@ class ThresholdStatistic(Statistic):
             raise ValueError(f"the thresholds of {self.name} name variables the run does not have: {unknown}")
         self._variables = variables
         self._per_variable = [self.thresholds.get(name) for name in variables]
+
+    def restrict(self, block: slice) -> ThresholdStatistic:
+        """A copy bound to the variables `block` of this one's, for the frames holding only those; it may name no
+        variable of the map, which then leaves every value NaN as for any variable the map does not name."""
+        if self._variables is None:
+            raise ValueError(f"{self.name} must be bound to the run's variables before it is restricted")
+        restricted = copy.copy(self)
+        restricted._variables = self._variables[block]
+        restricted._per_variable = self._per_variable[block]
+        return restricted
 
     def _bound(self, n_variables: int) -> list[float | None]:
         if self._per_variable is None:

@@ -309,7 +309,7 @@ for step, date, arrays in steps:
     c = None
     if climatology is not None:
         c = np.asarray(climatology.frame(date, variables, torch.device("cpu")).numpy(), dtype=np.float64)
-    mean = arrays.mean(0)
+    mean, median = arrays.mean(0), np.median(arrays, 0)
     finite = np.isfinite(arrays).all(0) & np.isfinite(y)
     for region, mask in masks.items():
         for j, variable in enumerate(variables):
@@ -318,7 +318,7 @@ for step, date, arrays in steps:
             e = mean[j][ok] - y[j][ok]
             ref = {
                 "rmse": np.sqrt((w * e**2).sum() / w.sum()),
-                "mae": (w * np.abs(e)).sum() / w.sum(),
+                "mae": (w * np.abs(median[j][ok] - y[j][ok])).sum() / w.sum(),
                 "bias": (w * e).sum() / w.sum(),
             }
             ref["error_std"] = np.sqrt((w * (e - ref["bias"]) ** 2).sum() / w.sum())

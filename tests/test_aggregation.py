@@ -37,15 +37,19 @@ def test_state_matches_naive_reference_and_merges_exactly():
         aggregator.add(state, frame, target)
 
     shape = (2, 4, 3, 2)
-    sums = {name: np.zeros(shape) for name in ("error", "squared_error", "absolute_error")}
+    sums = {name: np.zeros(shape) for name in ("error", "squared_error", "absolute_median_error")}
     weight_sum, n_init = np.zeros(shape), np.zeros(shape[:2], dtype=np.int64)
     W = weights[:, None] * masks
     for frame, target in frames:
         pred, y = frame.data.numpy().astype(np.float64), target.numpy()[0].astype(np.float64)
         valid = np.isfinite(pred).all(0) & np.isfinite(y)
-        error = pred.mean(0) - y
+        error, median_error = pred.mean(0) - y, np.median(pred, 0) - y
         lead, season = leads.index(frame.lead_time), {1: 0, 7: 2}[frame.init_time.month]
-        for name, values in (("error", error), ("squared_error", error**2), ("absolute_error", np.abs(error))):
+        for name, values in (
+            ("error", error),
+            ("squared_error", error**2),
+            ("absolute_median_error", np.abs(median_error)),
+        ):
             sums[name][lead, season] += np.where(valid, values, 0.0) @ W
         weight_sum[lead, season] += valid.astype(np.float64) @ W
         n_init[lead, season] += 1
@@ -58,7 +62,7 @@ def test_state_matches_naive_reference_and_merges_exactly():
             np.testing.assert_allclose(mean.numpy(), sums[name] / weight_sum, rtol=1e-10)
         expected = {
             "rmse": np.sqrt(pooled(sums["squared_error"]) / pooled(weight_sum)),
-            "mae": pooled(sums["absolute_error"]) / pooled(weight_sum),
+            "mae": pooled(sums["absolute_median_error"]) / pooled(weight_sum),
             "bias": pooled(sums["error"]) / pooled(weight_sum),
         }
     dataset = to_xarray(state, ms)
@@ -80,6 +84,41 @@ def test_state_matches_naive_reference_and_merges_exactly():
         winter.merge(aggregator.new_state(leads, variables, regions, 3))
     with pytest.raises(ValueError):
         aggregator.add(winter, frames[0][0], frames[0][1][:, :1])
+
+
+def test_variable_subset_aggregates_like_the_matching_slice():
+    """A frame holding only some of the variables gives, bit for bit, those variables' sums of the full frame, which is
+    what lets members be scored on variable blocks; three regions and an odd node count, where one product over all
+    the variables groups the terms differently with the variable count."""
+    rng = np.random.default_rng(3)
+    members, n, variables, leads = 5, 1001, ["a", "b", "c", "d", "e"], [6 * HOUR]
+    weights = rng.random(n) + 0.1
+    masks = np.stack([np.ones(n, dtype=bool), rng.random(n) < 0.5, rng.random(n) < 0.3], axis=1)
+    init = datetime.datetime(2024, 1, 1)
+    pred = torch.from_numpy(rng.normal(280, 2, (members, 5, n)).astype(np.float32))
+    target = torch.from_numpy(rng.normal(280, 2, (1, 5, n)).astype(np.float32))
+    climatology = torch.from_numpy(rng.normal(280, 1, (5, n)))
+    pred[1, 2, :4], target[0, 1, 10:13], climatology[3, 20:25] = float("nan"), float("nan"), float("nan")
+    warm = {"label": "warm", "thresholds": {"b": 280.5}}
+    specs = ["rmse", "mae", "bias", "fair_crps", "spread", "member_rmse", "acc", "rank_histogram"]
+    specs += [{"csi": warm}, {"brier": warm}, {"reliability": warm}]
+
+    def aggregate(columns):
+        statistics = metrics.unique_statistics(metrics.build(specs, [variables[j] for j in columns], members))
+        aggregator = Aggregator(weights, masks, statistics, SeasonBinning("init_time"))
+        state = aggregator.new_state(leads, [variables[j] for j in columns], ["all", "half", "third"], members)
+        frame = Frame(init, leads[0], init + leads[0], state.variables, pred[:, columns].contiguous())
+        aggregator.add(state, frame, target[:, columns].contiguous(), {"climatology": climatology[columns]})
+        return state
+
+    full = aggregate(list(range(5)))
+    # each subset binds its own variables, so the map names only `b`, which every subset holds
+    for columns in ([1, 2], [1, 3, 4], [1]):
+        part = aggregate(columns)
+        assert torch.equal(part.weights, full.weights[:, :, columns])
+        assert part.sums.keys() == full.sums.keys()
+        for name, total in part.sums.items():
+            torch.testing.assert_close(total, full.sums[name][:, :, columns], rtol=0, atol=0, equal_nan=True, msg=name)
 
 
 def test_binnings():
