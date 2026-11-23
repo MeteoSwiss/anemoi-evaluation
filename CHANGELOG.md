@@ -4,6 +4,7 @@
 
 ### Breaking
 
+* `spread_skill` now uses the unbiased RMSE of the ensemble mean (the WeatherBench-X `UnbiasedSpreadSkillRatio`). Merging older result files recomputes it with the new formula.
 * `mae` scores the ensemble median instead of the ensemble mean, from the new statistic `absolute_median_error`,
   which replaces `absolute_error`. Values at one or two members are unchanged.
   Older result files with mae can no longer be merged or re-read.

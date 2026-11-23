@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from anemoi.evaluation.metrics import CRPS
+from anemoi.evaluation.metrics import SpreadSkill
 from anemoi.evaluation.statistics import AbsoluteMedianError
 from anemoi.evaluation.statistics import EnsembleVariance
 from anemoi.evaluation.statistics import Error
@@ -70,6 +71,26 @@ def test_member_squared_error_identity():
         np.testing.assert_allclose(got, identity, rtol=1e-12)
     single = MemberSquaredError().compute(pred_t[:1], target_t)
     np.testing.assert_allclose(single.numpy(), SquaredError().compute(pred_t[:1], target_t).numpy(), rtol=1e-15)
+
+
+@pytest.mark.parametrize("members", [4, 16])
+def test_spread_skill_of_a_calibrated_ensemble_is_one(members):
+    rng = np.random.default_rng(members)
+    pred_t = torch.from_numpy(rng.standard_normal((members, 1, 200_000)))
+    target_t = torch.from_numpy(rng.standard_normal((1, 1, 200_000)))
+    means = {
+        statistic.name: statistic.compute(pred_t, target_t).mean(-1)
+        for statistic in (EnsembleVariance(), SquaredError())
+    }
+    assert float(SpreadSkill().from_means(means, members)) == pytest.approx(1.0, abs=0.01)
+    biased = (means["ensemble_variance"] / means["squared_error"]).sqrt()
+    assert float(biased) == pytest.approx(np.sqrt(members / (members + 1)), abs=0.01)
+
+
+def test_spread_skill_without_a_positive_unbiased_error():
+    means = {"ensemble_variance": torch.tensor([0.04, 0.04]), "squared_error": torch.tensor([0.01, 0.005])}
+    values = SpreadSkill().from_means(means, 4)
+    assert torch.isinf(values[0]) and torch.isnan(values[1])
 
 
 @pytest.mark.parametrize("members", [1, 2, 3, 4])
