@@ -217,6 +217,10 @@ class DatasetTargets(TargetSourceBase):
         """`param` and `level` of a variable from the dataset's typed variables; None when unknown."""
         return variable_info(self.typed_variables.get(name))
 
+    def recorded_variables(self) -> dict:
+        """The anemoi-transform variables of the dataset's `variables_metadata`."""
+        return dict(self.typed_variables)
+
     def describe(self) -> dict:
         """Dataset arguments, date range, row size and the prefetch and cache settings."""
         itemsize = np.dtype(getattr(self.ds, "dtype", np.float32)).itemsize

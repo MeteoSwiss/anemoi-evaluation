@@ -619,7 +619,8 @@ provider lists, and building a temporal downscaler's window input state
 
 Three designs were worked out against the current code and not built. The sketches are kept
 because the analysis, not the conclusion, is the expensive part; the decisions themselves are in
-[`requirements.md`](requirements.md) section 5. A fourth, member-parallel evaluation, is no longer
+[`requirements.md`](requirements.md) section 5, except model-parallel evaluation, which is not supported yet
+(section 1.2 there). A fourth, member-parallel evaluation, is no longer
 deferred: it is built as the member groups of section 3.13, with every rank running its own model
 rather than one model sharded over the ranks.
 

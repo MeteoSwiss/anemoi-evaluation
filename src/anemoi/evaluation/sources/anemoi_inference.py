@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from anemoi.transform.variables import Variable
 from anemoi.utils.dates import frequency_to_string
 
 from anemoi.evaluation.frame import Frame
@@ -282,6 +283,15 @@ def checkpoint_task(metadata: Mapping) -> tuple[str, str | None]:
     return "forecaster", None
 
 
+def recorded_variables_metadata(metadata: Mapping, name: str) -> dict:
+    """The `variables_metadata` a checkpoint's metadata records for dataset `name` (either layout of the `dataset`
+    block), read before anemoi-inference fills in assumed entries."""
+    block = metadata.get("dataset") or {}
+    if "variables_metadata" not in block:
+        block = block.get(name) or {}
+    return dict(block.get("variables_metadata") or {})
+
+
 def patched_metadata(metadata: Mapping, patch: Mapping | None) -> Mapping:
     """`metadata` with a `patch_metadata` block applied to the first dataset, as anemoi-inference does."""
     if not patch:
@@ -405,6 +415,14 @@ class DatasetForecast:
         names = metadata.output_tensor_index_to_variable
         self.variables = [names[i] for i in range(len(names))]
         self.typed_variables = dict(metadata.typed_variables)
+        # anemoi-inference fills in assumed metadata where the checkpoint records no `variables_metadata` (its legacy
+        # path), so only what the checkpoint records is compared with the targets
+        recorded = recorded_variables_metadata(source._recorded_metadata, name)
+        self._recorded_variables = {
+            variable: Variable.from_dict(variable, entry)
+            for variable, entry in recorded.items()
+            if variable in self.typed_variables
+        }
         arrays = metadata.supporting_arrays
         self.grid_indices = arrays.get("grid_indices")
         index = slice(None) if self.grid_indices is None else self.grid_indices
@@ -464,6 +482,11 @@ class DatasetForecast:
         """`param` and `level` of a variable of this dataset."""
         return variable_info(self.typed_variables.get(name))
 
+    def recorded_variables(self) -> dict:
+        """The anemoi-transform variables of this dataset whose metadata the checkpoint records; none that
+        anemoi-inference assumed."""
+        return dict(self._recorded_variables)
+
     def describe(self) -> dict:
         """What the parent reports for this dataset."""
         return self.source.describe(dataset=self.name)
@@ -517,6 +540,8 @@ class InferenceForecastSource(ForecastSourceBase):
             # before the runner is built: the `auto` runner raises on a task it has no runner for
             metadata = load_metadata(Checkpoint(config.checkpoint).path)
             patched = patched_metadata(metadata, config.patch_metadata)
+            # as stored (and patched): the runner fills in assumed `variables_metadata` on its own copy
+            self._recorded_metadata = patched
             self.task = check_task(patched)
             self.runner = create_runner(config)
             check_runner(self.task, self.runner, config.runner, (patched.get("metadata_inference") or {}).get("task"))
@@ -1002,6 +1027,10 @@ class InferenceForecastSource(ForecastSourceBase):
     def variable_info(self, name: str) -> dict:
         """`param` and `level` of a variable from the checkpoint's typed variables; None when unknown."""
         return variable_info(self.typed_variables.get(name))
+
+    def recorded_variables(self) -> dict:
+        """The anemoi-transform variables whose metadata the checkpoint records (its training dataset's)."""
+        return self.datasets[self.dataset_name].recorded_variables()
 
     def provenance(self) -> dict:
         """Result-file attrs identifying the checkpoint: its path, uuid and training run id; once the model is loaded,

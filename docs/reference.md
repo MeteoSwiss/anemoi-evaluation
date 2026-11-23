@@ -241,6 +241,18 @@ Every other key goes to `anemoi.datasets.open_dataset`. With no other key (or no
 all), the targets are opened from the arguments of the forecast source's prognostics input, so forecast
 and targets read the same zarr. The dataset must have exactly one member (`shape[2] == 1`).
 
+When the evaluation is built, the metadata of every scored variable the checkpoint records is
+compared with the targets' `variables_metadata`, as anemoi-transform's `Variable.compatible` does:
+units, time processing (such as `accumulation`), accumulation period and type of level (surface,
+pressure or model level). A difference is warned about, such as a 6 h `tp` checkpoint against
+targets whose `tp` is a 1 h total. The MARS request keys (`class`, `stream`, the GRIB `param` name,
+`levelist`) are not compared, since they differ between sources of truth for the same quantity.
+Units are compared as written, so `m s-1` and `m s**-1` differ. What only one side records is logged
+at info level and not checked: this includes a `levtype` of `unknown`, which some datasets write for
+pressure levels, and what anemoi-inference fills in for a checkpoint that records no
+`variables_metadata`. The baselines are not checked. A mismatch needs targets, or a forecast input,
+other than the checkpoint's training dataset; a cutout reports its first element's metadata only.
+
 ### Multi-dataset checkpoints
 
 A checkpoint trained on multiple datasets is scored as one evaluation per dataset, sharing one runner and
@@ -698,7 +710,7 @@ The state holds float64 sums over the four axes `(lead_time, bin, variable, regi
 | `weights` | float64 tensor `(L, B, V, R)` | Weight sum of the valid elements. |
 | `n_init` | int64 tensor `(L, B)` | Frames added. |
 | `members` | int | Ensemble size of the frames. |
-| `variable_coords` | dict name to list | Per-variable labels (`param`, `level`). |
+| `variable_coords` | dict name to list | Per-variable labels (`param`, `level`, `period`). |
 | `init_times` | list of datetime | Init times whose frames were added. |
 | `attrs` | dict | Result-file attributes. |
 
@@ -721,6 +733,7 @@ Dimensions and coordinates:
 | `init_time` | `init_time` | `datetime64[ns]` | Init times that contributed. |
 | `param` | `variable` | str | Parameter of each variable, `""` when unknown. |
 | `level` | `variable` | float | Level of each variable, NaN when unknown. |
+| `period` | `variable` | str | Accumulation period of each variable (`6h`), the forecast's, else the targets'; `""` when not an accumulation or unknown. Absent from files written by 0.4.0 or earlier. |
 | `rank` | `rank` | int64 | `0..M`, present only when a metric declares it (`rank_histogram`). |
 | `probability` | `probability` | float64 | `k / M` for `k` in `0..M`, present only when a metric declares it (`reliability`, `forecast_frequency`, `roc_pod`, `roc_pofd`). |
 | `cost_loss` | `cost_loss` | float64 | The configured cost/loss ratios, present only when a metric declares it (`rev`). |
@@ -816,6 +829,8 @@ unsharded control; that is a measurement of one configuration, not a guarantee.
 `merge` refuses:
 
 - different coordinates (`lead_times`, `bins`, `variables`, `regions`) or different statistic sets;
+- different per-variable labels (`param`, `level`, `period`); a label only some inputs carry, such as
+  the `period` of a file written by 0.4.0 or earlier, is dropped from the merged state;
 - different `members`;
 - overlapping `init_times` (the same init time counted twice);
 - inputs whose `dataset` attrs are not all the same (a multi-dataset run writes one file per dataset per
@@ -860,7 +875,7 @@ Weights and regions given as specs are resolved on first use.
 | `shard(index, count)` | `list[datetime]`, `init_times[index::count]`. |
 | `split_members(group)` | `None`; makes the evaluation rank `group.rank` of a `MemberGroup`: `run()` then returns the rank's state, of its variable block. Raises `ValueError` for a forecast source without `split_members` (only `InferenceForecastSource` has one). See [member-parallel runs](#member-parallel-runs). |
 | `model_calls_per_init()` | `tuple[int, timedelta]`: calls per init time and the lead time they compute. |
-| `variable_coords()` | `dict[str, list]`: `param` and `level` per variable. |
+| `variable_coords()` | `dict[str, list]`: `param`, `level` and `period` per variable. |
 | `attrs(init_times=None, timing=None)` | `dict` of result-file attributes. |
 | `to_config()` | `dict`, YAML-ready; raises when weights or regions were given as arrays. |
 | `close()` | `None`; releases the forecast, target and climatology sources. |
@@ -934,7 +949,7 @@ Diagnostic output for `--dry-run`. Its keys are not an interface and carry no co
 | `model_calls` | Calls per init time times the number of init times. |
 | `computed_lead_time` | The lead time those calls actually compute. |
 | `include_lead_zero` | The flag. |
-| `variables` | `{names, param, level}`. |
+| `variables` | `{names, param, level, period}`. |
 | `metrics`, `statistics` | The metric specs, and the sorted names of the statistics they need. |
 | `weights` | The weight spec, or `"array"` when given as an array. |
 | `regions` | Name to spec, or `"array"`. |
@@ -1070,6 +1085,7 @@ frames(init_time: datetime, lead_time: timedelta, variables: list[str], device: 
 check_init_times(init_times: list[datetime], lead_time: timedelta) -> None
 graph_node_attribute(name: str, nodes: str = "data") -> np.ndarray
 variable_info(name: str) -> dict
+recorded_variables() -> dict[str, Variable]   # optional: the anemoi-transform variables it records
 provenance() -> dict
 stats -> dict            # property
 describe() -> dict       # must not load a model
@@ -1090,6 +1106,7 @@ stats -> dict            # property: reads, read_seconds, cache_hits
 close() -> None
 grid_mask(i: int) -> np.ndarray
 variable_info(name: str) -> dict
+recorded_variables() -> dict[str, Variable]   # optional, as for forecasts
 to_config() -> dict
 describe() -> dict
 ```
@@ -1110,7 +1127,9 @@ with defaults: no device preference, no graph, no date check, no sub-grids, no l
 `stats` and `provenance`, unknown `variable_info`, and `to_config()` raising.
 Their `describe()` reports the class name, the node count and the variable count, and the forecast base
 adds `members`. Helpers: `lead_time_steps(lead_time, timestep)`, `variable_info(variable)`,
-`select_variables(requested, available)`.
+`accumulation_periods(typed_variables)`, `compare_variables(checkpoint, targets, names)`,
+`select_variables(requested, available)`. A forecast source without `recorded_variables` is not
+checked against the targets (the baselines).
 
 ### Internals (no compatibility promise)
 
@@ -1297,8 +1316,9 @@ Constraints the code enforces, with the message or behaviour:
 - **The `tools/` scripts take a single-dataset checkpoint.** `validate.py`, `make_climatology.py` and
   `ab_prefetch.py` read `forecast.dataset_name`, the `forecast.anemoi_inference.input.dataset` block and
   a plain `regions` block, all of which are per dataset on a multi-dataset checkpoint; they raise on one.
-- **One process per shard.** There is no multi-rank job and no model-parallel runner. Lockstep members
-  cost GPU memory linearly.
+- **A checkpoint must fit on one GPU.** A process runs a shard, or a rank of a member group runs its
+  block of members; model-parallel evaluation is not supported yet. Lockstep members cost GPU memory
+  linearly, per rank in a member group.
 - **Target datasets must have one member** (`shape[2] == 1`).
 - **Grids must match.** `Grid.check_compatible` raises unless forecast, target and climatology grids have
   the same nodes within `1e-5` degrees.
