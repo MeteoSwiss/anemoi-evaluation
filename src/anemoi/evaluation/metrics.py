@@ -61,10 +61,10 @@ class MAE(Metric):
     name = "mae"
 
     def __init__(self) -> None:
-        self.statistics = {"abs_median_error": st.AbsMedianError()}
+        self.statistics = {"absolute_median_error": st.AbsoluteMedianError()}
 
     def from_means(self, means: dict[str, torch.Tensor], members: int) -> torch.Tensor:
-        return means["abs_median_error"]
+        return means["absolute_median_error"]
 
 
 class RMSE(Metric):

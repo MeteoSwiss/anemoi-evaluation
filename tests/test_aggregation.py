@@ -37,7 +37,7 @@ def test_state_matches_naive_reference_and_merges_exactly():
         aggregator.add(state, frame, target)
 
     shape = (2, 4, 3, 2)
-    sums = {name: np.zeros(shape) for name in ("error", "squared_error", "abs_median_error")}
+    sums = {name: np.zeros(shape) for name in ("error", "squared_error", "absolute_median_error")}
     weight_sum, n_init = np.zeros(shape), np.zeros(shape[:2], dtype=np.int64)
     W = weights[:, None] * masks
     for frame, target in frames:
@@ -45,7 +45,11 @@ def test_state_matches_naive_reference_and_merges_exactly():
         valid = np.isfinite(pred).all(0) & np.isfinite(y)
         error, median_error = pred.mean(0) - y, np.median(pred, 0) - y
         lead, season = leads.index(frame.lead_time), {1: 0, 7: 2}[frame.init_time.month]
-        for name, values in (("error", error), ("squared_error", error**2), ("abs_median_error", np.abs(median_error))):
+        for name, values in (
+            ("error", error),
+            ("squared_error", error**2),
+            ("absolute_median_error", np.abs(median_error)),
+        ):
             sums[name][lead, season] += np.where(valid, values, 0.0) @ W
         weight_sum[lead, season] += valid.astype(np.float64) @ W
         n_init[lead, season] += 1
@@ -58,7 +62,7 @@ def test_state_matches_naive_reference_and_merges_exactly():
             np.testing.assert_allclose(mean.numpy(), sums[name] / weight_sum, rtol=1e-10)
         expected = {
             "rmse": np.sqrt(pooled(sums["squared_error"]) / pooled(weight_sum)),
-            "mae": pooled(sums["abs_median_error"]) / pooled(weight_sum),
+            "mae": pooled(sums["absolute_median_error"]) / pooled(weight_sum),
             "bias": pooled(sums["error"]) / pooled(weight_sum),
         }
     dataset = to_xarray(state, ms)

@@ -4,7 +4,7 @@
 
 ### Breaking
 
-* `mae` scores the ensemble median instead of the ensemble mean, from the new statistic `abs_median_error`,
+* `mae` scores the ensemble median instead of the ensemble mean, from the new statistic `absolute_median_error`,
   which replaces `absolute_error`. Values at one or two members are unchanged.
 
 ### Features
