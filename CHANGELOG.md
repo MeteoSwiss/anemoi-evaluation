@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Breaking
+
+* `mae` scores the ensemble median instead of the ensemble mean, from the new statistic `absolute_median_error`,
+  which replaces `absolute_error`. Values at one or two members are unchanged.
+  Older result files with mae can no longer be merged or re-read.
+
 ### Features
 
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the

@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from anemoi.evaluation.metrics import CRPS
+from anemoi.evaluation.statistics import AbsoluteMedianError
 from anemoi.evaluation.statistics import EnsembleVariance
 from anemoi.evaluation.statistics import Error
 from anemoi.evaluation.statistics import MemberSquaredError
@@ -69,6 +70,20 @@ def test_member_squared_error_identity():
         np.testing.assert_allclose(got, identity, rtol=1e-12)
     single = MemberSquaredError().compute(pred_t[:1], target_t)
     np.testing.assert_allclose(single.numpy(), SquaredError().compute(pred_t[:1], target_t).numpy(), rtol=1e-15)
+
+
+@pytest.mark.parametrize("members", [1, 2, 3, 4])
+def test_absolute_median_error_matches_numpy_median(members):
+    rng = np.random.default_rng(members)
+    pred, target = rng.standard_normal((members, 2, 7)), rng.standard_normal((1, 2, 7))
+    got = AbsoluteMedianError().compute(torch.from_numpy(pred), torch.from_numpy(target)).numpy()
+    np.testing.assert_allclose(got, np.abs(np.median(pred, 0) - target[0]), rtol=1e-12)
+
+
+def test_absolute_median_error_of_a_skewed_ensemble():
+    pred = torch.tensor([0.0, 0.0, 0.0, 8.0], dtype=torch.float64)[:, None, None]
+    target = torch.zeros((1, 1, 1), dtype=torch.float64)
+    assert AbsoluteMedianError().compute(pred, target).item() == 0.0
 
 
 def test_large_offset_small_spread_in_float32():
