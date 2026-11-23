@@ -607,7 +607,8 @@ sums while the shared weight sum still counts them, so only the ratio is meaning
 the three anomaly statistics are not.
 
 Ensemble conventions: `bias`, `rmse`, `spread_skill` and `acc` score the **ensemble mean**, `mae` the
-**ensemble median** (the optimal point forecast under absolute loss); `member_rmse` and `member_mae` score a randomly drawn member in expectation; `member_rmse` is never
+**ensemble median** (the optimal point forecast under absolute loss); `member_rmse` and `member_mae`
+score a randomly drawn member in expectation; `member_rmse` is never
 below `rmse`. A deterministic model is `M = 1`, where `member_squared_error` equals `squared_error` and
 the metrics needing 2 members are rejected at construction (`the metrics need at least N members`).
 
