@@ -245,6 +245,8 @@ class AbsoluteMedianError(Statistic):
     name = "absolute_median_error"
 
     def _compute(self, pred: torch.Tensor, target: torch.Tensor, aux: dict[str, torch.Tensor]) -> torch.Tensor:
+        if pred.shape[0] == 1:
+            return (pred[0].double() - target.double()).abs()
         return per_variable(pred, target, lambda members, truth: (members.quantile(0.5, dim=0) - truth).abs())
 
 
