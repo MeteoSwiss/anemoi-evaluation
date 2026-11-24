@@ -116,8 +116,8 @@ InitTimesConfig = InitTimesRange | InitTimesList
 
 
 class AnemoiInferenceConfig(BaseModel):
-    """The `anemoi_inference` block: `members`, `seed`, `quiet` and `forcings_cache_bytes`, the rest goes to the runner
-    configuration."""
+    """The `anemoi_inference` block: `members`, `seed`, `quiet`, `forcings_cache_bytes` and `member_inputs`, the rest
+    goes to the runner configuration."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -125,6 +125,15 @@ class AnemoiInferenceConfig(BaseModel):
     seed: int = 0
     quiet: bool = True
     forcings_cache_bytes: int = Field(2**30, ge=0)
+    # one anemoi-inference `input` block per member, `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}`
+    # filled in from the init time: each member's prognostics are read from its own input
+    member_inputs: list[dict] | None = None
+
+    @model_validator(mode="after")
+    def _member_inputs_per_member(self) -> AnemoiInferenceConfig:
+        if self.member_inputs is not None and len(self.member_inputs) != self.members:
+            raise ValueError(f"member_inputs has {len(self.member_inputs)} input blocks for {self.members} members")
+        return self
 
 
 class PersistenceConfig(_Model):

@@ -111,8 +111,9 @@ sources share, metrics `rmse`, `mae` and `bias`, the checkpoint's `area_weight` 
 one region `global`, seasonal bins by init time, missing targets skipped, no lead 0. Every key,
 its type and its default are in the [reference](reference.md#top-level-evaluationconfig).
 
-`forecast.anemoi_inference` consumes `members`, `seed`, `quiet` and `forcings_cache_bytes`; every
-other key goes to the anemoi-inference run configuration (`checkpoint`, `device`, `input`, `env`,
+`forecast.anemoi_inference` consumes `members`, `seed`, `quiet`, `forcings_cache_bytes` and
+`member_inputs` (one `input` block per member, see [per-member inputs](#per-member-inputs));
+every other key goes to the anemoi-inference run configuration (`checkpoint`, `device`, `input`, `env`,
 ...), except `date` and a non-`none` `output`, which are refused because init times come from the
 evaluation and forecast fields never leave memory. `targets.anemoi_dataset` consumes `prefetch`
 and `cache_bytes`; every other key goes to `anemoi.datasets.open_dataset`, and an empty block
@@ -322,6 +323,42 @@ and an extra member costs about 1.45 GiB on a 6-hourly 2-in/1-out 1 km checkpoin
 an hourly 7-in/6-out one ([benchmarks](benchmarks.md#3-model-step-time-and-gpu-memory)). An
 ensemble that does not fit one GPU is spread over several with a
 [member-parallel run](#member-parallel-runs).
+
+### Per-member inputs
+
+By default every member of an init time starts from the same input state. `member_inputs` gives each member
+its own anemoi-inference `input` block instead: for ensembles from perturbed initial conditions, for initial
+conditions assembled per init time from several sources, or for inputs stored as one file per init time.
+
+```yaml
+forecast:
+  anemoi_inference:
+    members: 2
+    input:                     # still the runner's input: constant and dynamic forcings, same for every member
+      dataset:
+        cutout: [/data/regional-member1.zarr, /data/global-all-dates.zarr]
+        min_distance_km: 0
+    member_inputs:             # one anemoi-inference input block per member
+      - dataset:
+          cutout:
+            - /data/regional-member1.zarr                                         # regional domain, all dates
+            - "/data/global/{yyyy}/{mm}/{dd}/global-{yyyymmdd}{hh}-member1.zarr"  # global domain of this init time
+          min_distance_km: 0
+      - dataset:
+          cutout:
+            - /data/regional-member2.zarr
+            - "/data/global/{yyyy}/{mm}/{dd}/global-{yyyymmdd}{hh}-member2.zarr"
+          min_distance_km: 0
+```
+
+`{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` are filled in from each init time, in every
+string of a block. Any path can thus be per init time, the regional one included (e.g. regional initial
+conditions built for each init time). Member `m` reads its initial state from block `m` and, when the checkpoint has boundary
+forcings (an `output_mask`), its boundaries at every lead time too, so the block must then cover the whole
+rollout. `input` keeps providing the constant and dynamic forcings, so it must hold the init times and the same
+constant fields as the members. Every member input is opened at every init time before the run, and an
+anemoi-datasets input is checked for the dates it is read at; each input is opened once per run. Single-dataset
+checkpoints only.
 
 ## Multi-step-output models, offset forecasters and lead 0
 

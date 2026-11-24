@@ -202,6 +202,7 @@ one. `linear_interpolation` yields `k * timestep` for `0 < k * timestep < lead_t
 | `seed` | int | 0 | Base seed, see [seeding](#seeding-and-reproducibility). |
 | `quiet` | bool | true | Raise the `anemoi.inference` and `anemoi.utils.timer` loggers to WARNING while the runner runs. |
 | `forcings_cache_bytes` | int >= 0 | `2**30` (1 GiB) | Host LRU budget for computed forcings arrays. `0` disables the cache. |
+| `member_inputs` | list of mappings, or null | null | One anemoi-inference `input` block per member (`members` of them); `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}`, `{yyyymmddhh}` in its strings are filled in from the init time. Member `m`'s prognostics are read from block `m`, and for a checkpoint with boundary forcings (an `output_mask`) its boundaries at every lead time too, as from `input` without `member_inputs`; constant and dynamic forcings from `input`, so they must be the same for every member. Every member input is opened at every init time and, when it is an anemoi-datasets input, checked for the dates its rollout reads (with boundary forcings, the boundary dates of every model call) (other input types: a warning, no date check); each input is opened once per run. Single-dataset checkpoints only. |
 
 Every other key goes to `anemoi.inference.config.run.RunConfiguration` (`checkpoint`, `device`, `input`,
 `env`, ...). The block is loaded as `{"verbosity": 0, **block, "output": "none"}`: `verbosity: 0` is only

@@ -44,7 +44,11 @@ def test_init_times_forms_and_inference_block():
     assert config.lead_time == datetime.timedelta(hours=24)
     block = config.forecast.anemoi_inference
     assert (block.members, block.seed, block.quiet) == (2, 3, False)
-    assert block.model_dump() == {**CONFIG["forecast"]["anemoi_inference"], "forcings_cache_bytes": 2**30}
+    assert block.model_dump() == {
+        **CONFIG["forecast"]["anemoi_inference"],
+        "forcings_cache_bytes": 2**30,
+        "member_inputs": None,
+    }
 
 
 def test_validation_errors(fake_sources):
