@@ -11,6 +11,13 @@
 
 ### Features
 
+* `forecast.anemoi_inference.member_inputs`: one anemoi-inference `input` block per member, with
+  `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` filled in from the init time and `{member}`
+  (e.g. `{member:02}`) by the member number from 1, or one block for every member. Each
+  member's prognostics, and for a checkpoint with boundary forcings (an `output_mask`) its boundaries at every
+  lead time, are read from its own input (EDA members, initial conditions or boundary files per init time); the
+  constant and dynamic forcings still come from `input`. The dates every anemoi-datasets member input needs
+  are checked at every init time, and each input is opened once per run. Single-dataset checkpoints only.
 * New time bins `bins: {time: hour}`, one per hour of day (`00` to `23`); by valid time they give the
   diurnal cycle.
 * `run --member-group` spreads the members of every init time over the tasks of an `srun` or
@@ -24,6 +31,12 @@
   processing, accumulation period or type of level, as anemoi-transform compares them. The result file
   records each variable's accumulation `period` next to `param` and `level`, and `merge` refuses inputs
   whose `param`, `level` or `period` disagree.
+
+### Fixes
+
+* The init-time check no longer requires the boundary-forcing dates of a checkpoint without an `output_mask`:
+  anemoi-inference builds no boundary-forcing providers for it and never reads that input, so a rollout longer
+  than the `input` dataset's last date was refused for nothing.
 
 ### Changes
 
