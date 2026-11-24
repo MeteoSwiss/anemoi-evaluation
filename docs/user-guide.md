@@ -352,7 +352,19 @@ forecast:
 ```
 
 `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` are filled in from each init time, in every
-string of a block. Any path can thus be per init time, the regional one included (e.g. regional initial
+string of a block, and `{member}` by the member number, 1 to `members`, with an optional format spec
+(`{member:02}` gives `01`). When the members' paths differ only by their number, one block serves them all:
+
+```yaml
+    member_inputs:             # one block for every member
+      dataset:
+        cutout:
+          - /data/regional.zarr
+          - "/data/global/{yyyy}/{mm}/{dd}/global-{yyyymmdd}{hh}-member{member:02}.zarr"
+        min_distance_km: 0
+```
+
+Any path can thus be per init time, the regional one included (e.g. regional initial
 conditions built for each init time). Member `m` reads its initial state from block `m` and, when the checkpoint has boundary
 forcings (an `output_mask`), its boundaries at every lead time too, so the block must then cover the whole
 rollout. `input` keeps providing the constant and dynamic forcings, so it must hold the init times and the same

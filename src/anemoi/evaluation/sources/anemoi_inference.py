@@ -12,6 +12,7 @@ import itertools
 import logging
 import math
 import os
+import re
 from collections import OrderedDict
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -54,13 +55,16 @@ def create_input_state(source: object, init_time: datetime.datetime, lagged: lis
     return source.create_input_state(date=init_time)
 
 
-DATE_PLACEHOLDERS = ("yyyy", "mm", "dd", "hh", "yyyymmdd", "yyyymmddhh")
+MEMBER_PLACEHOLDER = re.compile(r"\{member(?::([^{}]*))?\}")
 
 
-def format_init_time(value: object, init_time: datetime.datetime) -> object:
+def format_init_time(value: object, init_time: datetime.datetime, member: int | None = None) -> object:
     """`value` (a config block) with `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` in every string
-    replaced by the fields of `init_time`; other text is kept as is."""
+    replaced by the fields of `init_time` and, when `member` is given, `{member}` by it, with an optional format
+    spec (`{member:02}` gives `01`); other text is kept as is."""
     if isinstance(value, str):
+        if member is not None:
+            value = MEMBER_PLACEHOLDER.sub(lambda match: format(member, match.group(1) or ""), value)
         fields = {
             "yyyy": f"{init_time:%Y}",
             "mm": f"{init_time:%m}",
@@ -73,9 +77,9 @@ def format_init_time(value: object, init_time: datetime.datetime) -> object:
             value = value.replace("{" + key + "}", text)
         return value
     if isinstance(value, Mapping):
-        return {key: format_init_time(item, init_time) for key, item in value.items()}
+        return {key: format_init_time(item, init_time, member) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [format_init_time(item, init_time) for item in value]
+        return [format_init_time(item, init_time, member) for item in value]
     return value
 
 
@@ -539,13 +543,15 @@ class InferenceForecastSource(ForecastSourceBase):
         seed: int = 0,
         quiet: bool = True,
         forcings_cache_bytes: int = DEFAULT_FORCINGS_CACHE_BYTES,
-        member_inputs: list[Mapping] | None = None,
+        member_inputs: list[Mapping] | Mapping | None = None,
         **run_config: object,
     ) -> None:
-        """`member_inputs`: optional list of one anemoi-inference `input` block per member (`members` of them), each
-        with `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}`, `{yyyymmddhh}` filled in from the init time, from which
-        that member's prognostic input state is read, e.g. one EDA member each, or inputs that change with the init
-        time. Constant and dynamic forcings still come from the runner's `input`. Single-dataset checkpoints only."""
+        """`member_inputs`: optional list of one anemoi-inference `input` block per member (`members` of them), or
+        one block for every member, with `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}`, `{yyyymmddhh}` filled in
+        from the init time and `{member}` (format spec allowed, e.g. `{member:02}`) by the member number 1 to
+        `members`, from which that member's prognostic input state is read, e.g. one EDA member each, or inputs that
+        change with the init time. Constant and dynamic forcings still come from the runner's `input`.
+        Single-dataset checkpoints only."""
         from anemoi.inference.checkpoint import Checkpoint
         from anemoi.inference.config.run import RunConfiguration
         from anemoi.inference.runners import create_runner
@@ -559,6 +565,8 @@ class InferenceForecastSource(ForecastSourceBase):
             raise ValueError("the inference config's output must be 'none', forecasts stay in memory")
         env = inference_env(run_config)
         self.run_config = {**run_config, **({"env": env} if env else {})}
+        if isinstance(member_inputs, Mapping):
+            member_inputs = [member_inputs] * members
         if member_inputs is not None and len(member_inputs) != members:
             raise ValueError(f"member_inputs has {len(member_inputs)} input blocks for {members} members")
         self.member_inputs = None if member_inputs is None else [dict(block) for block in member_inputs]
@@ -936,8 +944,8 @@ class InferenceForecastSource(ForecastSourceBase):
         return self._initial[dataset][1]
 
     def member_input_config(self, member: int, init_time: datetime.datetime) -> dict:
-        """The `input` block of `member` at `init_time` (placeholders filled in)."""
-        return format_init_time(self.member_inputs[member], init_time)
+        """The `input` block of `member` (0-based) at `init_time`, placeholders filled in (`{member}` is 1-based)."""
+        return format_init_time(self.member_inputs[member], init_time, member + 1)
 
     def _member_input(self, member: int, init_time: datetime.datetime) -> object:
         """An input of the runner built from the member's `input` block at `init_time`, for its prognostics and its

@@ -1,6 +1,7 @@
 import datetime
 from types import SimpleNamespace
 
+import _multi_dataset as fixture
 import numpy as np
 import pytest
 import torch
@@ -26,6 +27,21 @@ def test_format_init_time_and_member_inputs_config():
     assert config.member_inputs == [block, block]
     with pytest.raises(ValueError, match="2 input blocks for 3 members"):
         AnemoiInferenceConfig.model_validate({"checkpoint": "x", "members": 3, "member_inputs": [block, block]})
+
+
+def test_member_placeholder_and_one_block_for_every_member(monkeypatch, tmp_path):
+    path = "/g/{yyyymmdd}{hh}-member{member:02}-m{member}.zarr"
+    assert format_init_time(path, T0, 3) == "/g/2024010200-member03-m3.zarr"
+    assert format_init_time(path, T0) == "/g/2024010200-member{member:02}-m{member}.zarr"  # no member: kept as is
+    template = {"dataset": {"cutout": ["/r.zarr", path]}}
+    config = AnemoiInferenceConfig.model_validate({"checkpoint": "x", "members": 3, "member_inputs": template})
+    assert config.member_inputs == template
+    source = fixture.forecast_source(
+        monkeypatch, tmp_path, fixture.DATASET_NAMES[:1], members=3, member_inputs=template
+    )
+    assert [source.member_input_config(m, T0)["dataset"]["cutout"][1] for m in range(3)] == [
+        f"/g/2024010200-member0{m}-m{m}.zarr" for m in (1, 2, 3)
+    ]
 
 
 class FakeInput:

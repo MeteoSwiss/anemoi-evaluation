@@ -12,7 +12,8 @@
 ### Features
 
 * `forecast.anemoi_inference.member_inputs`: one anemoi-inference `input` block per member, with
-  `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` filled in from the init time. Each
+  `{yyyy}`, `{mm}`, `{dd}`, `{hh}`, `{yyyymmdd}` and `{yyyymmddhh}` filled in from the init time and `{member}`
+  (e.g. `{member:02}`) by the member number from 1, or one block for every member. Each
   member's prognostics, and for a checkpoint with boundary forcings (an `output_mask`) its boundaries at every
   lead time, are read from its own input (EDA members, initial conditions or boundary files per init time); the
   constant and dynamic forcings still come from `input`. The dates every anemoi-datasets member input needs
