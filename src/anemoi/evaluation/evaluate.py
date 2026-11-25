@@ -621,7 +621,9 @@ class MultiEvaluation:
         of it. `predicted_only` names the checkpoint's datasets the run does not score: the model still predicts
         them, they simply have no targets, no aggregator and no result."""
         init_times = list(self.init_times if init_times is None else init_times)
-        predicted_only = [name for name in getattr(self.forecast, "dataset_names", ()) if name not in self.evaluations]
+        predicted_only = [
+            name for name in getattr(self.forecast, "decoded_dataset_names", ()) if name not in self.evaluations
+        ]
         return {
             "datasets": {
                 name: evaluation.plan(init_times, step_time, shards) for name, evaluation in self.evaluations.items()
@@ -772,10 +774,10 @@ def _forecast_views(
 
 
 def _dataset_names(config: EvaluationConfig, forecast: ForecastSource | None, targets: object) -> list[str]:
-    """The datasets a run could score: the checkpoint's when there is one, else the names the `datasets:` blocks or
-    the given target sources agree on, else the one unnamed dataset."""
+    """The datasets a run could score: decoded checkpoint datasets when there is one, else the names the
+    `datasets:` blocks or the given target sources agree on, else the one unnamed dataset."""
     if isinstance(forecast, InferenceForecastSource):
-        names = list(forecast.dataset_names)
+        names = list(forecast.decoded_dataset_names)
     elif isinstance(targets, dict):
         names = list(targets)
     else:

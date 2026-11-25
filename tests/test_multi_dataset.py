@@ -324,13 +324,15 @@ def test_output_path_needs_the_dataset_placeholder():
         format_output_path("out/run-{dataset}.nc", 0, 1)
 
 
-def test_downscaler_checkpoints_are_refused(tmp_path, monkeypatch):
-    """A model that encodes both datasets but decodes only one cannot be run by anemoi-inference at
-    all (step1-verification.md A.2), so the evaluation refuses it where the routing is readable."""
+def test_input_only_dataset_is_not_scored(tmp_path, monkeypatch):
+    """Input-only datasets provide model state but are not forecast/evaluation outputs."""
     checkpoint = fixture.save_checkpoint(tmp_path / "down.ckpt", routing="downscaler")
     fixture.patch_create_runner(monkeypatch, checkpoint)
-    with pytest.raises(ValueError, match="does not decode"):
-        InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
+    source = InferenceForecastSource(checkpoint=str(checkpoint), device="cpu")
+    assert source.dataset_names == ["era5", "realch1"]  # both are model inputs
+    assert source.decoded_dataset_names == ["realch1"]
+    frames = list(source.multi_frames(fixture.init_times()[0], 6 * fixture.HOUR, {"realch1": ["2t"]}, CPU))
+    assert len(frames) == 1 and list(frames[0]) == ["realch1"]
 
 
 def test_datasets_must_share_the_timing(tmp_path, monkeypatch):

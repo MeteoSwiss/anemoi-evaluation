@@ -391,7 +391,7 @@ class InferenceForecastSource(ForecastSourceBase):
         self.frames_per_pass = self.multi_step_output
         self._check_shared_timing()
         metadata = load_metadata(self.checkpoint)
-        self._check_every_dataset_is_decoded(metadata)
+        self.decoded_dataset_names = self._decoded_datasets(metadata)
         # Which datasets the run scores; every one of them until an evaluation narrows it (the `datasets:` config
         # key). The model predicts them all whatever this says: the runner needs an input state for each one.
         self.scored_datasets: list[str] | None = None
@@ -451,22 +451,22 @@ class InferenceForecastSource(ForecastSourceBase):
                 f"the datasets of a checkpoint must share the same timestep, input and output steps, got {reported}"
             )
 
-    def _check_every_dataset_is_decoded(self, metadata: Mapping) -> None:
-        """Refuse a checkpoint whose model does not decode every dataset (a downscaler).
+    def _decoded_datasets(self, metadata: Mapping) -> list[str]:
+        """Return checkpoint datasets the model decodes, in checkpoint order.
 
-        anemoi-inference cannot run one at all: `Runner.forecast` indexes the model output by every dataset of
-        `metadata_inference` and raises `KeyError` on the input-only one. The routing is only readable from the
-        stored training config, so a checkpoint that does not carry it is let through."""
+        Input-only datasets still provide states to the model, but are not forecast outputs to evaluate. Legacy
+        checkpoints without routing metadata retain the historical assumption that every dataset is decoded."""
         routed = routed_datasets(metadata)
         if routed is None:
-            return
+            return list(self.dataset_names)
         _, decoded = routed
-        missing = [name for name in self.dataset_names if name not in decoded]
-        if missing:
+        names = [name for name in self.dataset_names if name in decoded]
+        if not names:
             raise ValueError(
-                f"the checkpoint's model does not decode {missing}, it only decodes {sorted(decoded)}: "
-                "downscaling checkpoints cannot be evaluated (anemoi-inference cannot run them either)"
+                f"the checkpoint's model does not decode any of its datasets {self.dataset_names}; "
+                f"decoder targets are {sorted(decoded)}"
             )
+        return names
 
     @property
     def device(self) -> torch.device:
@@ -750,13 +750,20 @@ class InferenceForecastSource(ForecastSourceBase):
         }
         if self.model_loaded:
             info["inference_chunks"] = inference_chunks(self.runner.model)
-        skipped = [name for name in self.dataset_names if name not in (self.scored_datasets or self.dataset_names)]
+        scored = self.scored_datasets or self.decoded_dataset_names
+        skipped = [name for name in self.decoded_dataset_names if name not in scored]
         if skipped:
-            # the run scores a subset: the others are still predicted, and the runner still holds their state
+            # The model still runs these decoders, and the runner still holds each dataset's input state.
             info["datasets_scored"] = list(self.scored_datasets)
             info["datasets_predicted_only"] = skipped
             info["predicted_only_state_bytes"] = sum(
                 self._describe_dataset(name)["per_member_state_bytes"] for name in skipped
+            )
+        input_only = [name for name in self.dataset_names if name not in self.decoded_dataset_names]
+        if input_only:
+            info["datasets_input_only"] = input_only
+            info["input_only_state_bytes"] = sum(
+                self._describe_dataset(name)["per_member_state_bytes"] for name in input_only
             )
         with contextlib.suppress(OSError):
             info["checkpoint_bytes"] = os.path.getsize(self.checkpoint)
