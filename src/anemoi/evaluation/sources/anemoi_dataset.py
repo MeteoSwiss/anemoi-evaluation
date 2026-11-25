@@ -121,6 +121,11 @@ class DatasetTargets(TargetSourceBase):
         return _interpolate_frequencies([list(self.args), self.kwargs])
 
     @property
+    def dates(self) -> list[datetime.datetime]:
+        """The dataset's dates, missing ones included (see `available`)."""
+        return list(self._dates)
+
+    @property
     def stats(self) -> dict:
         """Rows read (and the seconds spent reading them, on the worker when there is one) and cache hits."""
         return dict(self._stats)

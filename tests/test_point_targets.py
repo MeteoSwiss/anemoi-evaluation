@@ -492,7 +492,7 @@ REFUSALS = {
     "array region": "needs a fixed point set",
     "weights shape": "expected",
     "region shape": "expected",
-    "no constants": "with a provider that serves them",
+    "no constants": "cannot serve the model constants",
     "no elevation": "elevation",
     "stray constants": "constants are",
     "bound": "bound to a model before",
