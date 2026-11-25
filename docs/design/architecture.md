@@ -80,7 +80,7 @@ climatology source on a different grid (FR-8).
 `Frame` carries `init_time`, `lead_time`, `valid_time`, `variables` and `data`, a `(M, V, N)`
 float32 tensor, and validates all of it on construction: rank, dtype, the variable count against
 the columns, and `valid_time == init_time + lead_time`. A frame mapped to observation points has
-`(M, V, P)` data and its `PointSet` in `points`, None on the grid (3.13).
+`(M, V, P)` data and its `PointSet` in `points`, None on the grid (3.14).
 
 The `(M, V, N)` layout is chosen so that the reduction over nodes is one matrix-vector product
 `(N,) @ (N, R)` per variable that produces every region at once, and because both real sources deliver
@@ -94,7 +94,7 @@ The bring-your-own-data boundary (FR-34). Three `Protocol` classes state the ful
 `ForecastSourceBase`, `TargetSourceBase` and `ClimatologySourceBase`, implement the optional
 capabilities with defaults, so a new source subclasses a base and overrides what it can provide.
 A fourth pair, `PointTargetSource` and `PointTargetSourceBase`, is the target contract for
-observations at points (3.13); `is_point_target` tells it from a gridded one by its
+observations at points (3.14); `is_point_target` tells it from a gridded one by its
 `observations()` method. The members of each protocol are listed in
 [`../reference.md`](../reference.md).
 
@@ -321,7 +321,7 @@ metrics' member requirements, resolves the device (the explicit argument, then t
 source's preference, then cuda if available, then cpu) and finally checks the init times against
 the runner's datasets. `weights`, `regions` and `aggregator` are cached properties, so a weight
 spec that needs the checkpoint graph loads the model only when `run()` does. On point targets
-construction also checks the observation operator against the targets and the forecast (3.13),
+construction also checks the observation operator against the targets and the forecast (3.14),
 and hands the point side to a `point_scoring.PointScoring` it delegates to: the chain and its bind,
 the plan and `W` cache, the weights and regions per point set (`point_weights`, `point_regions`),
 the dry run's point facts and the point attrs; `weights` and `regions` then hold the fixed set's, and
@@ -448,7 +448,7 @@ launcher must stop the other tasks (`srun --kill-on-bad-exit=1`, or torchrun, wh
 itself). Only the world group is aborted: destroying a
 gloo subgroup does not unblock its peers.
 
-### 3.13 Observations: `points.py`, `operators/`, `point_scoring.py`
+### 3.14 Observations: `points.py`, `operators/`, `point_scoring.py`
 
 A `PointSet` holds the `P` points of one valid time: `latitudes` and `longitudes` (float64 degrees),
 `timedeltas` (float32 seconds relative to the valid time, zero by default) and named per-point
