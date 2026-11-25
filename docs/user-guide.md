@@ -20,6 +20,7 @@ in the [reference](reference.md); the reasons behind the design are in the
 - [ROC curve and economic value](#roc-curve-and-economic-value)
 - [Temporal downscalers](#temporal-downscalers)
 - [Persistence and the other included sources](#persistence-and-the-other-included-sources)
+- [Scoring against observations](#scoring-against-observations)
 - [Sharding and merging](#sharding-and-merging)
 - [Member-parallel runs](#member-parallel-runs)
 - [Reading the results](#reading-the-results)
@@ -48,13 +49,16 @@ in the [reference](reference.md); the reasons behind the design are in the
   weighted mean over the nodes of a region; regions may overlap. A **time bin** is the second
   aggregation axis (season, month, hour of day, date or a single bin); lead time is always its own
   axis.
-- A checkpoint may be trained on several **datasets**, each with its own grid and variables. Such
+- A checkpoint may be trained on multiple **datasets**, each with its own grid and variables. Such
   a run is one evaluation per dataset sharing one rollout, and it writes one result file per
   dataset (see [Multi-dataset checkpoints](#multi-dataset-checkpoints)).
 - A **source** produces forecasts, targets or a climatology. Sources are small protocols, so a
   run mixes an anemoi-inference checkpoint, a persistence baseline or your own code.
 - Nodes where any member or the target is non-finite are excluded from every statistic *and* from
   the weight sum of that frame, so a metric is always a mean over what was finite.
+- Targets may also be **observations at points**, such as stations; an **observation operator**
+  then maps each forecast frame to the points first (see
+  [Scoring against observations](#scoring-against-observations)).
 - Fields are compared in the units the runner yields them in, against targets from a zarr in the
   same units, so `tp` is scored as the per-step quantity the model was trained on: nothing is
   accumulated over lead time.
@@ -71,7 +75,7 @@ pytest tests        # CPU only, a few seconds
 ```
 
 The dependencies are anemoi-datasets, anemoi-graphs, anemoi-inference, anemoi-transform,
-anemoi-utils, numpy, torch, xarray, netcdf4, pydantic and pyyaml. To score a checkpoint you also
+anemoi-utils, numpy, scipy, torch, xarray, netcdf4, pydantic and pyyaml. To score a checkpoint you also
 need a **GPU** (about 16 GiB for one member of a 1 km stretched-grid model, see
 [benchmarks](benchmarks.md#3-model-step-time-and-gpu-memory)), an **anemoi-inference
 checkpoint** and an **anemoi-datasets zarr** for the targets, by default the
@@ -814,6 +818,167 @@ times whose target is missing are warned about at construction and skipped at ru
 included, mainly for tests and notebooks: `ArrayTargets`, `FakeForecastSource` and
 `ArrayClimatology`, all exported from `anemoi.evaluation`.
 
+## Scoring against observations
+
+A run can score a model against observations at points instead of a gridded dataset. Two things
+change: the targets are a **point target** source, which hands out a set of points and their values
+per valid time, and an **observation operator** maps each forecast frame to those points before it is
+scored. Everything after that is the gridded machinery: the same metrics, bins, result file,
+sharding and merging. For now this is the Python API only; YAML for observations is not yet
+supported.
+
+A point target source hands out, per valid time, an `Observations`: a `PointSet` (the coordinates of
+the points, their time offsets and per-point attributes such as an elevation) and its values. You
+write one for your observations by subclassing `PointTargetSourceBase` (see
+[Bringing your own source](#bringing-your-own-source)); `ArrayPointTargets` holds them in memory, for
+tests and notebooks. The shipped operators are `Nearest` (the value of the nearest model node) and
+`LapseRate` (a fixed-lapse-rate height correction of a temperature), and they chain.
+
+### A worked example
+
+A model trained on a gridded analysis, scored against a fixed set of stations held in memory, in the
+model's units under the model's names:
+
+```python
+import anemoi.evaluation as ae
+from anemoi.evaluation import operators
+
+forecast = ae.InferenceForecastSource(
+    checkpoint="/path/to/inference-last.ckpt",
+    input={"dataset": {"use_original_paths": True}},
+    device="cuda",
+)
+points = ae.PointSet(latitudes, longitudes, attributes={"elevation": elevations})   # one per station, m
+stations = ae.ArrayPointTargets.fixed(points, ["2t", "2d"], fields)   # valid time -> (2, P) float32, K
+orography = operators.ArrayConstants({"orography": (model_orography, "m")})   # (N,) on the model grid
+init_times = ae.init_times("2020-01-01T00", "2020-01-31T18", "6h")
+common = dict(metrics=["bias", "rmse", "mae"], variables=["2t", "2d"], bins="none")
+lapse = operators.Chain([operators.Nearest(max_distance_km=5.0), operators.LapseRate("2t", rate=0.0065)])
+
+runs = {
+    "nearest": ae.Evaluation(
+        forecast, stations, init_times, "120h",
+        observation_operator=operators.Nearest(max_distance_km=5.0), **common,
+    ),
+    "lapse_rate": ae.Evaluation(
+        forecast, stations, init_times, "120h", observation_operator=lapse, constants=orography, **common
+    ),
+}
+analysis = ae.DatasetTargets.from_forecast(forecast)
+runs["persistence"] = ae.Evaluation(
+    ae.PersistenceForecastSource(analysis, "6h"), stations, init_times, "120h",
+    observation_operator=lapse, constants=orography, **common,
+)
+for name, evaluation in runs.items():
+    evaluation.run().to_xarray(evaluation.metrics).to_netcdf(f"results-{name}.nc")
+for source in (forecast, analysis):
+    source.close()
+```
+
+What each piece does:
+
+- **The point targets.** A point target source returns, per valid time, an `Observations` of a
+  `PointSet` and `(1, V, P)` float32 values, NaN where a station did not report, in the model's units
+  under the model's names: the scores are then in the model's units and compare with a gridded run of
+  the same model.
+  `ArrayPointTargets.fixed` has the same points at every valid time; a source whose points change
+  from one valid time to the next is scored the same way. The point attributes an operator reads
+  (`elevation` for `LapseRate`) must be among the source's `point_attributes`.
+- **`Nearest(max_distance_km=...)`** takes each station's value from its nearest model node. The
+  distance is required: a station farther than that from every node, outside a limited-area domain,
+  gets a NaN forecast and is not scored. Pass `None` to map every point, which suits a global model
+  only.
+- **`LapseRate`** corrects `2t` by `rate * (elevation - orography)`, the station elevation (a point
+  attribute) minus the model orography at the nearest node, in metres. The orography is a **model
+  constant**, served by the provider given as `constants=`, here an `ArrayConstants` of an `(N,)`
+  array on the model grid, in the model's node order: for instance the geopotential `z` of the
+  model's dataset divided by g (`z / 9.80665`). Only the declared units are checked, so a
+  geopotential declared as `m` would pass. An operator that needs constants is refused without a
+  provider. A station with no elevation gets a NaN forecast for the corrected `2t` only; its other
+  variables are scored. When `2t` is not among the scored variables, `LapseRate` is passed through
+  and needs neither the orography nor the elevations.
+- **Persistence through the same operator.** A persistence baseline of the analysis is scored through
+  the same operator and the same constants. The scored variables are the operator's outputs that the
+  targets have.
+
+One operator instance can be given to several evaluations: each takes a deep copy and binds it to
+its own forecast in `run()` (or `pairs()`, or `attrs()`); the dry run binds a throwaway copy on the
+CPU, so it works on a login node for a run meant for a GPU. The forecast is asked for what the
+operator reads, not for the scored variables; `evaluation.forecast_variables` says which.
+`pairs()` yields the frames already mapped, `(M, V, P)` with the point set in `frame.points`,
+next to the observations `(1, V, P)`.
+
+Weights default to one per observation, so `weight_sum` is the number of finite (forecast,
+observation) pairs that were scored. `{"uniform": {}}` is the same, and a `file` of one weight per
+station works on a fixed station set. Regions take `all`, a `bbox` on the station coordinates, a
+`graph_attribute` read at each station's nearest model node, or a `file` of one value per station.
+
+### Reading the out-of-domain counter
+
+```python
+import json
+
+import xarray as xr
+
+ds = xr.open_dataset("results-lapse_rate.nc", decode_timedelta=True)
+ds["out_of_domain"].sel(bin="all")       # stations without a node within max_distance_km, per lead time
+ds["weight_sum"].sel(bin="all", region="global", variable="2t")   # pairs scored
+json.loads(ds.attrs["observation_diagnostics"])["nearest_node_max_km"]   # the farthest a scored station is from its node
+```
+
+`out_of_domain` counts point-frames: a station outside the domain counts once per frame it was
+missed in, so for a fixed set it is the number of such stations times `n_init`. It counts what the
+spatial step (`Nearest`) cannot map only: a later step, such as `LapseRate` on an unknown elevation,
+gives a NaN forecast without being counted. It is a sum like the
+others, so it merges. Two models on different limited-area domains score different stations unless a
+region restricts both to the same ones. The dry run reports the fixed set's out-of-domain count and the
+operator's diagnostics (`nearest_node_max_km`) under `points`, and the operator under
+`observation_operator`. Stations are scored at the valid time: point sets with time offsets
+(non-zero `PointSet.timedeltas`, float noise included) are refused for now. Leave `timedeltas` out, or
+zero, to score the points at the valid time.
+
+### What is refused, and why
+
+At construction, before any model call:
+
+| refused | why |
+|---|---|
+| point targets without an operator | there is no way to compare a field with points |
+| an operator other than `Identity` on gridded targets | derived gridded variables are not supported yet |
+| an operator bound to a model before | its state belongs to that model; give a fresh one |
+| a chain starting in points space, or with two `grid -> points` steps | the forecast is gridded, and there is no way back from points |
+| a step with a time stencil wider than the valid time | not supported yet |
+| a fixed point set with time offsets (non-zero `timedeltas`) | they need a time stencil, which the driver does not run yet; leave `timedeltas` out, or zero, to score at the valid time |
+| a point attribute the operator needs and the targets lack | `LapseRate` on targets without an `elevation`, for instance |
+| an operator needing model constants without `constants=` | there is nothing to read the orography from |
+| `graph_attribute` or `spherical_voronoi` weights, `grid` regions | they are per model node, not per observation |
+| weight or region files and arrays on a varying point set | a varying set has no fixed shape to give one value per point |
+| anomaly metrics and a climatology | ACC at points is not supported yet |
+| `to_config()` | YAML for observations is not supported yet, so the result has no `config` attr; the operator and the targets are recorded in their own attrs |
+| `split_members()`, a member group | a rank's block of the scored variables is not a block of the operator's inputs; not supported yet |
+
+At bind, at the start of `run()` and in `plan()`: a constant in the wrong units (`LapseRate` needs
+the orography in `m`, and geopotential is not a height) or of the wrong shape, and a merge identity
+holding a value it cannot record exactly (an object, a set, a non-string key; paths and dates are
+fine). Also refused at
+construction: `constants=` for an operator that needs none.
+
+During the run, a valid time with no observation (the source raises `MissingTargetError`, or returns
+an empty point set) is a missing target, skipped (or raised with `on_missing_target="raise"`) and not
+counted in `n_init`. A varying point set with time offsets is refused when it is read.
+
+`merge` refuses results whose operator or point targets differ, and a mixture of point and gridded
+results; the diagnostics are for information and come from the first input. The point targets are
+compared on the source's `merge_identity()`, in a canonical JSON form, so key order does not count:
+the base class, and so `ArrayPointTargets`, gives the
+class, the sizes and the attribute names only, so a source of your own should return what identifies
+its data.
+
+Not yet supported: YAML for observations, tabular (point) datasets, models that predict at
+observation points directly, ACC at points, member groups, per-station scores, and time interpolation.
+The check of the variable metadata against the targets is skipped on point targets. Of the spatial
+mappings only the nearest node is shipped; an operator of your own can interpolate in space.
+
 ## Sharding and merging
 
 A run splits over init times: shard `i` of `n` evaluates `init_times[i::n]` and writes its own
@@ -1056,6 +1221,13 @@ call, an early date check, the dry-run description, the result attrs, serialisat
 with their defaults under [source protocols](reference.md#source-protocols). Sources built in
 Python go to `Evaluation(...)`, or to `Evaluation.from_config(config, forecast=..., targets=...)`
 to keep the rest of a YAML config.
+
+Observations come in the same way: a point target source subclasses `PointTargetSourceBase` and
+implements `observations()`, which returns an `Observations(points, values)`, and an observation
+operator subclasses
+`operators.ObservationOperatorBase`. Both contracts are in the reference: the point target source
+under [source protocols](reference.md#source-protocols-and-base-classes), the operator and a worked
+example under [observation operators](reference.md#observation-operators).
 
 ## Performance
 

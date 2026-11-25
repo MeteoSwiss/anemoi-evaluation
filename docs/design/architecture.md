@@ -27,11 +27,12 @@ result file, and it drives the anemoi packages rather than extending them (NFR-1
 | `anemoi-inference` | the runner that produces the forecasts, the checkpoint metadata, the input states and the forcings providers |
 | `anemoi-datasets` | `open_dataset` for the target rows and for the dataset the runner itself reads |
 | `anemoi-graphs` | spherical Voronoi cell areas, for grids whose source has no training graph |
-| `anemoi-transform` | the cropping mask of a latitude/longitude box, with the longitude wrap |
+| `anemoi-transform` | the cropping mask of a latitude/longitude box, with the longitude wrap, and the unit-sphere coordinates of the nearest-node search |
 | `anemoi-utils` | date and duration parsing, human-readable sizes, checkpoint metadata |
 
 Outside anemoi it needs `torch` for the compute device and the reductions, `pydantic` and
-`pyyaml` for the configuration, and `xarray`, `netcdf4` and `numpy` for the result file.
+`pyyaml` for the configuration, `xarray`, `netcdf4` and `numpy` for the result file, and `scipy` for
+the KD-tree of the nearest-node search on point targets.
 
 ```mermaid
 flowchart LR
@@ -55,13 +56,15 @@ The file-by-file listing is in the repository layout section of
 here is that the dependency direction is one way, which is what keeps the package testable without
 a checkpoint (NFR-21).
 
-`frame` is depended on by everything and imports nothing from the package; `sources/` depends on
-`frame` alone; `aggregation` depends on `frame`, `statistics` and `binning`; `output` depends on
-`aggregation` and `metrics`; `evaluate` depends on all of them and on `config`; `__main__` depends
-only on `evaluate`, `config`, `output` and `metrics`, the last for rebuilding the metric objects
-when merging. Nothing under `sources/` imports the driver. `distributed` depends on `aggregation`
-and `output`; the inference source, the driver and `__main__` import it only when a run splits its
-members.
+`points` and `variables` import nothing from the package; `frame` is depended on by everything and
+imports `points` alone; `sources/` depends on `frame`, `points` and `variables`; `operators/` depends
+on `frame`, `points` and `variables`, not on `sources/`; `aggregation` depends on `frame`,
+`statistics` and `binning`; `output` depends on `aggregation` and `metrics`; `point_scoring` depends
+on `operators/`, `aggregation`, `config`, `weights`, `regions` and `sources/base`; `evaluate` depends
+on all of them; `__main__` depends only on `evaluate`, `config`, `output` and `metrics`, the last for
+rebuilding the metric objects when merging. Nothing under `sources/` or `operators/` imports the
+driver. `distributed` depends on `aggregation` and `output`; the inference source, the driver and
+`__main__` import it only when a run splits its members.
 
 ## 3. Components
 
@@ -76,7 +79,8 @@ climatology source on a different grid (FR-8).
 
 `Frame` carries `init_time`, `lead_time`, `valid_time`, `variables` and `data`, a `(M, V, N)`
 float32 tensor, and validates all of it on construction: rank, dtype, the variable count against
-the columns, and `valid_time == init_time + lead_time`.
+the columns, and `valid_time == init_time + lead_time`. A frame mapped to observation points has
+`(M, V, P)` data and its `PointSet` in `points`, None on the grid (3.14).
 
 The `(M, V, N)` layout is chosen so that the reduction over nodes is one matrix-vector product
 `(N,) @ (N, R)` per variable that produces every region at once, and because both real sources deliver
@@ -89,7 +93,10 @@ The bring-your-own-data boundary (FR-34). Three `Protocol` classes state the ful
 `ForecastSource`, `TargetSource` and `ClimatologySource`, and three base classes,
 `ForecastSourceBase`, `TargetSourceBase` and `ClimatologySourceBase`, implement the optional
 capabilities with defaults, so a new source subclasses a base and overrides what it can provide.
-The members of each protocol are listed in [`../reference.md`](../reference.md).
+A fourth pair, `PointTargetSource` and `PointTargetSourceBase`, is the target contract for
+observations at points (3.14); `is_point_target` tells it from a gridded one by its
+`observations()` method. The members of each protocol are listed in
+[`../reference.md`](../reference.md).
 
 The contract the driver relies on: `frames()` yields strictly increasing lead times and each
 frame's `data` belongs to the caller (NFR-8); an undeliverable variable name raises;
@@ -271,7 +278,11 @@ unions the init times, refusing states whose coordinates, statistics or member c
 states that share an init time, since a shard merged twice would double its weight (FR-32).
 
 `Aggregator` is built once per run from the node weights `w` and the region masks, folded into one
-float64 matrix `W = w[:, None] * masks` on the device. For each frame it computes the shared
+float64 matrix `W = w[:, None] * masks` on the device (`weight_matrix`). On point targets
+`Aggregator.for_points` has no `W` of its own: every `add` passes the `W` of its frame's point set
+and the number of its points out of the operator's domain, which the state counts in
+`out_of_domain`, an int64 `(lead time, bin)` counter that merges by addition like the sums. For
+each frame it computes the shared
 validity mask `isfinite(pred).all(0) & isfinite(target[0])`, adds `valid[v].double() @ W` to the
 weights of each variable `v`, and for every statistic adds `values[v] @ W` to its sums, with
 `values = where(valid, statistic.compute(...), 0)` (FR-18, FR-19): one matrix-vector product per
@@ -309,7 +320,13 @@ compatibility, passes `frames_per_pass` to the target source's `prefetch_hint()`
 metrics' member requirements, resolves the device (the explicit argument, then the forecast
 source's preference, then cuda if available, then cpu) and finally checks the init times against
 the runner's datasets. `weights`, `regions` and `aggregator` are cached properties, so a weight
-spec that needs the checkpoint graph loads the model only when `run()` does.
+spec that needs the checkpoint graph loads the model only when `run()` does. On point targets
+construction also checks the observation operator against the targets and the forecast (3.14),
+and hands the point side to a `point_scoring.PointScoring` it delegates to: the chain and its bind,
+the plan and `W` cache, the weights and regions per point set (`point_weights`, `point_regions`),
+the dry run's point facts and the point attrs; `weights` and `regions` then hold the fixed set's, and
+raise on a varying one. The gridded path never reaches that module; the region parsing both share is
+`config.region_entries`.
 
 `run()` loops over init times, accumulating into one state inside a single
 `torch.inference_mode()`, through `begin()`, `frames()`, `add_frame()`, `charge()` and `finish()`,
@@ -431,6 +448,66 @@ launcher must stop the other tasks (`srun --kill-on-bad-exit=1`, or torchrun, wh
 itself). Only the world group is aborted: destroying a
 gloo subgroup does not unblock its peers.
 
+### 3.14 Observations: `points.py`, `operators/`, `point_scoring.py`
+
+A `PointSet` holds the `P` points of one valid time: `latitudes` and `longitudes` (float64 degrees),
+`timedeltas` (float32 seconds relative to the valid time, zero by default) and named per-point
+`attributes`, all copied and read-only, plus an identity: an explicit `key`, or a digest of the
+content. The names mirror anemoi-core's tabular payload keys. A point target returns, per valid
+time, an `Observations` of one `PointSet` and `(1, V, P)` float32 values in one read, `P` changing
+from one valid time to the next unless the source declares `fixed_points`; `Observations` is a
+dataclass, so per-observation fields can be added later with defaults. The driver refuses non-zero
+`timedeltas` for now: a time offset needs a time stencil, which the driver does not run yet.
+
+An observation operator has three phases, one per cache lifetime: `bind(model)` once per run, from
+the model side (`ModelSide`: grid, variables, constants, device), for what does not depend on the
+points (a KD-tree, the orography); `prepare(points, constants)` once per point set, returning a plan
+the driver caches by the point set's identity; and `apply(frames, plan, valid_time)` per valid time,
+from `(M, V, N)` frames to `(M, V', P)`, float64 inside and float32 out, never mixing members. Every
+operator declares its spaces (`grid -> grid`, `grid -> points` or `points -> points`), the variables
+it `reads`, `produces` and `touches` (everything else passes through, a spatial step maps it), its
+time `stencil` (provisional, with `time_window`), the point attributes and the model constants
+(`ConstantNeed`, with units) it needs, and its constructor parameters, `parameters()`, by default the
+public scalar attributes. `Chain` and the driver call `prepare`, `apply` and `map_constant` by keyword,
+so new inputs can come as keyword arguments with defaults.
+
+`Chain` composes steps, is itself an operator, and is the runtime wrapper around every step: it
+checks the declarations at construction, resolves the forecast variables backwards from the scored
+ones (a step whose products are not needed is skipped: its reads are not asked for, and its
+constants and point attributes are not needed), fetches the constants of the steps that run from
+the provider at `bind` and checks their units and shape, has the spatial step map them to the
+points so that a `points -> points` step sees orography at its points, never the raw `(N,)` field,
+and checks every step's output (variables, members, valid time, size). The driver always wraps the
+given operator in a `Chain` of a deep copy and refuses a chain or step bound before, since bound
+state lives on the instances. The lifecycle is explicit: `PointScoring.bind()` binds the run's chain
+once, called by `begin()`, `pairs()` and `attrs()` (so the operator attr is the same before and after
+a run); `plan()` binds a throwaway deep copy on the CPU, which checks the constants as the run would,
+leaves the evaluation unbound and needs no GPU. The contract expresses more than the driver runs (a
+bracketing stencil, points-space model sides, operator `to_config()`), so the design can grow into
+time interpolation and point-native forecasts; the driver refuses what it does not run yet.
+
+`Nearest(max_distance_km=...)` takes the value of the nearest node, from a KD-tree on the unit sphere
+(`NearestNodes`, the distance bound converted from km to a chord); a point with no node within the
+bound gets a NaN forecast and is reported by `out_of_domain()`, which the driver counts per frame. The
+chain counts its spatial step's points only; a later step gives NaN where it cannot compute, uncounted.
+`LapseRate` subtracts `rate * (elevation - orography)` from one variable. `Identity` is the gridded
+path itself, which keeps its own code: no operator, or identities only, changes nothing.
+
+Constants come from a provider (`ConstantsProvider`), given to the evaluation as `constants`;
+`ArrayConstants` holds arrays in memory. An operator whose steps that run need constants is refused
+without a provider.
+
+Provenance is kept outside `config`, which a Python-only operator does not have: the chain's
+`merge_identity()` is the `observation_operator` attr: each step's declarations and `parameters()`,
+with the provider's `merge_identity()` (a digest
+of the values), and the targets' `merge_identity()` is the `point_targets` attr (what makes the
+observations what they are). Both are canonical JSON (`identity_json`: sorted keys, exact numbers,
+arrays by value or by sha256), checked when the operator is bound, and `merge` refuses inputs that
+differ in either, compared in that form. For information only, and
+kept from the first input by `merge`: the full `describe()` of the targets, `point_targets_description`,
+and the chain's `diagnostics()` of a fixed set, `observation_diagnostics` (a JSON object, so a new
+spatial operator adds its own facts without a new attr).
+
 ## 4. Data flow of a run
 
 ```mermaid
@@ -468,6 +545,11 @@ Nothing but the sums, the weights and the counts survives a frame. Fields stay o
 the model output to the sums; the only host-to-device traffic per frame is one target row, and the
 only device-to-host traffic in a run is the state at the end (NFR-15, NFR-18).
 
+On point targets the target read returns the valid time's point set and values instead of a field,
+and between the read and the aggregator the driver looks the point set up in its cache (prepare and
+build `W` on a miss) and applies the operator to the frame; the operator's time is charged to
+`statistics`.
+
 ## 5. Key design decisions
 
 **On-the-fly inference, no forecast fields on disk.** The forecast source is a real
@@ -479,6 +561,15 @@ costs terabytes and an intermediate format that the comparison would then depend
 `open_dataset` arguments of the runner's own prognostics input, not from the ones the checkpoint
 records, so the evaluation period is whatever the run configuration opened (FR-9). Same grid, same
 units, no regridding (FR-8).
+
+**Observations through an operator owned by the driver.** Point targets are scored by mapping each
+gridded frame to the points with an observation operator, in `add_frame` and in both `pairs()`, so
+the shared multi-dataset rollout and lead 0 are covered too, and the forecast is asked for the
+operator's inputs rather than the scored variables. A wrapper forecast source would have missed the
+rollout and the default weights. The plan of a point set and its `W` are cached by
+`PointSet.identity`, so a fixed station network is prepared once per run and today's gridded path
+keeps its single `W`. A member group refuses point targets: the forecast source splits the variables
+it is asked for, which on points are the operator's inputs, not a block of the scored variables.
 
 **Float64 per-element sums and a per-variable node reduction.** Statistics return float64 and the
 reduction over nodes is `values[v].double() @ W` for each variable `v`, which produces every region in
@@ -549,10 +640,17 @@ unit test with an interleaving fake source checks this.
 | a metric with an extra output axis | return `(name, values)` from `output_dim` and an array with that axis last from `from_means`; `to_xarray` writes the dimension and the coordinate |
 | a new binning | implement the `Binning` protocol |
 | a new weight or region spec | add the builder in `weights.py` or `regions.py` and a single-key spec model in `config.py` |
+| a new point target source | subclass `PointTargetSourceBase` and implement `observations()`; set `fixed_points` for a set that never changes, `point_attributes` for what the operators may read; read-ahead, availability and `merge_identity()` are optional |
+| a new observation operator | subclass `ObservationOperatorBase`, declare its spaces, `reads`, `produces` or `touches`, `point_attributes` and `constants`, implement `apply()` and, when it has a plan, `prepare()`; a spatial step also implements `map_constant()` and `out_of_domain()`; chain it with the shipped ones in a `Chain` |
+| a new constants provider | implement `constant(name)` and `describe()` (`ConstantsProvider`), serving without loading the model; `names`, `check_grid()` and `merge_identity()` are optional |
 
 A source used only from Python needs neither `to_config()` nor more than the default `describe()`;
-those exist so that it can appear in a YAML config and in a dry run. Signatures are in
-[`../reference.md`](../reference.md).
+those exist so that it can appear in a YAML config and in a dry run. An operator's `merge_identity()`,
+its declarations and `parameters()` by default, is the result's `observation_operator` attr, which
+`merge` compares; the default `parameters()` are the public scalar attributes, so a parameter kept
+that way needs nothing more. `Chain` runs the
+generic checks (spaces, variables, members, output shapes) around every step, so a user operator
+implements its own logic only. Signatures are in [`../reference.md`](../reference.md).
 
 ## 7. Results file layout
 
@@ -560,7 +658,8 @@ The structure only; the variable-by-variable listing is in [`../reference.md`](.
 The file holds three things: the metrics on `(lead_time, bin, variable, region)` with the frame
 counts and the summed weights; the raw state, one variable per statistic plus the state weights and
 counts, on `state_bin` rather than `bin`; and the run's provenance, timings and counters as
-attributes.
+attributes. A run on point targets adds the out-of-domain counter in both halves and the operator
+and point-target identities as attributes, which `merge` requires to be equal.
 
 The two bin axes are the one deliberate redundancy. `bin` carries the stored bins plus a derived
 `all` that is the sum over them taken *before* the division, which is what a reader wants;
@@ -597,8 +696,11 @@ listed here because they are what to re-check when a pin moves.
   see it. The mappers use the larger of that count and the checkpoint's own `num_chunks`, and the
   processor's edge embedding is built before the chunk loop, which is why chunking it saves
   nothing.
-* **The training graph survives in the inference checkpoint**, so per-node attributes such as
-  `area_weight` and `cutout_mask` are readable off the loaded model.
+* **The training graph may or may not survive in the inference checkpoint.** When it does,
+  per-node attributes such as `area_weight` and `cutout_mask` are readable off the loaded model.
+  anemoi-core's trimmed inference checkpoints store none, which is found out only when the model
+  loads: the default weights then fall back to `spherical_voronoi` with a warning, and an explicit
+  graph-attribute weight or region raises `MissingGraphError`.
 * **Dataset inputs refuse multi-member zarrs**, and the model's noise is drawn from the global RNG
   with no explicit generator, which is what makes `torch.manual_seed` before a forward pass
   sufficient for FR-3.
@@ -617,12 +719,12 @@ provider lists, and building a temporal downscaler's window input state
 
 ## 9. Deferred designs
 
-Three designs were worked out against the current code and not built. The sketches are kept
+Four designs were worked out against the current code and not built. The sketches are kept
 because the analysis, not the conclusion, is the expensive part; the decisions themselves are in
-[`requirements.md`](requirements.md) section 5, except model-parallel evaluation, which is not supported yet
-(section 1.2 there). A fourth, member-parallel evaluation, is no longer
-deferred: it is built as the member groups of section 3.13, with every rank running its own model
-rather than one model sharded over the ranks.
+[`requirements.md`](requirements.md) section 5 and, for the point-native sources, in FR-8, except
+model-parallel evaluation, which is not supported yet (section 1.2 there). A fifth, member-parallel
+evaluation, is no longer deferred: it is built as the member groups of section 3.13, with every rank
+running its own model rather than one model sharded over the ranks.
 
 **Sequential members with a host buffer**, if lockstep memory (NFR-13) ever becomes binding. Run
 one `run()` generator at a time, so the device peak is the M = 1 peak whatever M, copy each step's
@@ -637,6 +739,14 @@ only be exact where every element is non-zero on one rank, whereas a gather keep
 semantics of FR-32. Combined with member groups it would be `world = shards x R` in one step, a
 member group per shard on subgroups; a job array of member groups does the same without the
 subgroups, whose gloo teardown does not unblock peers.
+
+**Point-native forecast sources**, for a model that decodes onto observation points itself
+(ecmwf/anemoi-core#1435). The source would declare its output space as points on request: the driver
+reads the target's point set (coordinates, time offsets, the forcing columns the decoder needs)
+before the model step and passes it in, the frame comes back on those points, and only
+`points -> points` operators run. The forecast then depends on the targets: target reads move before
+the model step in the driver and in the shared rollout, and the observation set becomes part of the
+forecast's provenance. The operator contract already has the points space for it.
 
 **Model-parallel evaluation** through anemoi-inference's parallel runner: every rank runs the same
 init times and members in the same order, each model call being a collective, with rank 0

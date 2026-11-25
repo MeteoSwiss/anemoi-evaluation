@@ -30,15 +30,16 @@ kept light: numbered requirements, MUST / SHOULD / MAY, a rationale where one is
 
 In scope at v0.4.0: deterministic and ensemble forecasts from an anemoi checkpoint trained on one
 or multiple datasets (offset forecasters included), gridded targets from an anemoi dataset on the
-same grid, deterministic and ensemble metrics, weighting, regions, time bins, persistence and
+same grid, observations at points as targets through an observation operator (from the Python
+API), deterministic and ensemble metrics, weighting, regions, time bins, persistence and
 linear-interpolation baselines, a climatology for anomaly scores, a YAML configuration and CLI, and
 sharding with exact merging. Section 5 lists what is deliberately outside. The goal is to score
 every anemoi task: forecasters, and for now temporal downscalers between analysis bounds, are
 supported; the others (temporal downscalers with forecast bounds, spatial downscalers,
 autoencoders) are planned, see MeteoSwiss/anemoi-evaluation#5. Not supported yet either:
 checkpoints larger than one device (model-parallel evaluation, blocked by anemoi-inference's parallel
-runner, [`architecture.md`](architecture.md) section 9), and observations as targets, irregular point
-sets through the anemoi-datasets tabular layout. The package itself is
+runner, [`architecture.md`](architecture.md) section 9), and observations from a YAML configuration
+or from the anemoi-datasets tabular layout of irregular point sets (FR-8). The package itself is
 device-agnostic, but the anemoi checkpoints it is validated against do not run on CPU, so an
 end-to-end exercise needs a GPU.
 
@@ -51,7 +52,9 @@ before they trust a score. Users who only want to run it should read the user gu
 
 | term | meaning |
 |---|---|
-| frame | one forecast step: `(M members, V variables, N nodes)` float32, with its init, lead and valid times |
+| frame | one forecast step: `(M members, V variables, N nodes)` float32, with its init, lead and valid times; `(M, V, P points)` once mapped to observation points |
+| point set | the `P` observation points of one valid time: coordinates, time offsets and per-point attributes such as an elevation; fixed (a station network) or varying from one valid time to the next |
+| observation operator | what maps a gridded forecast frame to what was observed at the points of a point set, for example the value of the nearest node, plus a height correction |
 | statistic | a per-node, per-variable quantity computed from a frame and its target |
 | metric | a function of the *means* of statistics, for example RMSE from mean squared error |
 | state | the `AggregationState`: the float64 sums, weights and counts of a run |
@@ -136,15 +139,25 @@ grids and two variable namespaces in one result.*
 
 ### 3.2 Targets
 
-**FR-8** Targets MUST be read from an anemoi dataset at the frame's valid time, on the grid of the
-dataset being scored, in the model's units, with no regridding and no unit conversion; a source on
-a different grid (beyond 1e-5 degrees per node) MUST be refused at construction.
-*Rationale: the comparison is then the one the model was trained against, with no interpolation
-error the package cannot account for.*
+**FR-8** Targets are gridded or at points. Gridded targets MUST be read from an anemoi dataset at
+the frame's valid time, on the grid of the dataset being scored, in the model's units, with no
+regridding and no unit conversion; a source on a different grid (beyond 1e-5 degrees per node) MUST
+be refused at construction. Point targets MUST be read once per valid time as a point set and its
+values, and MUST be scored through an observation operator that maps the forecast to those points;
+point targets without an operator, and an operator other than the identity on gridded targets, MUST
+be refused at construction.
+*Rationale: on the grid the comparison is then the one the model was trained against, with no
+interpolation error the package cannot account for; on points the operator is that error, named and
+recorded (NFR-5).*
+**Status: met from the Python API, for point target sources of your own** (`PointTargetSourceBase`).
+Not yet: YAML for observations, tabular datasets, point-native forecast sources, ACC at points, point
+time offsets and member groups (both refused) and operators with a time stencil wider than the valid
+time.
 
 **FR-9** The default target dataset of a scored dataset MUST be that dataset's own prognostics
 input, and MUST cover the evaluation period rather than the period the model was trained on,
-without the user having to spell the dataset out.
+without the user having to spell the dataset out. Point targets have no default: they MUST always
+be given explicitly.
 *Rationale: the arguments recorded in a checkpoint carry the training period's `start` and `end`,
 which would silently exclude the dates being evaluated.*
 
@@ -211,19 +224,26 @@ decomposition MUST agree with the stored Brier score to float64 rounding of the 
 resolved by lead time, time bin, variable and region, and MUST retain alongside it the weights
 and the frame counts needed to interpret a mean and to spot an under-filled cell.
 
-**FR-19** A node MUST be excluded from *every* statistic of a frame when any member or the target
-is non-finite there, and the same exclusion MUST drive the weight sum, so a mean is always over
-the same set of nodes.
+**FR-19** A node (a point, on point targets) MUST be excluded from *every* statistic of a frame
+when any member or the target is non-finite there, and the same exclusion MUST drive the weight
+sum, so a mean is always over the same set of nodes. A point the observation operator cannot map
+(outside a limited-area domain) MUST get a non-finite forecast, hence no weight, and MUST be counted
+in the state.
 
 **FR-20** Node weights MUST be configurable, including from the checkpoint's training graph, and
 MUST default to the training area weights when the forecast source has a graph, so that a score
-uses exactly the weights training used. The spec vocabulary is in
-[`../reference.md`](../reference.md).
+uses exactly the weights training used. On point targets the weights MUST default to one per
+observation, so that the weight sum of a statistic is its count of finite pairs; per-model-node
+specs MUST be refused there, and weights from a file MUST need a fixed point set. The spec
+vocabulary is in [`../reference.md`](../reference.md).
 
 **FR-21** Regions MUST be configurable as arbitrary per-node masks, including geographic boxes,
 graph attributes and the sub-grids of a cutout dataset, and MAY overlap. At least one region MUST
 be configured, the default being one global region. Regions are per scored dataset: a mask is
-built over that dataset's grid, and a graph attribute is read from that dataset's node set.
+built over that dataset's grid, and a graph attribute is read from that dataset's node set. On point
+targets a region is a mask over each point set: a geographic box on the point coordinates, a graph
+attribute read at each point's nearest model node (never interpolated), or a file on a fixed point
+set; a sub-grid region MUST be refused there.
 
 **FR-22** Time binning MUST offer at least seasonal, monthly, hour-of-day, per-date and no
 binning, keyed on either the init time or the valid time of a frame. Lead time MUST always be an
@@ -257,7 +277,9 @@ so a single override discards them; evaluating outside the training period needs
 
 **FR-28** A dry run MUST describe what a run would do without loading a model: the sources, the
 init and lead times, the model calls, the metrics and statistics, the weight and region specs,
-the bins, how many frames have targets, and the bytes the run moves.
+the bins, how many frames have targets, and the bytes the run moves. On point targets it MUST also
+describe the observation operator and the forecast variables it reads, and, for a fixed point set,
+how many points fall outside the operator's domain.
 
 **FR-29** Given a measured step time, the dry run SHOULD estimate model and wall seconds for a
 shard, and GPU hours and per-shard wall time for the run. The hint describes the machine, not the
@@ -296,9 +318,9 @@ members) does not fit one GPU, and sharding over init times does not split an in
 
 ### 3.7 Extensibility
 
-**FR-34** A forecast, target or climatology source that is not shipped with the package MUST be
-usable without modifying the driver, and MUST be able to opt out of the capabilities it cannot
-provide rather than implement them.
+**FR-34** A forecast, target (gridded or point) or climatology source, or an observation operator,
+that is not shipped with the package MUST be usable without modifying the driver, and MUST be able
+to opt out of the capabilities it cannot provide rather than implement them.
 
 **FR-35** A new statistic or metric MUST be addable without modifying the aggregator or the
 output, and MUST be able to declare the per-frame inputs it needs and the smallest ensemble it
@@ -327,9 +349,13 @@ three nodes (benchmarks 6).*
 
 **NFR-5** The package MUST record everything that is part of a run's numerical identity:
 checkpoint path, uuid and training run id, package versions, resolved configuration, ensemble
-size, inference chunk counts and GPU model. The mapper chunk count changes a reduction order and
-device noise depends on the GPU's SM count, so two runs differing in either are not comparable bit
-for bit.
+size, inference chunk counts and GPU model, and on point targets the observation operator (its
+steps, their parameters and a digest of the model constants it uses) and what makes the
+observations what they are (the point target source's identity). The mapper chunk count changes
+a reduction order and device noise depends on the GPU's SM count, so two runs differing in either
+are not comparable bit for bit. The operator and the observations are recorded outside the
+configuration, since a Python-only operator has none, and merging MUST refuse inputs that differ
+in them.
 
 **NFR-6** Bit-level reproducibility of ensemble members MUST be understood as per GPU model;
 shards that must merge bit-exactly MUST run on one GPU model.
@@ -443,7 +469,9 @@ commit.
 Deliberate non-goals at v0.4.0. Each is a decision, not an oversight.
 
 * **Spectra, and any statistic that is not a per-node reduction.**
-* **Regridding and unit conversion** (FR-8).
+* **Regridded or converted forecast fields.** A target on another grid is scored at its points
+  through an observation operator (FR-8); the package never produces a forecast field on another
+  grid or in other units.
 * **Plots and reports.** A result file is the product; presentation is downstream tooling.
 * **Distributed torch beyond member groups.** Member-parallel evaluation (FR-41) is built: the
   members of an init time are spread over a group of ranks. Data-parallel evaluation over init
