@@ -2,6 +2,8 @@
 
     python tools/validate.py <config.yaml> --init 2024-01-02T00 [--steps 2 | --lead 9h]
                              [--members 1 4] [--lead-zero] [--rtol 1e-5] [-o out.nc]
+    python tools/validate.py <config.yaml> --init 2024-03-01T00,2024-08-15T12 --lead 48h --stations <zarr>
+                             --obs-variable tre200s0=2t:offset=273.15 [--station-file stations.csv] [--lapse-rate]
 
 Needs a GPU: it loads the checkpoint of the config's `forecast.anemoi_inference` block and runs it.
 Single-dataset checkpoints only: it reads `forecast.dataset_name` and a plain `regions` block.
@@ -29,6 +31,22 @@ Prints `VALIDATE:` lines: the checkpoint facts, the framework run's timing, mode
 loop's per-`next()` times and peak memory per member count, every mismatch above --rtol, the maximum relative difference
 per metric, and a final PASS or FAIL (also the exit status, 0 or 1). The framework run is written to --output
 (default: `validate-<config stem>.nc` next to the config's `output.path`).
+
+Station mode (`--stations <zarr>`, with `--obs-variable RAW=NAME[:offset=X][:scale=Y]` repeated, optionally
+`--station-file <csv>` with an elevation column, `--lapse-rate [K/m]` and `--max-distance-km`): point targets are
+Python-only in the package, so the config gives only the checkpoint (its `forecast` block, whose input dataset must
+cover the init times) and the lead; `--init` takes comma-separated init times. The model is scored against the
+gridded station dataset through `Nearest` (+ `LapseRate` on 2t), in one rollout per init time whose frames feed two
+evaluations (uniform weights, and seeded non-dyadic weights in [0.5, 1.5) per station, so the summation order shows)
+and a numpy reference with its own KD-tree, its own `z / g` read and its own observation read. PASS or FAIL: the
+chain's mapped frames equal the numpy ones bit for bit; the sums equal `math.fsum` references within --rtol (default
+1e-13 in this mode; the signed error sum relative to the sum of its absolute terms), the uniform weight sums exactly
+(they are the finite-pair counts, as `weight_sum` must be); `out_of_domain` counts the stations beyond
+--max-distance-km per frame; lead 0 of the model chain equals lead 0 of analysis persistence through the same chain.
+Plausibility as `WARN` lines that do not fail the run: lead-0 RMSE above --lead0-rmse-max (3 K), station-mean 2t not
+correlated with elevation (r > -0.5: the data columns may not belong to the coordinates), more than 0.1 % of pairs
+with |error| > 15 K, gross observations (2t outside [233.15, 315.15] K, 2d outside [223.15, 308.15] K, 2d > 2t +
+0.5 K). The weighted framework state is written to --output (default `validate-<config stem>-points.nc`).
 
 `ANEMOI_INFERENCE_NUM_CHUNKS` is set to 8 unless the environment already sets it (needed at 1 km resolution to avoid
 running out of GPU memory in the mapper).
@@ -70,6 +88,20 @@ parser.add_argument("--lead-zero", action="store_true")
 parser.add_argument(
     "-o", "--output", default=None, help="Framework results file (default: beside the config's output.path)."
 )
+points_group = parser.add_argument_group("station mode (point targets, Python-only in the package)")
+points_group.add_argument("--stations", metavar="ZARR", help="Gridded station dataset; switches to station mode.")
+points_group.add_argument("--station-file", metavar="CSV", help="Station file in dataset order (latitude, longitude).")
+points_group.add_argument("--elevation-column", default="elevation", help="Station file column with the elevation (m).")
+points_group.add_argument(
+    "--obs-variable",
+    action="append",
+    default=[],
+    metavar="RAW=NAME[:offset=X][:scale=Y]",
+    help="Dataset variable, its result name and conversion, repeatable, e.g. tre200s0=2t:offset=273.15.",
+)
+points_group.add_argument("--lapse-rate", type=float, nargs="?", const=0.0065, help="Chain LapseRate (K/m) on 2t.")
+points_group.add_argument("--max-distance-km", type=float, default=5.0)
+points_group.add_argument("--lead0-rmse-max", type=float, default=3.0, help="WARN above this lead-0 RMSE.")
 args = parser.parse_args()
 
 
@@ -77,7 +109,287 @@ def log(*items):
     print("VALIDATE:", *items, flush=True)
 
 
+# Plausibility bounds of the station mode's WARN lines, in the result units (K).
+GROSS = {"2t": (233.15, 315.15), "2d": (223.15, 308.15)}
+
+
+def validate_points(config) -> bool:
+    """Station mode: the config's checkpoint against a gridded station dataset through Nearest (+ LapseRate).
+
+    One rollout per init time (comma-separated `--init`), its frames fed to two framework evaluations, uniform
+    weights and seeded non-dyadic array weights on the fixed station set (`begin`/`add_frame`/`finish`, as `run()`
+    does), and to a numpy float64 reference: own KD-tree gather, own lapse correction with `z / g` read from the
+    model's dataset, own read and conversion of the observations. Checks, PASS or FAIL: the chain's mapped frames
+    equal the numpy ones bit for bit; the sums equal `math.fsum` references (counts exact under uniform weights, the
+    other sums to --rtol, default 1e-13 here); `weight_sum` is the finite-pair count; `out_of_domain` is the number of
+    stations beyond --max-distance-km; lead 0 of the model chain equals lead 0 of analysis persistence through the
+    same chain. Plausibility, WARN only: lead-0 RMSE, station-mean 2t against elevation, |error| > 15 K, gross values.
+    """
+    import math
+
+    from anemoi.utils.dates import frequency_to_string
+    from scipy.spatial import cKDTree
+
+    from anemoi.evaluation.evaluate import PhaseTimer
+    from anemoi.evaluation.operators import Chain
+    from anemoi.evaluation.operators import DatasetConstants
+    from anemoi.evaluation.operators import LapseRate
+    from anemoi.evaluation.operators import Nearest
+
+    rtol = args.rtol if any(a.startswith("--rtol") for a in sys.argv) else 1e-13
+    conversions = {}
+    for item in args.obs_variable:
+        raw, _, rest = item.partition("=")
+        name, *options = rest.split(":")
+        conversions[raw] = {"name": name, **{k: float(v) for k, v in (o.split("=") for o in options)}}
+    if not conversions:
+        parser.error("--stations needs at least one --obs-variable")
+    if args.lapse_rate is not None and not args.station_file:
+        parser.error("--lapse-rate needs the station elevations of --station-file")
+    variables = [spec["name"] for spec in conversions.values()]
+    inits = [as_datetime(text) for text in args.init.split(",")]
+    forecast = ae.InferenceForecastSource(**config.forecast.anemoi_inference.model_dump())
+    lead = frequency_to_timedelta(args.lead) if args.lead else args.steps * forecast.timestep if args.steps else None
+    lead = lead or config.lead_time
+    frequency = frequency_to_string(forecast.timestep)
+    attributes = {"elevation": args.elevation_column} if args.station_file else None
+    targets = ae.StationDatasetTargets(
+        ae.DatasetTargets(args.stations, frequency=frequency, select=list(conversions)),
+        conversions,
+        stations=args.station_file,
+        attributes=attributes,
+    )
+    points = targets.fixed_points
+    steps = [Nearest(max_distance_km=args.max_distance_km)]
+    if args.lapse_rate is not None:
+        steps.append(LapseRate("2t", rate=args.lapse_rate))
+    chain = Chain(steps)
+    rng = np.random.default_rng(0)
+    point_weights = rng.uniform(0.5, 1.5, len(points))  # non-dyadic, so the summation order shows
+    regions = {"all": "all", "half": rng.random(len(points)) < 0.5}
+    common = dict(metrics=["bias", "rmse", "mae"], variables=variables, bins="none", include_lead_zero=True)
+    common["regions"] = regions
+    runs = {
+        "uniform": ae.Evaluation(forecast, targets, inits, lead, observation_operator=chain, **common),
+        "weighted": ae.Evaluation(
+            forecast, targets, inits, lead, observation_operator=chain, weights=point_weights, **common
+        ),
+    }
+    analysis = ae.DatasetTargets.from_forecast(forecast)
+    persistence = ae.Evaluation(
+        ae.PersistenceForecastSource(analysis, forecast.timestep),
+        targets,
+        inits,
+        lead,
+        observation_operator=chain,
+        constants=DatasetConstants(ae.DatasetTargets.from_forecast(forecast)) if args.lapse_rate is not None else None,
+        device=forecast.device,
+        **common,
+    )
+    log(
+        f"station mode: {len(points)} stations from {args.stations}, variables {conversions}, chain "
+        f"{[type(step).__name__ for step in steps]}, inits {[str(i) for i in inits]}, lead {lead}, rtol {rtol}"
+    )
+
+    # reference side: own tree, own orography read, own observation read and conversion
+    grid = forecast.grid
+
+    def xyz(lat, lon):
+        lat, lon = np.deg2rad(lat), np.deg2rad(lon)
+        return np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=1)
+
+    chord, nodes = cKDTree(xyz(grid.latitudes, grid.longitudes)).query(xyz(points.latitudes, points.longitudes))
+    distance_km = 2 * 6371.0 * np.arcsin(np.minimum(chord / 2, 1))
+    inside = distance_km <= args.max_distance_km
+    nodes = np.where(inside, nodes, 0)
+    model_ds = open_dataset(*forecast.dataset_args_kwargs()[0], **forecast.dataset_args_kwargs()[1])
+    gi = slice(None) if forecast.grid_indices is None else forecast.grid_indices
+    elevation = points.attributes.get("elevation")
+    dh = None
+    if (
+        args.lapse_rate is not None
+    ):  # the orography as the default ForecastConstants serves it, z * (1 / g) at the first init
+        row = model_ds.dates.astype("datetime64[us]").tolist().index(min(inits))
+        z = np.asarray(model_ds[row][model_ds.name_to_index["z"], 0], dtype=np.float32)[gi]
+        dh = elevation - np.where(inside, z.astype(np.float64)[nodes] * (1 / 9.80665), np.nan)
+    obs_ds = open_dataset(args.stations, frequency=frequency, select=list(conversions))
+    obs_index = {date: i for i, date in enumerate(obs_ds.dates.astype("datetime64[us]").tolist())}
+    obs_columns = [obs_ds.name_to_index[raw] for raw in conversions]
+    scale = np.array([spec.get("scale", 1.0) for spec in conversions.values()])[:, None]
+    offset = np.array([spec.get("offset", 0.0) for spec in conversions.values()])[:, None]
+
+    def observed(valid_time):
+        raw = np.asarray(obs_ds[obs_index[valid_time]], dtype=np.float32)[obs_columns, 0]
+        return (raw.astype(np.float64) * scale + offset).astype(np.float32)
+
+    def reference_frame(data):  # (M, V_model, N) float32 -> (M, V, P) float32
+        mapped = data[:, [frame_variables.index(v) for v in variables]][:, :, nodes]
+        mapped[:, :, ~inside] = np.nan
+        if args.lapse_rate is not None and "2t" in variables:
+            j = variables.index("2t")
+            mapped[:, j] = (mapped[:, j].astype(np.float64) - args.lapse_rate * dh).astype(np.float32)
+        return mapped
+
+    device = forecast.device
+    states = {name: evaluation.begin() for name, evaluation in runs.items()}
+    bound = runs["uniform"].observation_operator  # a plain accessor: bound here because begin() binds
+    assert bound.bound
+    plan = bound.prepare(points)
+    frame_variables = runs["uniform"].forecast_variables
+    leads = runs["uniform"].lead_times
+    fc = np.full((len(inits), len(leads), forecast.members, len(variables), len(points)), np.nan, np.float32)
+    obs = np.full((len(inits), len(leads), len(variables), len(points)), np.nan, np.float32)
+    exact_frames = total_frames = 0
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for i, init in enumerate(inits):
+            timers = {name: PhaseTimer(device) for name in runs}
+            initial = forecast.initial_frame(init, frame_variables, device)
+            for frame in itertools.chain([initial], forecast.frames(init, lead, frame_variables, device)):
+                for name, evaluation in runs.items():
+                    evaluation.add_frame(states[name], frame, timers[name])
+                j = leads.index(frame.lead_time)
+                fc[i, j] = reference_frame(frame.data.cpu().numpy())
+                obs[i, j] = observed(frame.valid_time)
+                out = bound.apply([frame], plan, frame.valid_time)
+                mapped = out.data.cpu().numpy()[:, [out.variables.index(v) for v in variables]]
+                exact_frames += int(np.array_equal(mapped, fc[i, j], equal_nan=True))
+                total_frames += 1
+            for timer in timers.values():
+                timer.mark("model")
+    log(
+        f"{total_frames} frames in {time.perf_counter() - t0:.1f}s, peak GPU {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
+    )
+    for name, evaluation in runs.items():
+        evaluation.finish(states[name], inits)
+    persistence_state = persistence.run()
+    out = (
+        Path(args.output)
+        if args.output
+        else Path(config.output.path).parent / f"validate-{Path(args.config).stem}-points.nc"
+    )
+    write(states["weighted"].to_xarray(runs["weighted"].metrics), out)
+    log(f"weighted framework state written to {out}")
+
+    ok = True
+
+    def check(label, good, detail=""):
+        nonlocal ok
+        ok &= bool(good)
+        log(f"{'PASS' if good else 'FAIL'} {label}{': ' + detail if detail else ''}")
+
+    check(
+        "mapped frames equal the numpy gather/lapse loop bit for bit",
+        exact_frames == total_frames,
+        f"{exact_frames}/{total_frames} frames",
+    )
+    error = fc.astype(np.float64).mean(2) - obs  # ensemble mean, float64
+    median_error = np.median(fc.astype(np.float64), 2) - obs  # mae scores the ensemble median
+    valid = np.isfinite(fc).all(2) & np.isfinite(obs)
+    masks = {"all": np.ones(len(points), bool), "half": regions["half"]}
+    for name, weight in (("uniform", np.ones(len(points))), ("weighted", point_weights)):
+        state = states[name].cpu()
+        worst = {}
+        weights_exact = True
+        for j in range(len(leads)):
+            for v in range(len(variables)):
+                for r, region in enumerate(state.regions):
+                    ok_pairs = valid[:, j, v] & masks[region]
+                    e, w = error[:, j, v][ok_pairs], np.broadcast_to(weight, ok_pairs.shape)[ok_pairs]
+                    ref = {
+                        "error": math.fsum(w * e),
+                        "squared_error": math.fsum(w * e**2),
+                        "absolute_median_error": math.fsum(w * np.abs(median_error[:, j, v][ok_pairs])),
+                    }
+                    absolute = math.fsum(w * np.abs(e))
+                    got_w, ref_w = float(state.weights[j, 0, v, r]), math.fsum(w)
+                    if name == "uniform":
+                        weights_exact &= got_w == ref_w
+                    else:
+                        ref["weights"] = ref_w
+                    for key, value in ref.items():
+                        got = got_w if key == "weights" else float(state.sums[key][j, 0, v, r])
+                        # relative to the sum of |terms|, the scale of a summation error: the signed error sum can
+                        # cancel to near zero, where a difference relative to the sum itself means nothing
+                        scale = absolute if key == "error" else abs(value)
+                        worst[key] = max(worst.get(key, 0.0), abs(got - value) / max(scale, 1e-300))
+        detail = ", ".join(f"{key} {rel:.2e}" for key, rel in worst.items())
+        if name == "uniform":
+            check("uniform weights: weight sums exact (finite pair counts)", weights_exact)
+        check(f"{name} weights: sums against math.fsum within {rtol:g}", all(r <= rtol for r in worst.values()), detail)
+        written = state.to_xarray(runs[name].metrics)
+        if name == "uniform":
+            count = np.array(
+                [
+                    [
+                        [float((valid[:, j, v] & masks[region]).sum()) for region in state.regions]
+                        for v in range(len(variables))
+                    ]
+                    for j in range(len(leads))
+                ]
+            )
+            check(
+                "weight_sum equals the finite pair count",
+                np.array_equal(written["weight_sum"].sel(bin="all").values, count),
+            )
+        expected_out = int((~inside).sum()) * state.n_init[:, 0].numpy()
+        check(
+            f"{name}: out_of_domain is the stations beyond {args.max_distance_km} km per frame",
+            np.array_equal(state.out_of_domain[:, 0].numpy(), expected_out),
+            f"{int((~inside).sum())} stations",
+        )
+    uniform, baseline = states["uniform"].cpu(), persistence_state.cpu()
+    same = all(torch.equal(uniform.sums[k][0], baseline.sums[k][0]) for k in uniform.sums)
+    check(
+        "lead 0 of the model chain equals lead 0 of persistence through the same chain",
+        same and torch.equal(uniform.weights[0], baseline.weights[0]),
+    )
+
+    # plausibility, WARN only
+    def warn(label, bad, detail):
+        log(f"{'WARN' if bad else 'OK'} plausibility {label}: {detail}")
+
+    lead0 = leads.index(datetime.timedelta(0))
+    for v, variable in enumerate(variables):
+        e0 = error[:, lead0, v][valid[:, lead0, v]]
+        rmse0 = float(np.sqrt(np.mean(e0**2))) if e0.size else float("nan")
+        warn(
+            f"{variable} lead-0 RMSE",
+            not rmse0 <= args.lead0_rmse_max,
+            f"{rmse0:.2f} (bound {args.lead0_rmse_max}, analysis against the observations)",
+        )
+        if elevation is not None and variable == "2t":
+            with np.errstate(invalid="ignore"):
+                station_mean = np.nanmean(obs[:, :, v].reshape(-1, len(points)), 0)
+            good = np.isfinite(station_mean) & np.isfinite(elevation)
+            r = float(np.corrcoef(elevation[good], station_mean[good])[0, 1])
+            warn(
+                f"{variable} station mean against elevation",
+                not r < -0.5,
+                f"r {r:+.3f} over {int(good.sum())} stations (a station network has a strong negative relation; "
+                "near zero means the data columns do not belong to the coordinates)",
+            )
+        e = error[:, :, v][valid[:, :, v]]
+        big = int((np.abs(e) > 15).sum())
+        warn(f"{variable} |error| > 15 K", big > 0.001 * e.size, f"{big} of {e.size} pairs")
+        if variable in GROSS:
+            low, high = GROSS[variable]
+            values = obs[:, :, v][np.isfinite(obs[:, :, v])]
+            gross = int(((values < low) | (values > high)).sum())
+            warn(f"{variable} gross observations", gross > 0, f"{gross} of {values.size} outside [{low}, {high}] K")
+    if "2t" in variables and "2d" in variables:
+        t, d = obs[:, :, variables.index("2t")], obs[:, :, variables.index("2d")]
+        above = int(np.nansum(d > t + 0.5))
+        warn("2d above 2t + 0.5 K", above > 0, f"{above} values")
+    log("PASS" if ok else "FAIL", f"(station mode, rtol {rtol})")
+    targets.close()
+    forecast.close()
+    return ok
+
+
 config = load_config(args.config)
+if args.stations:
+    sys.exit(0 if validate_points(config) else 1)
 block = config.forecast.anemoi_inference.model_dump()
 init = as_datetime(args.init)
 forecast = ae.InferenceForecastSource(**block)
