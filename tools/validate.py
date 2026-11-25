@@ -284,6 +284,7 @@ def validate_points(config) -> bool:
         f"{exact_frames}/{total_frames} frames",
     )
     error = fc.astype(np.float64).mean(2) - obs  # ensemble mean, float64
+    median_error = np.median(fc.astype(np.float64), 2) - obs  # mae scores the ensemble median
     valid = np.isfinite(fc).all(2) & np.isfinite(obs)
     masks = {"all": np.ones(len(points), bool), "half": regions["half"]}
     for name, weight in (("uniform", np.ones(len(points))), ("weighted", point_weights)):
@@ -298,8 +299,9 @@ def validate_points(config) -> bool:
                     ref = {
                         "error": math.fsum(w * e),
                         "squared_error": math.fsum(w * e**2),
-                        "absolute_error": math.fsum(w * np.abs(e)),
+                        "absolute_median_error": math.fsum(w * np.abs(median_error[:, j, v][ok_pairs])),
                     }
+                    absolute = math.fsum(w * np.abs(e))
                     got_w, ref_w = float(state.weights[j, 0, v, r]), math.fsum(w)
                     if name == "uniform":
                         weights_exact &= got_w == ref_w
@@ -309,7 +311,7 @@ def validate_points(config) -> bool:
                         got = got_w if key == "weights" else float(state.sums[key][j, 0, v, r])
                         # relative to the sum of |terms|, the scale of a summation error: the signed error sum can
                         # cancel to near zero, where a difference relative to the sum itself means nothing
-                        scale = ref["absolute_error"] if key == "error" else abs(value)
+                        scale = absolute if key == "error" else abs(value)
                         worst[key] = max(worst.get(key, 0.0), abs(got - value) / max(scale, 1e-300))
         detail = ", ".join(f"{key} {rel:.2e}" for key, rel in worst.items())
         if name == "uniform":
