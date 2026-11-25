@@ -1104,7 +1104,9 @@ left out, and so is `peak`. `frame` stays the forecast frame on the grid, with t
 
 - `Aggregator(weights, masks, statistics, binning, device=None, n_regions=None)`: `n_regions`,
   `new_state(lead_times, variables, regions, members, variable_coords=None) -> AggregationState`,
-  `add(state, frame, target, aux=None, W=None, out_of_domain=0) -> None`.
+  `add(state, frame, target, aux=None, W=None, out_of_domain=0) -> None`, and `reduce(values, W=None)`,
+  the `(V, R)` float64 region sums of `(V, L)` values, one product per variable through the
+  aggregator's `W` or the frame's.
   `Aggregator.for_points(n_regions, statistics, binning, device=None)`, the same as `Aggregator(None,
   None, statistics, binning, device, n_regions=n_regions)`, has no `W` of its own: each `add`
   passes the `(P, R)` `W` of its frame's point set and the number of its points out of the operator's
